@@ -1,0 +1,6 @@
+{"t":"2026-07-20T21:00:01.000Z","type":"mode","mode":"demo"}
+{"t":"2026-07-20T21:00:03.120Z","type":"click","x":812,"y":540,"app":"notepad.exe","pid":1234,"window":"Untitled - Notepad","controlType":"MenuItem","name":"File","automationId":"FileMenu","rect":[790,530,850,560],"mode":"demo"}
+{"t":"2026-07-20T21:00:04.400Z","type":"click","x":830,"y":610,"app":"notepad.exe","pid":1234,"window":"Untitled - Notepad","controlType":"MenuItem","name":"Save As","automationId":"SaveAsItem","rect":[800,595,900,625],"mode":"demo"}
+{"t":"2026-07-20T21:00:08.900Z","type":"text","value":"meeting-notes.txt","app":"notepad.exe","pid":1234,"window":"Save As","controlType":"Edit","name":"File name:","rect":[420,700,900,730],"mode":"demo"}
+{"t":"2026-07-20T21:00:10.150Z","type":"click","x":950,"y":760,"app":"notepad.exe","pid":1234,"window":"Save As","controlType":"Button","name":"Save","automationId":"1","rect":[920,748,1000,778],"mode":"demo"}
+{"t":"2026-07-20T21:00:12.000Z","type":"wait","seconds":3.2,"mode":"demo"}

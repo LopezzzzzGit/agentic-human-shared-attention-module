@@ -1,4 +1,4 @@
-# Look Here — Build Spec v1
+# Agentic/Human Shared Attention — Build Spec v1
 
 **For the Codex build sessions.** This document is your complete starting
 knowledge: what to build, the measured facts about the driver you build on,
@@ -8,15 +8,15 @@ over guesses.
 
 ---
 
-## 1. What Look Here is
+## 1. What this is
 
 Computer-use agents and humans lack a shared visual language. Agents click
-blind; humans steer with paragraphs of text. Look Here adds the missing
+blind; humans steer with paragraphs of text. This plugin adds the missing
 deictic channel — *this, here, watch me* — on the live desktop:
 
 - **Show Me** — the agent marks the element it resolved as its target
   (box / dot / label) BEFORE acting; after verification the mark confirms.
-- **Look Here** — the human points, clicks, or circles with their own
+- **Look Here** (the gesture, namesake of the tagline) — the human points, clicks, or circles with their own
   mouse; the mark resolves to a semantic UI element and is handed to the
   agent as ground truth.
 - **Watch Me** — the human demonstrates a workflow once (clicks,
@@ -48,7 +48,7 @@ installed and provides the screen overlay. Facts, all measured:
 
 `move_cursor` — move an overlay instance. Does NOT move the real mouse.
 ```json
-{ "x": 800, "y": 500, "cursor_id": "mark-1", "session": "lookhere" }
+{ "x": 800, "y": 500, "cursor_id": "mark-1", "session": "asha" }
 ```
 
 `set_agent_cursor_motion` — appearance + motion of one instance:
@@ -112,7 +112,7 @@ armed(on: boolean): void        // visible "teach mode armed" indicator (a label
 ```
 
 Implementation notes:
-- One `cursor_id` per mark (`mark-<n>`), all in session `"lookhere"`.
+- One `cursor_id` per mark (`mark-<n>`), all in session `"asha"`.
 - `mark()` = set_agent_cursor_motion (icon per kind, color, label,
   size from w/h, `idle_hide_ms: 0`, `arc_size: 0`, `glide_duration_ms: 50`)
   then move_cursor to (x, y).
@@ -196,11 +196,11 @@ raw coordinate as its FIRST target.
 ## 6. CLI contract (what the host harness calls)
 
 ```
-look-here mark '<json>'          → {"id":"mark-3"}
-look-here ack <id> | clear [id]  → {"ok":true}
-look-here armed on|off           → {"ok":true}
-look-here teach start            → streams recorder JSONL to stdout until Esc
-look-here compile <file.jsonl> --title "..." → recipe JSON on stdout
+asha mark '<json>'          → {"id":"mark-3"}
+asha ack <id> | clear [id]  → {"ok":true}
+asha armed on|off           → {"ok":true}
+asha teach start            → streams recorder JSONL to stdout until Esc
+asha compile <file.jsonl> --title "..." → recipe JSON on stdout
 ```
 stdout is always machine-readable JSON (or JSONL); human noise to stderr.
 

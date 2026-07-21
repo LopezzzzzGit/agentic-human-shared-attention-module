@@ -1,0 +1,26 @@
+<Window x:Class="AshaLive.QuitDialog"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Quit ASHA" Width="390" Height="214" ResizeMode="NoResize"
+        WindowStyle="None" AllowsTransparency="True" Background="Transparent"
+        ShowInTaskbar="False" WindowStartupLocation="CenterOwner" Topmost="True">
+    <Border Margin="10" Padding="24" CornerRadius="25" Background="#F4FBFFFF" BorderBrush="#B7D9F5" BorderThickness="1">
+        <Border.Effect>
+            <DropShadowEffect BlurRadius="28" ShadowDepth="8" Opacity="0.25" Color="#173E70" />
+        </Border.Effect>
+        <Grid>
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="*" />
+                <RowDefinition Height="Auto" />
+            </Grid.RowDefinitions>
+            <TextBlock FontSize="20" FontWeight="SemiBold" Foreground="#12355E">Quit ASHA?</TextBlock>
+            <TextBlock Grid.Row="1" Margin="0,12,0,16" FontSize="13" Foreground="#526A84" TextWrapping="Wrap"
+                       Text="This stops the orb, microphone listening, voice playback, and the current live conversation. ASHA will no longer be available in the system tray." />
+            <StackPanel Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Right">
+                <Button Padding="14,7" Margin="0,0,9,0" Click="Cancel_Click">Cancel</Button>
+                <Button Padding="14,7" Background="#1D64B8" BorderBrush="#1D64B8" Foreground="White" Click="Quit_Click">Quit ASHA</Button>
+            </StackPanel>
+        </Grid>
+    </Border>
+</Window>

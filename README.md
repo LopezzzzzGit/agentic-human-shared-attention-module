@@ -138,15 +138,33 @@ same `asha` CLI stays available to the future harness.
 ### First live voice conversation
 
 The current orb can run its own local voice loop without Codex Remote: it
-records a short push-to-talk turn, sends it to the local Whisper/Kokoro service
-at `127.0.0.1:9010`, asks a Groq model for the reply, then plays the local TTS
-response.
+detects spoken turns through the local speech service at `127.0.0.1:9010`, asks
+the configured Groq model for a reply, and plays local TTS. Tap the orb once to
+enter free conversation; ASHA detects pauses and returns to listening after
+each reply. Tap the centre again only when you want to end the conversation.
 
-Run `configure-groq.bat` once and paste your Groq API key when prompted. The
-key is stored only as the Windows user environment variable
-`ASHA_GROQ_API_KEY`; it is not written into this repository. Then start
-`start-asha.bat`. Tap the orb once to begin listening, then tap it again when
-you finish your sentence. Drag the orb instead of tapping to move it.
+Bring your own free Groq API key. Run `configure-groq.bat` once, paste one key
+or a comma-separated list, restart ASHA, then run `start-asha.bat`. Keys are
+stored only in the Windows user environment and never in this repository.
+
+For multiple accounts, ASHA resolves keys in this order:
+
+1. `ASHA_GROQ_KEYS`, as a comma-separated user environment variable.
+2. `%USERPROFILE%\.groq\keys.txt`, containing one comma-separated line.
+3. `%USERPROFILE%\.lantern\keys.json`, using the string field
+   `ASHA_GROQ_KEYS`.
+4. The legacy single-key variable `ASHA_GROQ_API_KEY` for existing installs.
+
+Successful keys are sticky. HTTP 429 responses rotate immediately to the next
+key, rate-limited keys cool down according to Groq response headers, and
+structural HTTP errors fail fast. The default vision model is configured with
+`ASHA_GROQ_MODEL=qwen/qwen3.6-27b`; ASHA disables Qwen reasoning output and
+strips any unexpected `<think>` block before it reaches chat, tools, or speech.
+
+The checked-in `.env.example` contains placeholders only. ASHA does not need a
+`.env` file inside the project: prefer the setup script or one of the external
+key sources above. If no key is configured, the app still starts and explains
+how to enable inference.
 
 ## Development
 

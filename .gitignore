@@ -10,3 +10,10 @@ teach-recorder/bin/
 teach-recorder/obj/
 *.user
 *.suo
+.env
+.env.*
+!.env.example
+.groq/
+.lantern/
+**/keys.txt
+*.key

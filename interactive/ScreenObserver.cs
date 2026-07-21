@@ -69,7 +69,11 @@ public sealed class ScreenObserver : IDisposable
         return await Task.Run(() =>
         {
             cancellationToken.ThrowIfCancellationRequested();
-            using var context = CaptureContext(anchorX, anchorY);
+            // Ambient summaries need scene understanding, not pixel-perfect
+            // OCR. Preserve the same 960 by 620 desktop region and visible
+            // blue boundary, but send roughly half as many image pixels to the
+            // provider. Explicit one-view evidence remains full resolution.
+            using var context = CaptureContext(anchorX, anchorY, 672, 434);
             using var stream = new MemoryStream();
             context.Image.Save(stream, ImageFormat.Png);
             return new VisionAttachment(
@@ -184,7 +188,7 @@ public sealed class ScreenObserver : IDisposable
         return new ScreenSnapshot(DateTime.UtcNow, CaptureScaled(bounds.Left, bounds.Top, bounds.Width, bounds.Height, SampleWidth, height));
     }
 
-    private static ContextCapture CaptureContext(int anchorX, int anchorY)
+    private static ContextCapture CaptureContext(int anchorX, int anchorY, int? outputWidth = null, int? outputHeight = null)
     {
         var bounds = System.Windows.Forms.SystemInformation.VirtualScreen;
         const int desiredWidth = 960;
@@ -193,7 +197,9 @@ public sealed class ScreenObserver : IDisposable
         var height = Math.Min(desiredHeight, bounds.Height);
         var left = Math.Clamp(anchorX - (width / 2), bounds.Left, bounds.Right - width);
         var top = Math.Clamp(anchorY - (height / 2), bounds.Top, bounds.Bottom - height);
-        return new ContextCapture(CaptureScaled(left, top, width, height, width, height), left, top, width, height);
+        var targetWidth = Math.Clamp(outputWidth ?? width, 1, width);
+        var targetHeight = Math.Clamp(outputHeight ?? height, 1, height);
+        return new ContextCapture(CaptureScaled(left, top, width, height, targetWidth, targetHeight), left, top, width, height);
     }
 
     private static Bitmap CaptureScaled(int sourceX, int sourceY, int sourceWidth, int sourceHeight, int targetWidth, int targetHeight)

@@ -15,6 +15,7 @@ using System.Windows.Media;
 using System.Windows.Threading;
 using Drawing = System.Drawing;
 using Forms = System.Windows.Forms;
+using SharedInference;
 
 namespace AshaLive;
 
@@ -1243,13 +1244,18 @@ public partial class MainWindow : Window
             WorkingDirectory = _repositoryRoot,
             UseShellExecute = true,
         });
-        StatusText.Text = "Save your Groq key in the setup window, then restart ASHA.";
+        StatusText.Text = "Save one or more Groq keys in the setup window, then restart ASHA.";
     }
 
     private string DescribeProvider()
     {
-        var model = Environment.GetEnvironmentVariable("ASHA_GROQ_MODEL") ?? "llama-3.3-70b-versatile";
-        var keyState = _voiceSession.IsGroqConfigured ? "key configured" : "no key configured";
+        var model = Environment.GetEnvironmentVariable("ASHA_GROQ_MODEL") ?? "qwen/qwen3.6-27b";
+        var keyState = _voiceSession.GroqKeyCount switch
+        {
+            0 => "no keys configured",
+            1 => "one key configured",
+            var count => $"{count} rotating keys configured",
+        };
         return $"Groq · {model} · {keyState}";
     }
 
@@ -1390,6 +1396,7 @@ public partial class MainWindow : Window
     private async Task CompleteVoiceTurnAsync()
     {
         if (!_voiceCapturing || _voiceTurnInFlight) return;
+        var preserveFinalStatus = false;
         _voiceCapturing = false;
         _voiceTurnInFlight = true;
         _conversationBoundaryTimer.Stop();
@@ -1455,12 +1462,53 @@ public partial class MainWindow : Window
                 await awarenessRefresh;
             }
         }
+        catch (AllGroqKeysRateLimitedException error)
+        {
+            preserveFinalStatus = true;
+            _conversationActive = false;
+            var retryText = error.RetryAtUtc is { } retryAt
+                ? $" Please try again after {retryAt.ToLocalTime():HH:mm}."
+                : " Please try again in a little while.";
+            var reply = $"All of my available connections are temporarily busy.{retryText}";
+            StatusText.Text = reply;
+            AwarenessStatusText.Text = "Automatic visual updates are paused while all configured model connections cool down.";
+            Log($"All {_voiceSession.GroqKeyCount} configured Groq keys are rate-limited; ASHA returned to a calm idle state.");
+            await AddConversationAsync("ASHA", reply);
+            try
+            {
+                OrbSurface.SetPresenceState(OrbPresenceState.Speaking);
+                await _voiceSession.SpeakAsync(reply, _voiceTurnCancellation.Token);
+            }
+            catch (Exception speechError)
+            {
+                Log($"Could not speak the rate-limit notice: {speechError.Message}");
+            }
+        }
+        catch (GroqKeysUnavailableException error)
+        {
+            preserveFinalStatus = true;
+            _conversationActive = false;
+            const string reply = "I cannot reach my model connections right now. Your words are saved, and you can try again shortly.";
+            StatusText.Text = reply;
+            Log($"Groq key-ring network error: {error.Message}");
+            await AddConversationAsync("ASHA", reply);
+            try
+            {
+                OrbSurface.SetPresenceState(OrbPresenceState.Speaking);
+                await _voiceSession.SpeakAsync(reply, _voiceTurnCancellation.Token);
+            }
+            catch (Exception speechError)
+            {
+                Log($"Could not speak the connection notice: {speechError.Message}");
+            }
+        }
         catch (OperationCanceledException)
         {
             // The app is closing or the current turn was deliberately cancelled.
         }
         catch (Exception error)
         {
+            preserveFinalStatus = true;
             StatusText.Text = ShortReason(error);
             Log($"Voice turn error: {error.Message}");
         }
@@ -1479,7 +1527,8 @@ public partial class MainWindow : Window
                 // of manually armed one-shot recordings.
                 _ = ResumeFreeConversationAsync();
             }
-            else if (!StatusText.Text.Contains("error", StringComparison.OrdinalIgnoreCase) &&
+            else if (!preserveFinalStatus &&
+                     !StatusText.Text.Contains("error", StringComparison.OrdinalIgnoreCase) &&
                      !StatusText.Text.Contains("unavailable", StringComparison.OrdinalIgnoreCase))
                 StatusText.Text = _voiceSession.IsGroqConfigured ? "Tap the orb to start listening." : "Configure Groq, then restart ASHA.";
         }

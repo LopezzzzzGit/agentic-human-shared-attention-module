@@ -7,6 +7,7 @@ using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using NAudio.Wave;
+using SharedInference;
 
 namespace AshaLive;
 
@@ -213,7 +214,7 @@ public sealed class AshaVoiceSession : IDisposable
 {
     private const string SpeechBaseUrl = "http://127.0.0.1:9010";
     private const string GroqBaseUrl = "https://api.groq.com/openai/v1";
-    private const string DefaultModel = "llama-3.3-70b-versatile";
+    private const string DefaultModel = "qwen/qwen3.6-27b";
     private const string SystemPrompt = """
         You are ASHA — a warm, concise shared-attention companion living on
         the user's desktop. You know that your role is to help a person notice,
@@ -286,11 +287,13 @@ public sealed class AshaVoiceSession : IDisposable
         """;
 
     private readonly HttpClient _http = new() { Timeout = TimeSpan.FromSeconds(90) };
+    private readonly GroqKeyRotator _groqKeys = GroqKeyRotator.LoadDefault();
     private readonly List<ChatTurn> _history = [];
     private string _sessionSummary = string.Empty;
     private bool _disposed;
 
-    public bool IsGroqConfigured => !string.IsNullOrWhiteSpace(GroqApiKey());
+    public bool IsGroqConfigured => _groqKeys.IsConfigured;
+    public int GroqKeyCount => _groqKeys.Count;
     public bool SupportsVision => string.Equals(GroqModel(), "qwen/qwen3.6-27b", StringComparison.OrdinalIgnoreCase);
 
     public void LoadConversationMemory(IEnumerable<ConversationMessage> recentMessages, string? summary)
@@ -317,8 +320,7 @@ public sealed class AshaVoiceSession : IDisposable
         CancellationToken cancellationToken)
     {
         if (additionalMessages.Count == 0) return existingSummary?.Trim() ?? string.Empty;
-        var key = GroqApiKey();
-        if (string.IsNullOrWhiteSpace(key)) return existingSummary?.Trim() ?? string.Empty;
+        if (!IsGroqConfigured) return existingSummary?.Trim() ?? string.Empty;
 
         var transcript = string.Join("\n", additionalMessages.Select(message =>
             $"[{message.Timestamp:yyyy-MM-dd HH:mm}] {message.Speaker}: {message.Text}"));
@@ -337,7 +339,7 @@ public sealed class AshaVoiceSession : IDisposable
             },
         };
         var baseUrl = (Environment.GetEnvironmentVariable("ASHA_GROQ_BASE_URL") ?? GroqBaseUrl).TrimEnd('/');
-        using var response = await SendChatCompletionAsync(key, baseUrl, GroqModel(), messages, null, cancellationToken, 900).ConfigureAwait(false);
+        using var response = await SendChatCompletionAsync(baseUrl, GroqModel(), messages, null, cancellationToken, 900).ConfigureAwait(false);
         var summary = StripReasoningMarkup(ReadMessageContent(response.RootElement.GetProperty("choices")[0].GetProperty("message")));
         return string.IsNullOrWhiteSpace(summary) ? previous : Regex.Replace(summary, @"\s+", " ").Trim();
     }
@@ -414,8 +416,7 @@ public sealed class AshaVoiceSession : IDisposable
     public async Task<string?> DescribeDesktopViewAsync(VisionAttachment vision, AwarenessScene? scene, CancellationToken cancellationToken)
     {
         if (!SupportsVision) return null;
-        var key = GroqApiKey();
-        if (string.IsNullOrWhiteSpace(key)) return null;
+        if (!IsGroqConfigured) return null;
 
         var foreground = scene?.Foreground?.DisplayName ?? "unknown application";
         var hovered = scene?.Hovered?.DisplayName;
@@ -440,7 +441,7 @@ public sealed class AshaVoiceSession : IDisposable
             },
         };
         var baseUrl = (Environment.GetEnvironmentVariable("ASHA_GROQ_BASE_URL") ?? GroqBaseUrl).TrimEnd('/');
-        using var response = await SendChatCompletionAsync(key, baseUrl, GroqModel(), messages, null, cancellationToken).ConfigureAwait(false);
+        using var response = await SendChatCompletionAsync(baseUrl, GroqModel(), messages, null, cancellationToken).ConfigureAwait(false);
         var summary = StripReasoningMarkup(ReadMessageContent(response.RootElement.GetProperty("choices")[0].GetProperty("message")));
         return string.IsNullOrWhiteSpace(summary) ? null : Regex.Replace(summary, @"\s+", " ").Trim();
     }
@@ -468,9 +469,8 @@ public sealed class AshaVoiceSession : IDisposable
         DesktopAwarenessContext? awarenessContext,
         CancellationToken cancellationToken)
     {
-        var key = GroqApiKey();
-        if (string.IsNullOrWhiteSpace(key))
-            throw new InvalidOperationException("Groq is not configured. Run configure-groq.bat, then restart ASHA.");
+        if (!IsGroqConfigured)
+            throw new InvalidOperationException("Set ASHA_GROQ_KEYS or configure a Groq key in settings, then restart ASHA.");
 
         var messages = new List<object> { new { role = "system", content = SystemPrompt } };
         if (!string.IsNullOrWhiteSpace(_sessionSummary))
@@ -501,7 +501,7 @@ public sealed class AshaVoiceSession : IDisposable
                 ? ViewRequestToolDefinitions
                 : null;
         string? reply;
-        using (var first = await SendChatCompletionAsync(key, baseUrl, model, messages, tools, cancellationToken).ConfigureAwait(false))
+        using (var first = await SendChatCompletionAsync(baseUrl, model, messages, tools, cancellationToken).ConfigureAwait(false))
         {
             var message = first.RootElement.GetProperty("choices")[0].GetProperty("message");
             var toolCalls = ReadToolCalls(message);
@@ -515,9 +515,9 @@ public sealed class AshaVoiceSession : IDisposable
                     tools = vision.HasDesktopMapping && visualToolExecutor is not null
                         ? allowComputerControl ? VisualAndControlToolDefinitions : VisualToolDefinitions
                         : null;
-                    using var grounded = await SendChatCompletionAsync(key, baseUrl, model, messages, tools, cancellationToken).ConfigureAwait(false);
+                    using var grounded = await SendChatCompletionAsync(baseUrl, model, messages, tools, cancellationToken).ConfigureAwait(false);
                     var groundedMessage = grounded.RootElement.GetProperty("choices")[0].GetProperty("message");
-                    reply = await CompleteVisualToolCallsAsync(messages, groundedMessage, vision, visualToolExecutor, tools, key, baseUrl, model, cancellationToken).ConfigureAwait(false);
+                    reply = await CompleteVisualToolCallsAsync(messages, groundedMessage, vision, visualToolExecutor, tools, baseUrl, model, cancellationToken).ConfigureAwait(false);
                 }
                 else
                 {
@@ -531,12 +531,12 @@ public sealed class AshaVoiceSession : IDisposable
                             content = JsonSerializer.Serialize(new { ok = false, error = "A current desktop view is not available under the active session and privacy settings." }),
                         });
                     }
-                    using var unavailable = await SendChatCompletionAsync(key, baseUrl, model, messages, null, cancellationToken).ConfigureAwait(false);
+                    using var unavailable = await SendChatCompletionAsync(baseUrl, model, messages, null, cancellationToken).ConfigureAwait(false);
                     reply = ReadMessageContent(unavailable.RootElement.GetProperty("choices")[0].GetProperty("message"));
                 }
             }
             else if (vision is not null && visualToolExecutor is not null)
-                reply = await CompleteVisualToolCallsAsync(messages, message, vision, visualToolExecutor, tools, key, baseUrl, model, cancellationToken).ConfigureAwait(false);
+                reply = await CompleteVisualToolCallsAsync(messages, message, vision, visualToolExecutor, tools, baseUrl, model, cancellationToken).ConfigureAwait(false);
             else
                 reply = ReadMessageContent(message);
         }
@@ -581,7 +581,6 @@ public sealed class AshaVoiceSession : IDisposable
         VisionAttachment vision,
         Func<AshaVisualToolCall, VisionAttachment, CancellationToken, Task<string>>? visualToolExecutor,
         IReadOnlyList<object>? tools,
-        string key,
         string baseUrl,
         string model,
         CancellationToken cancellationToken)
@@ -598,7 +597,7 @@ public sealed class AshaVoiceSession : IDisposable
             messages.Add(new { role = "tool", tool_call_id = toolCall.Id, content = output });
         }
 
-        using var final = await SendChatCompletionAsync(key, baseUrl, model, messages, tools, cancellationToken).ConfigureAwait(false);
+        using var final = await SendChatCompletionAsync(baseUrl, model, messages, tools, cancellationToken).ConfigureAwait(false);
         return ReadMessageContent(final.RootElement.GetProperty("choices")[0].GetProperty("message"));
     }
 
@@ -618,7 +617,6 @@ public sealed class AshaVoiceSession : IDisposable
     }
 
     private async Task<JsonDocument> SendChatCompletionAsync(
-        string key,
         string baseUrl,
         string model,
         List<object> messages,
@@ -644,23 +642,18 @@ public sealed class AshaVoiceSession : IDisposable
         if (string.Equals(model, "qwen/qwen3.6-27b", StringComparison.OrdinalIgnoreCase))
             payload["reasoning_effort"] = "none";
 
-        using var request = new HttpRequestMessage(HttpMethod.Post, $"{baseUrl}/chat/completions")
+        var attemptTimeout = maxTokens > 420 ? TimeSpan.FromSeconds(15) : TimeSpan.FromSeconds(6);
+        using var response = await _groqKeys.SendAsync(async (key, attemptCancellation) =>
         {
-            Content = JsonContent.Create(payload),
-        };
-        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", key);
-        using var requestDeadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        requestDeadline.CancelAfter(maxTokens > 420 ? TimeSpan.FromSeconds(45) : TimeSpan.FromSeconds(20));
-        try
-        {
-            using var response = await _http.SendAsync(request, requestDeadline.Token).ConfigureAwait(false);
-            await EnsureSuccessAsync(response, "Groq", requestDeadline.Token).ConfigureAwait(false);
-            return JsonDocument.Parse(await response.Content.ReadAsStringAsync(requestDeadline.Token).ConfigureAwait(false));
-        }
-        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
-        {
-            throw new TimeoutException("ASHA's model response took too long. The microphone will reopen so you can continue.");
-        }
+            using var request = new HttpRequestMessage(HttpMethod.Post, $"{baseUrl}/chat/completions")
+            {
+                Content = JsonContent.Create(payload),
+            };
+            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", key);
+            return await _http.SendAsync(request, attemptCancellation).ConfigureAwait(false);
+        }, attemptTimeout, cancellationToken).ConfigureAwait(false);
+        await EnsureSuccessAsync(response, "Groq", cancellationToken).ConfigureAwait(false);
+        return JsonDocument.Parse(await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false));
     }
 
     private static string? ReadMessageContent(JsonElement message) =>
@@ -773,7 +766,6 @@ public sealed class AshaVoiceSession : IDisposable
             },
         ]).ToArray();
 
-    private static string? GroqApiKey() => Environment.GetEnvironmentVariable("ASHA_GROQ_API_KEY");
     private static string GroqModel() => Environment.GetEnvironmentVariable("ASHA_GROQ_MODEL") ?? DefaultModel;
 
     /// <summary>

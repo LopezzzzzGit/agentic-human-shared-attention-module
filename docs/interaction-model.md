@@ -80,6 +80,13 @@ attention record around it. Thus a future request such as “How did you teach
 me the mailboxes?” can retrieve the ASHA session and follow its Codex link,
 without pretending a 20 Hz audio meter is useful memory.
 
+When ASHA itself coordinates the conversation, the ASHA session owns that
+transcript instead of linking to an external copy. A session can begin as an
+ephemeral working session and still keep short-term memory while running. On
+ending, the person chooses Keep, Discard, or Cancel; “ephemeral” must never be
+confused with forgetting between turns. The detailed lifecycle and delivery
+order live in [the product roadmap](../ROADMAP.md).
+
 Raw microphone data, complete cursor traces, and unbounded screen capture are
 not ledger entries. They are transient local signals unless the person has
 separately chosen a recording artifact with an explicit retention policy.

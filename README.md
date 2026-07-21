@@ -10,6 +10,9 @@ The implementation follows the build order in [SPEC.md](SPEC.md). The current
 first milestone is the dependency-free TypeScript mark engine and the `asha`
 command-line interface.
 
+The intended product lifecycle, memory hierarchy, retention choices, and
+delivery order are maintained in [ROADMAP.md](ROADMAP.md).
+
 ## Mark engine
 
 With `cua-driver` installed, run the live overlay demo:

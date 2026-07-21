@@ -22,6 +22,9 @@ public sealed class ScreenObserver : IDisposable
     private VisionPreference _mode = VisionPreference.Off;
     private int _captureInProgress;
     private bool _disposed;
+    private DateTime _lastChangeNotificationUtc;
+
+    public event Action<LocalScreenChange>? MeaningfulChange;
 
     public void Start(VisionPreference mode)
     {
@@ -46,6 +49,7 @@ public sealed class ScreenObserver : IDisposable
         _timer?.Dispose();
         _timer = null;
         _mode = VisionPreference.Off;
+        _lastChangeNotificationUtc = DateTime.MinValue;
         lock (_gate)
         {
             while (_recent.Count > 0) _recent.Dequeue().Dispose();
@@ -57,6 +61,25 @@ public sealed class ScreenObserver : IDisposable
         if (_mode == VisionPreference.Off || string.IsNullOrWhiteSpace(sessionId)) return null;
 
         return await Task.Run(() => PreserveEvidence(sessionId, reason, anchorX, anchorY, cancellationToken), cancellationToken).ConfigureAwait(false);
+    }
+
+    public async Task<VisionAttachment?> CaptureCurrentContextAsync(int anchorX, int anchorY, CancellationToken cancellationToken = default)
+    {
+        if (_mode == VisionPreference.Off) return null;
+        return await Task.Run(() =>
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            using var context = CaptureContext(anchorX, anchorY);
+            using var stream = new MemoryStream();
+            context.Image.Save(stream, ImageFormat.Png);
+            return new VisionAttachment(
+                $"asha-live-{DateTime.UtcNow:yyyyMMdd-HHmmss-fff}.png",
+                stream.ToArray(),
+                context.Left,
+                context.Top,
+                context.Width,
+                context.Height);
+        }, cancellationToken).ConfigureAwait(false);
     }
 
     private VisualEvidenceBundle PreserveEvidence(string sessionId, string reason, int? anchorX, int? anchorY, CancellationToken cancellationToken)
@@ -120,7 +143,19 @@ public sealed class ScreenObserver : IDisposable
         if (_disposed || _mode == VisionPreference.Off || Interlocked.Exchange(ref _captureInProgress, 1) == 1) return;
         try
         {
-            AddToRing(CaptureSnapshot());
+            ScreenSnapshot? previous;
+            lock (_gate) previous = _recent.Count > 0 ? _recent.Last().Copy() : null;
+            var current = CaptureSnapshot();
+            var changedScore = previous is null ? 1d : Difference(previous.Image, current.Image);
+            previous?.Dispose();
+            AddToRing(current);
+
+            var now = DateTime.UtcNow;
+            if (changedScore >= 0.035 && now - _lastChangeNotificationUtc >= TimeSpan.FromSeconds(2.5))
+            {
+                _lastChangeNotificationUtc = now;
+                MeaningfulChange?.Invoke(new LocalScreenChange(now, Math.Round(changedScore, 4)));
+            }
         }
         catch
         {
@@ -241,3 +276,5 @@ public sealed record VisualEvidenceBundle(
     int? ContextY,
     int? ContextWidth,
     int? ContextHeight);
+
+public sealed record LocalScreenChange(DateTime TimestampUtc, double ChangedScore);

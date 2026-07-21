@@ -194,7 +194,7 @@
                             <StackPanel>
                                 <TextBlock FontWeight="SemiBold" Foreground="#214E7D">Desktop awareness</TextBlock>
                                 <TextBlock Margin="0,4,0,0" FontSize="11" Foreground="#62788D" TextWrapping="Wrap"
-                                           Text="During an intentional session, ASHA keeps small local samples in memory. It saves a private evidence bundle only when you mark or capture a view. No desktop image is sent to an AI provider yet." />
+                                           Text="During an intentional session, ASHA keeps small local samples in memory. Images leave this computer only through the separate permissions below." />
                                 <ComboBox x:Name="VisionModeBox" Margin="0,9,0,0" SelectionChanged="VisionModeBox_SelectionChanged">
                                     <ComboBoxItem Tag="Off" Content="Off — no desktop frames" />
                                     <ComboBoxItem Tag="OnChange" Content="Session awareness — low-resource local samples" />
@@ -207,6 +207,10 @@
                                           Content="Allow ASHA to request and send one current view when needed" />
                                 <TextBlock Margin="0,3,0,0" FontSize="10" Foreground="#71869B" TextWrapping="Wrap"
                                            Text="This is off by default. During an active session, ASHA may request one fresh view for a visual question. It never sends a desktop video or images with ordinary chat." />
+                                <CheckBox x:Name="LiveProviderAwarenessCheckBox" Margin="0,9,0,0" Checked="LiveProviderAwarenessChanged" Unchecked="LiveProviderAwarenessChanged"
+                                          Content="Keep Qwen visually aware from changed keyframes in Live mode" />
+                                <TextBlock Margin="0,3,0,0" FontSize="10" Foreground="#71869B" TextWrapping="Wrap"
+                                           Text="When enabled, meaningful local changes may send at most one current crop every five seconds. Qwen keeps a compact scene summary; unchanged frames are skipped." />
                                 <CheckBox x:Name="ControlPresenceCheckBox" Margin="0,9,0,0" Checked="ControlPresenceChanged" Unchecked="ControlPresenceChanged"
                                           Content="Show the blue-violet desktop-control presence when ASHA is acting" />
                             </StackPanel>

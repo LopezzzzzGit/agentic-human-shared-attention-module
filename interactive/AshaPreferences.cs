@@ -17,6 +17,11 @@ public sealed class AshaPreferences
     /// <summary>Explicit opt-in before any selected desktop image may leave this PC.</summary>
     public bool AllowRemoteVision { get; set; }
     /// <summary>
+    /// Separate opt-in for sending throttled changed keyframes to the configured
+    /// visual model while Live awareness and a durable session are active.
+    /// </summary>
+    public bool LiveProviderAwareness { get; set; }
+    /// <summary>
     /// An intentionally started session may survive an ASHA restart. Casual
     /// conversation never writes this value and therefore remains transient.
     /// </summary>

@@ -96,7 +96,11 @@ public partial class MainWindow : Window
     private string? _activeSessionId;
     private VisualEvidenceBundle? _latestVisionEvidence;
     private bool _shareVisionOnNextTurn;
+    private DesktopAwarenessContext? _liveAwarenessContext;
+    private bool _liveAwarenessRefreshInFlight;
+    private DateTime _lastLiveAwarenessRefreshUtc;
     private CancellationTokenSource? _voiceTurnCancellation;
+    private readonly CancellationTokenSource _lifetimeCancellation = new();
     private readonly SemaphoreSlim _sessionWriteGate = new(1, 1);
 
     public MainWindow()
@@ -131,6 +135,7 @@ public partial class MainWindow : Window
             ObserveIncomingSpeech(energy);
         });
         _awarenessCoordinator.SceneChanged += scene => Dispatcher.BeginInvoke(() => ShowAwarenessScene(scene));
+        _screenObserver.MeaningfulChange += change => Dispatcher.BeginInvoke(() => QueueLiveAwarenessRefresh(change));
     }
 
     private void Window_Loaded(object sender, RoutedEventArgs e)
@@ -780,6 +785,7 @@ public partial class MainWindow : Window
         if (!IsLoaded || VisionModeBox.SelectedItem is not ComboBoxItem { Tag: string value } || !Enum.TryParse<VisionPreference>(value, out var mode)) return;
         _preferences.Vision = mode;
         _preferences.Save();
+        if (mode != VisionPreference.Live) _liveAwarenessContext = null;
         if (!string.IsNullOrWhiteSpace(_activeSessionId))
         {
             _screenObserver.SetMode(mode);
@@ -801,23 +807,135 @@ public partial class MainWindow : Window
 
         var pace = scene.Mode == VisionPreference.Live ? "Live local awareness" : "Local session awareness";
         var foreground = scene.Foreground?.DisplayName ?? "the desktop";
+        var providerContext = _preferences.LiveProviderAwareness && _liveAwarenessContext is not null
+            ? $" Qwen's latest context: {_liveAwarenessContext.Summary}"
+            : " No image is being shared.";
         if (scene.Hovered is not null && scene.Hovered.Handle != scene.Foreground?.Handle)
         {
-            AwarenessStatusText.Text = $"{pace}: {foreground}. Pointer over {scene.Hovered.DisplayName}. No image is being shared.";
+            AwarenessStatusText.Text = $"{pace}: {foreground}. Pointer over {scene.Hovered.DisplayName}.{providerContext}";
             return;
         }
 
-        AwarenessStatusText.Text = $"{pace}: {foreground}. No image is being shared.";
+        AwarenessStatusText.Text = $"{pace}: {foreground}.{providerContext}";
     }
 
     private void RemoteVisionChanged(object sender, RoutedEventArgs e)
     {
         if (!IsLoaded) return;
         _preferences.AllowRemoteVision = RemoteVisionCheckBox.IsChecked == true;
+        LiveProviderAwarenessCheckBox.IsEnabled = _preferences.AllowRemoteVision;
+        if (!_preferences.AllowRemoteVision) _liveAwarenessContext = null;
         _preferences.Save();
         Log(_preferences.AllowRemoteVision
             ? "One-view remote vision is allowed during an active session when the person selects a view or ASHA requests current visual context."
             : "Remote vision is off; desktop samples and selected evidence remain local.");
+    }
+
+    private void LiveProviderAwarenessChanged(object sender, RoutedEventArgs e)
+    {
+        if (!IsLoaded) return;
+        _preferences.LiveProviderAwareness = LiveProviderAwarenessCheckBox.IsChecked == true;
+        _preferences.Save();
+        if (_preferences.LiveProviderAwareness)
+        {
+            Log("Adaptive Qwen live awareness enabled. Only throttled changed keyframes may leave the PC while Live mode and a session are active.");
+            QueueLiveAwarenessRefresh(new LocalScreenChange(DateTime.UtcNow, 1));
+        }
+        else
+        {
+            _liveAwarenessContext = null;
+            Log("Adaptive Qwen live awareness disabled. Local desktop sampling is unchanged.");
+        }
+    }
+
+    private void QueueLiveAwarenessRefresh(LocalScreenChange change)
+    {
+        if (_liveAwarenessRefreshInFlight || _voiceTurnInFlight || _voiceCapturing ||
+            string.IsNullOrWhiteSpace(_activeSessionId) ||
+            _preferences.Vision != VisionPreference.Live ||
+            !_preferences.AllowRemoteVision ||
+            !_preferences.LiveProviderAwareness ||
+            !_voiceSession.SupportsVision ||
+            DateTime.UtcNow - _lastLiveAwarenessRefreshUtc < TimeSpan.FromSeconds(5)) return;
+
+        _lastLiveAwarenessRefreshUtc = DateTime.UtcNow;
+        _ = RefreshLiveAwarenessAsync(change);
+    }
+
+    private async Task RefreshLiveAwarenessAsync(LocalScreenChange change)
+    {
+        _liveAwarenessRefreshInFlight = true;
+        try
+        {
+            var scene = _awarenessCoordinator.Current;
+            var pointer = scene?.Pointer;
+            if (pointer is null && GetCursorPos(out var currentPointer))
+                pointer = new AwarenessPoint(currentPointer.X, currentPointer.Y);
+            if (pointer is null) return;
+
+            AwarenessStatusText.Text = "ASHA noticed a meaningful change and is refreshing her visual context…";
+            var frame = await _screenObserver.CaptureCurrentContextAsync(pointer.X, pointer.Y, _lifetimeCancellation.Token);
+            if (frame is null) return;
+            await ShowTransientLiveCaptureBoundaryAsync(frame);
+            var summary = await _voiceSession.DescribeDesktopViewAsync(frame, scene, _lifetimeCancellation.Token);
+            if (string.IsNullOrWhiteSpace(summary)) return;
+
+            _liveAwarenessContext = new DesktopAwarenessContext(DateTime.UtcNow, summary, change.ChangedScore);
+            AwarenessStatusText.Text = $"Qwen live awareness: {summary}";
+            await RecordActiveSessionEventAsync(
+                "vision.live_awareness_updated",
+                summary,
+                "system",
+                "ambient_desktop_awareness",
+                new
+                {
+                    app = scene?.Foreground?.ProcessName ?? "desktop",
+                    label = scene?.Foreground?.DisplayName ?? "current desktop",
+                    control = "adaptive changed keyframe",
+                    x = frame.ContextX,
+                    y = frame.ContextY,
+                    w = frame.ContextWidth,
+                    h = frame.ContextHeight,
+                    changeScore = change.ChangedScore,
+                });
+            Log($"Adaptive live visual context updated (change score {change.ChangedScore:0.000}).");
+        }
+        catch (OperationCanceledException)
+        {
+            // ASHA is closing.
+        }
+        catch (Exception error)
+        {
+            AwarenessStatusText.Text = $"Live visual awareness could not refresh: {ShortReason(error)}";
+            Log($"Adaptive live-awareness error: {error.Message}");
+        }
+        finally
+        {
+            _liveAwarenessRefreshInFlight = false;
+        }
+    }
+
+    private async Task ShowTransientLiveCaptureBoundaryAsync(VisionAttachment frame)
+    {
+        if (!frame.ContextX.HasValue || !frame.ContextY.HasValue ||
+            !frame.ContextWidth.HasValue || !frame.ContextHeight.HasValue) return;
+
+        var id = $"asha-live-capture-{Guid.NewGuid():N}";
+        var boundary = new MarkRequest(id, "frame", frame.ContextX.Value, frame.ContextY.Value,
+            frame.ContextWidth.Value, frame.ContextHeight.Value, null, "#76B6FF");
+        try
+        {
+            await RunAshaAsync("mark", JsonSerializer.Serialize(boundary, JsonOptions));
+            _ = Task.Run(async () =>
+            {
+                await Task.Delay(700);
+                try { StartAshaWithoutWaiting("clear", id); } catch { }
+            });
+        }
+        catch (Exception error)
+        {
+            Log($"Could not show the live-awareness capture boundary: {error.Message}");
+        }
     }
 
     private async void CaptureVisionEvidence_Click(object sender, RoutedEventArgs e)
@@ -884,6 +1002,8 @@ public partial class MainWindow : Window
         };
         ControlPresenceCheckBox.IsChecked = _preferences.ShowControlPresence;
         RemoteVisionCheckBox.IsChecked = _preferences.AllowRemoteVision;
+        LiveProviderAwarenessCheckBox.IsChecked = _preferences.LiveProviderAwareness;
+        LiveProviderAwarenessCheckBox.IsEnabled = _preferences.AllowRemoteVision;
     }
 
     private static string ProfileDisplayName(AshaProfile profile) => profile switch
@@ -1158,6 +1278,7 @@ public partial class MainWindow : Window
                     _preferences.Vision != VisionPreference.Off &&
                     _preferences.AllowRemoteVision &&
                     _voiceSession.SupportsVision,
+                _liveAwarenessContext,
                 _voiceTurnCancellation.Token);
             if (!string.IsNullOrWhiteSpace(result.Transcript)) AddConversation("You", result.Transcript);
             AddConversation("ASHA", result.Reply);
@@ -1702,10 +1823,12 @@ public partial class MainWindow : Window
         _boxDrawingPreview?.Close();
         _conversationActive = false;
         _voiceTurnCancellation?.Cancel();
+        _lifetimeCancellation.Cancel();
         _microphone.Dispose();
         _voiceSession.Dispose();
         _screenObserver.Dispose();
         _awarenessCoordinator.Dispose();
+        _lifetimeCancellation.Dispose();
         _trayIcon.Visible = false;
         _trayIcon.Dispose();
         if (_source is not null)
@@ -1846,6 +1969,8 @@ public partial class MainWindow : Window
         _screenObserver.Stop();
         _awarenessCoordinator.Stop();
         _latestVisionEvidence = null;
+        _liveAwarenessContext = null;
+        _lastLiveAwarenessRefreshUtc = DateTime.MinValue;
         _activeSessionId = null;
         _preferences.ActiveSessionId = null;
         _preferences.Save();

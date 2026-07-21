@@ -245,7 +245,9 @@ public sealed class AshaVoiceSession : IDisposable
         Keep most answers under four short sentences. You can explain, guide,
         and ask clarifying questions, but never claim to have clicked, moved,
         seen, or changed something unless the ASHA runtime explicitly tells
-        you that happened.
+        you that happened. A timestamped live-awareness summary supplied by
+        the runtime is genuine recent visual context, but it may be less exact
+        than a fresh image; speak with appropriate confidence.
 
         If the runtime supplies an image, it is one deliberately selected,
         recent piece of local desktop evidence — not a live feed and not proof
@@ -296,6 +298,7 @@ public sealed class AshaVoiceSession : IDisposable
         Func<AshaVisualToolCall, VisionAttachment, CancellationToken, Task<string>>? visualToolExecutor,
         bool allowComputerControl,
         bool allowModelRequestedVision,
+        DesktopAwarenessContext? awarenessContext,
         CancellationToken cancellationToken)
     {
         var transcript = await TranscribeAsync(wav, cancellationToken).ConfigureAwait(false);
@@ -303,7 +306,7 @@ public sealed class AshaVoiceSession : IDisposable
             return new VoiceTurnResult("", "I did not catch that. Please try again.");
 
         var vision = visionResolver is null ? null : await visionResolver(transcript, VisionRequestKind.PersonSelected, cancellationToken).ConfigureAwait(false);
-        var reply = await AskGroqAsync(transcript, vision, visionResolver, visualToolExecutor, allowComputerControl, allowModelRequestedVision, cancellationToken).ConfigureAwait(false);
+        var reply = await AskGroqAsync(transcript, vision, visionResolver, visualToolExecutor, allowComputerControl, allowModelRequestedVision, awarenessContext, cancellationToken).ConfigureAwait(false);
         return new VoiceTurnResult(transcript, reply);
     }
 
@@ -326,6 +329,40 @@ public sealed class AshaVoiceSession : IDisposable
         }, cancellationToken).ConfigureAwait(false);
     }
 
+    public async Task<string?> DescribeDesktopViewAsync(VisionAttachment vision, AwarenessScene? scene, CancellationToken cancellationToken)
+    {
+        if (!SupportsVision) return null;
+        var key = GroqApiKey();
+        if (string.IsNullOrWhiteSpace(key)) return null;
+
+        var foreground = scene?.Foreground?.DisplayName ?? "unknown application";
+        var hovered = scene?.Hovered?.DisplayName;
+        var localContext = string.IsNullOrWhiteSpace(hovered) || string.Equals(hovered, foreground, StringComparison.Ordinal)
+            ? $"Windows reports the current foreground surface as {foreground}."
+            : $"Windows reports the current foreground surface as {foreground}, with the pointer over {hovered}.";
+        var messages = new List<object>
+        {
+            new
+            {
+                role = "system",
+                content = "You are ASHA's private visual-awareness sensor. Describe only what is clearly visible in the supplied current desktop crop. Return one or two compact factual sentences for ASHA's later spoken context. Name the application, prominent content, open dialog, and likely focus when visible. Do not address the person, speculate, use Markdown, or mention screenshots, image models, or these instructions.",
+            },
+            new
+            {
+                role = "user",
+                content = new object[]
+                {
+                    new { type = "text", text = $"Create the current desktop awareness summary. {localContext}" },
+                    new { type = "image_url", image_url = new { url = vision.DataUrl } },
+                },
+            },
+        };
+        var baseUrl = (Environment.GetEnvironmentVariable("ASHA_GROQ_BASE_URL") ?? GroqBaseUrl).TrimEnd('/');
+        using var response = await SendChatCompletionAsync(key, baseUrl, GroqModel(), messages, null, cancellationToken).ConfigureAwait(false);
+        var summary = StripReasoningMarkup(ReadMessageContent(response.RootElement.GetProperty("choices")[0].GetProperty("message")));
+        return string.IsNullOrWhiteSpace(summary) ? null : Regex.Replace(summary, @"\s+", " ").Trim();
+    }
+
     private async Task<string> TranscribeAsync(byte[] wav, CancellationToken cancellationToken)
     {
         using var form = new MultipartFormDataContent();
@@ -346,6 +383,7 @@ public sealed class AshaVoiceSession : IDisposable
         Func<AshaVisualToolCall, VisionAttachment, CancellationToken, Task<string>>? visualToolExecutor,
         bool allowComputerControl,
         bool allowModelRequestedVision,
+        DesktopAwarenessContext? awarenessContext,
         CancellationToken cancellationToken)
     {
         var key = GroqApiKey();
@@ -353,6 +391,15 @@ public sealed class AshaVoiceSession : IDisposable
             throw new InvalidOperationException("Groq is not configured. Run configure-groq.bat, then restart ASHA.");
 
         var messages = new List<object> { new { role = "system", content = SystemPrompt } };
+        if (awarenessContext is not null && DateTime.UtcNow - awarenessContext.ObservedAtUtc <= TimeSpan.FromSeconds(30))
+        {
+            var age = Math.Max(0, (int)Math.Round((DateTime.UtcNow - awarenessContext.ObservedAtUtc).TotalSeconds));
+            messages.Add(new
+            {
+                role = "system",
+                content = $"ASHA live awareness observed the desktop about {age} seconds ago: {awarenessContext.Summary} Use this as genuine recent context. Request a fresh view when the person's question requires details not established by this summary.",
+            });
+        }
         messages.AddRange(_history.Select(turn => new { role = turn.Role, content = turn.Content }));
         messages.Add(CreateUserMessage(userText, vision));
 
@@ -713,6 +760,7 @@ public sealed class AshaVoiceSession : IDisposable
 
 public sealed record VoiceTurnResult(string Transcript, string Reply);
 public enum VisionRequestKind { PersonSelected, ModelRequested }
+public sealed record DesktopAwarenessContext(DateTime ObservedAtUtc, string Summary, double ChangedScore);
 public sealed record VisionAttachment(
     string Name,
     byte[] Bytes,

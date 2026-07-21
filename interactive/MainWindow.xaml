@@ -117,12 +117,16 @@
                         </StackPanel>
                     </Grid>
 
-                    <Border Grid.Row="1" Margin="0,16,0,0" Padding="12" CornerRadius="15" Background="#DFF2FF" BorderBrush="#C2E0F3" BorderThickness="1">
+                    <Border Grid.Row="1" Height="142" Margin="0,16,0,0" Padding="12" CornerRadius="15" Background="#DFF2FF" BorderBrush="#C2E0F3" BorderThickness="1">
                         <StackPanel>
                             <TextBlock FontWeight="SemiBold" Foreground="#214E7D">Live voice</TextBlock>
-                            <TextBlock x:Name="StatusText" Margin="0,3,0,0" FontSize="12" TextWrapping="Wrap" Foreground="#4B6683" />
-                            <TextBlock x:Name="CurrentSessionText" Margin="0,7,0,0" FontSize="10" TextWrapping="Wrap" Foreground="#295A8D"
-                                       Text="Session: none — the next conversation starts one" />
+                            <ScrollViewer Height="34" Margin="0,3,0,0" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+                                <TextBlock x:Name="StatusText" FontSize="12" TextWrapping="Wrap" Foreground="#4B6683" />
+                            </ScrollViewer>
+                            <ScrollViewer Height="27" Margin="0,7,0,0" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+                                <TextBlock x:Name="CurrentSessionText" FontSize="10" TextWrapping="Wrap" Foreground="#295A8D"
+                                           Text="Session: none — the next conversation starts one" />
+                            </ScrollViewer>
                             <TextBlock Margin="0,10,0,0" FontSize="11" Foreground="#62788D" TextWrapping="Wrap">Tap once to talk · ASHA detects pauses · centre ends</TextBlock>
                         </StackPanel>
                     </Border>
@@ -204,19 +208,30 @@
                                 <ComboBox x:Name="VisionModeBox" Margin="0,9,0,0" SelectionChanged="VisionModeBox_SelectionChanged">
                                     <ComboBoxItem Tag="Off" Content="Off — no desktop frames" />
                                     <ComboBoxItem Tag="OnChange" Content="Session awareness — low-resource local samples" />
-                                    <ComboBoxItem Tag="Live" Content="Live awareness — faster local samples during a session" />
+                                    <ComboBoxItem Tag="Live" Content="Live — fast local awareness" />
                                 </ComboBox>
                                 <Button Margin="0,9,0,0" Padding="9,5" HorizontalAlignment="Left" Click="CaptureVisionEvidence_Click">Let ASHA look once</Button>
-                                <TextBlock x:Name="AwarenessStatusText" Margin="0,7,0,0" FontSize="10" Foreground="#496C8C" TextWrapping="Wrap"
-                                           Text="Local awareness is idle until you start a session." />
                                 <CheckBox x:Name="RemoteVisionCheckBox" Margin="0,9,0,0" Checked="RemoteVisionChanged" Unchecked="RemoteVisionChanged"
                                           Content="Allow ASHA to request and send one current view when needed" />
                                 <TextBlock Margin="0,3,0,0" FontSize="10" Foreground="#71869B" TextWrapping="Wrap"
                                            Text="This is off by default. During an active session, ASHA may request one fresh view for a visual question. It never sends a desktop video or images with ordinary chat." />
                                 <CheckBox x:Name="LiveProviderAwarenessCheckBox" Margin="0,9,0,0" Checked="LiveProviderAwarenessChanged" Unchecked="LiveProviderAwarenessChanged"
-                                          Content="Keep Qwen visually aware from changed keyframes in Live mode" />
+                                          Content="Keep ASHA visually aware of screen changes" />
                                 <TextBlock Margin="0,3,0,0" FontSize="10" Foreground="#71869B" TextWrapping="Wrap"
-                                           Text="When enabled, meaningful local changes may send at most one current crop every five seconds. Qwen keeps a compact scene summary; unchanged frames are skipped." />
+                                           Text="When enabled, meaningful local changes may send at most one current crop every five seconds. The configured vision model keeps a compact scene summary; unchanged frames are skipped." />
+                                <Border Height="92" Margin="0,10,0,0" Padding="9" CornerRadius="11" Background="#E8F6FF" BorderBrush="#C7E2F4" BorderThickness="1">
+                                    <Grid>
+                                        <Grid.RowDefinitions>
+                                            <RowDefinition Height="Auto" />
+                                            <RowDefinition Height="*" />
+                                        </Grid.RowDefinitions>
+                                        <TextBlock FontSize="11" FontWeight="SemiBold" Foreground="#214E7D">Current visual context</TextBlock>
+                                        <ScrollViewer Grid.Row="1" Margin="0,5,0,0" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+                                            <TextBlock x:Name="AwarenessStatusText" FontSize="10" Foreground="#496C8C" TextWrapping="Wrap"
+                                                       Text="Local awareness is idle until you start a session." />
+                                        </ScrollViewer>
+                                    </Grid>
+                                </Border>
                                 <CheckBox x:Name="ControlPresenceCheckBox" Margin="0,9,0,0" Checked="ControlPresenceChanged" Unchecked="ControlPresenceChanged"
                                           Content="Show the blue-violet desktop-control presence when ASHA is acting" />
                             </StackPanel>

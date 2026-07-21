@@ -351,13 +351,45 @@ public sealed class AshaVoiceSession : IDisposable
         DesktopAwarenessContext? awarenessContext,
         CancellationToken cancellationToken)
     {
-        var transcript = await TranscribeAsync(wav, cancellationToken).ConfigureAwait(false);
+        var transcript = await TranscribeTurnAsync(wav, cancellationToken).ConfigureAwait(false);
         if (string.IsNullOrWhiteSpace(transcript))
             return new VoiceTurnResult("", "I did not catch that. Please try again.");
 
-        var vision = visionResolver is null ? null : await visionResolver(transcript, VisionRequestKind.PersonSelected, cancellationToken).ConfigureAwait(false);
-        var reply = await AskGroqAsync(transcript, vision, visionResolver, visualToolExecutor, allowComputerControl, allowModelRequestedVision, awarenessContext, cancellationToken).ConfigureAwait(false);
+        var reply = await RespondToTranscriptAsync(
+            transcript,
+            visionResolver,
+            visualToolExecutor,
+            allowComputerControl,
+            allowModelRequestedVision,
+            awarenessContext,
+            cancellationToken).ConfigureAwait(false);
         return new VoiceTurnResult(transcript, reply);
+    }
+
+    public Task<string> TranscribeTurnAsync(byte[] wav, CancellationToken cancellationToken) =>
+        TranscribeAsync(wav, cancellationToken);
+
+    public async Task<string> RespondToTranscriptAsync(
+        string transcript,
+        Func<string, VisionRequestKind, CancellationToken, Task<VisionAttachment?>>? visionResolver,
+        Func<AshaVisualToolCall, VisionAttachment, CancellationToken, Task<string>>? visualToolExecutor,
+        bool allowComputerControl,
+        bool allowModelRequestedVision,
+        DesktopAwarenessContext? awarenessContext,
+        CancellationToken cancellationToken)
+    {
+        var vision = visionResolver is null
+            ? null
+            : await visionResolver(transcript, VisionRequestKind.PersonSelected, cancellationToken).ConfigureAwait(false);
+        return await AskGroqAsync(
+            transcript,
+            vision,
+            visionResolver,
+            visualToolExecutor,
+            allowComputerControl,
+            allowModelRequestedVision,
+            awarenessContext,
+            cancellationToken).ConfigureAwait(false);
     }
 
     public async Task SpeakAsync(string text, CancellationToken cancellationToken)
@@ -617,9 +649,18 @@ public sealed class AshaVoiceSession : IDisposable
             Content = JsonContent.Create(payload),
         };
         request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", key);
-        using var response = await _http.SendAsync(request, cancellationToken).ConfigureAwait(false);
-        await EnsureSuccessAsync(response, "Groq", cancellationToken).ConfigureAwait(false);
-        return JsonDocument.Parse(await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false));
+        using var requestDeadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        requestDeadline.CancelAfter(maxTokens > 420 ? TimeSpan.FromSeconds(45) : TimeSpan.FromSeconds(20));
+        try
+        {
+            using var response = await _http.SendAsync(request, requestDeadline.Token).ConfigureAwait(false);
+            await EnsureSuccessAsync(response, "Groq", requestDeadline.Token).ConfigureAwait(false);
+            return JsonDocument.Parse(await response.Content.ReadAsStringAsync(requestDeadline.Token).ConfigureAwait(false));
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            throw new TimeoutException("ASHA's model response took too long. The microphone will reopen so you can continue.");
+        }
     }
 
     private static string? ReadMessageContent(JsonElement message) =>

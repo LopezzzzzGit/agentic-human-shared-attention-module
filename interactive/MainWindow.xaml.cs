@@ -984,7 +984,11 @@ public partial class MainWindow : Window
             !_preferences.LiveProviderAwareness ||
             !_voiceSession.SupportsVision) return;
 
-        if (_liveAwarenessRefreshInFlight || _voiceTurnInFlight || _voiceCapturing)
+        // Voice is the foreground interaction. During a live conversation,
+        // retain only the newest changed keyframe and analyse it in the safe
+        // window while ASHA speaks. A background vision call must never race
+        // the microphone re-arm or the person's next model turn.
+        if (_liveAwarenessRefreshInFlight || _conversationActive || _voiceTurnInFlight || _voiceCapturing)
         {
             _pendingLiveScreenChange = change;
             return;
@@ -992,10 +996,10 @@ public partial class MainWindow : Window
         if (DateTime.UtcNow - _lastLiveAwarenessRefreshUtc < TimeSpan.FromSeconds(5)) return;
 
         _lastLiveAwarenessRefreshUtc = DateTime.UtcNow;
-        _ = RefreshLiveAwarenessAsync(change);
+        _ = RefreshLiveAwarenessAsync(change, _lifetimeCancellation.Token);
     }
 
-    private async Task RefreshLiveAwarenessAsync(LocalScreenChange change)
+    private async Task RefreshLiveAwarenessAsync(LocalScreenChange change, CancellationToken cancellationToken)
     {
         _liveAwarenessRefreshInFlight = true;
         try
@@ -1007,10 +1011,10 @@ public partial class MainWindow : Window
             if (pointer is null) return;
 
             AwarenessStatusText.Text = "ASHA noticed a meaningful change and is refreshing her visual context…";
-            var frame = await _screenObserver.CaptureCurrentContextAsync(pointer.X, pointer.Y, _lifetimeCancellation.Token);
+            var frame = await _screenObserver.CaptureCurrentContextAsync(pointer.X, pointer.Y, cancellationToken);
             if (frame is null) return;
             await ShowTransientLiveCaptureBoundaryAsync(frame);
-            var summary = await _voiceSession.DescribeDesktopViewAsync(frame, scene, _lifetimeCancellation.Token);
+            var summary = await _voiceSession.DescribeDesktopViewAsync(frame, scene, cancellationToken);
             if (string.IsNullOrWhiteSpace(summary)) return;
 
             _liveAwarenessContext = new DesktopAwarenessContext(DateTime.UtcNow, summary, change.ChangedScore);
@@ -1259,7 +1263,7 @@ public partial class MainWindow : Window
         if (StartVoiceCapture()) AshaEarcons.ConversationStarted();
     }
 
-    private bool StartVoiceCapture()
+    private bool StartVoiceCapture(bool keepConversationReadyOnFailure = false)
     {
         try
         {
@@ -1278,7 +1282,7 @@ public partial class MainWindow : Window
         }
         catch (Exception error)
         {
-            _conversationActive = false;
+            if (!keepConversationReadyOnFailure) _conversationActive = false;
             _conversationBoundaryTimer.Stop();
             _dragPending = false;
             OrbSurface.ReleaseMouseCapture();
@@ -1300,7 +1304,7 @@ public partial class MainWindow : Window
             if (!_conversationActive || _reallyQuitting || _voiceTurnInFlight || !_voiceSession.IsGroqConfigured) return;
 
             _conversationActive = true;
-            if (StartVoiceCapture())
+            if (StartVoiceCapture(keepConversationReadyOnFailure: true))
             {
                 StatusText.Text = "Listening again… speak naturally. Tap ASHA's centre only when you want to end the conversation.";
                 Log($"Free conversation re-armed after reply (attempt {attempt}).");
@@ -1404,8 +1408,21 @@ public partial class MainWindow : Window
             OrbSurface.SetPresenceState(OrbPresenceState.Thinking);
             OrbSurface.SetAudioEnergy(0.16);
             StatusText.Text = "Thinking…";
-            var result = await _voiceSession.RespondAsync(
-                wav,
+            var transcript = await _voiceSession.TranscribeTurnAsync(wav, _voiceTurnCancellation.Token);
+            if (string.IsNullOrWhiteSpace(transcript))
+            {
+                StatusText.Text = "I did not catch that. I am still listening—please try again.";
+                return;
+            }
+
+            // Persist and show what the person said before any visual or model
+            // follow-up. If a provider call later fails, the spoken turn is
+            // still visible, reviewable, and part of the full session log.
+            await AddConversationAsync("You", transcript);
+            await MaybeNameActiveSessionAsync(transcript);
+
+            var reply = await _voiceSession.RespondToTranscriptAsync(
+                transcript,
                 ResolveVisionForTranscriptAsync,
                 ExecuteVisualToolAsync,
                 _controlSessionActive,
@@ -1415,18 +1432,28 @@ public partial class MainWindow : Window
                     _voiceSession.SupportsVision,
                 _liveAwarenessContext,
                 _voiceTurnCancellation.Token);
-            if (!string.IsNullOrWhiteSpace(result.Transcript))
-            {
-                await AddConversationAsync("You", result.Transcript);
-                await MaybeNameActiveSessionAsync(result.Transcript);
-            }
-            await AddConversationAsync("ASHA", result.Reply);
+            await AddConversationAsync("ASHA", reply);
             if (!string.IsNullOrWhiteSpace(_activeSessionId))
                 _ = RefreshSessionMemoryAsync(_activeSessionId, forceCompression: false);
 
             OrbSurface.SetPresenceState(OrbPresenceState.Speaking);
             StatusText.Text = "ASHA is speaking…";
-            await _voiceSession.SpeakAsync(result.Reply, _voiceTurnCancellation.Token);
+
+            // Continuous visual awareness gets one bounded opportunity while
+            // ASHA is already speaking. It is cancelled as soon as speech
+            // ends, so reopening the microphone is never held up by vision.
+            using var awarenessWindow = CancellationTokenSource.CreateLinkedTokenSource(_voiceTurnCancellation.Token);
+            awarenessWindow.CancelAfter(TimeSpan.FromSeconds(8));
+            var awarenessRefresh = RefreshPendingLiveAwarenessDuringReplyAsync(awarenessWindow.Token);
+            try
+            {
+                await _voiceSession.SpeakAsync(reply, _voiceTurnCancellation.Token);
+            }
+            finally
+            {
+                awarenessWindow.Cancel();
+                await awarenessRefresh;
+            }
         }
         catch (OperationCanceledException)
         {
@@ -1445,12 +1472,6 @@ public partial class MainWindow : Window
             _voiceTurnCancellation = null;
             _voiceTurnInFlight = false;
 
-            if (_pendingLiveScreenChange is { } pendingChange)
-            {
-                _pendingLiveScreenChange = null;
-                QueueLiveAwarenessRefresh(pendingChange);
-            }
-
             if (_conversationActive && !_reallyQuitting && _voiceSession.IsGroqConfigured)
             {
                 // Return to listening after ASHA finishes speaking. This is
@@ -1462,6 +1483,21 @@ public partial class MainWindow : Window
                      !StatusText.Text.Contains("unavailable", StringComparison.OrdinalIgnoreCase))
                 StatusText.Text = _voiceSession.IsGroqConfigured ? "Tap the orb to start listening." : "Configure Groq, then restart ASHA.";
         }
+    }
+
+    private async Task RefreshPendingLiveAwarenessDuringReplyAsync(CancellationToken cancellationToken)
+    {
+        if (_pendingLiveScreenChange is not { } change ||
+            _preferences.Vision != VisionPreference.Live ||
+            !_preferences.AllowRemoteVision ||
+            !_preferences.LiveProviderAwareness ||
+            !_voiceSession.SupportsVision ||
+            _liveAwarenessRefreshInFlight) return;
+
+        if (DateTime.UtcNow - _lastLiveAwarenessRefreshUtc < TimeSpan.FromSeconds(5)) return;
+        _pendingLiveScreenChange = null;
+        _lastLiveAwarenessRefreshUtc = DateTime.UtcNow;
+        await RefreshLiveAwarenessAsync(change, cancellationToken);
     }
 
     private async void PlaceCueAtPointer_Click(object sender, RoutedEventArgs e) => await MarkAtCurrentMouseAsync();

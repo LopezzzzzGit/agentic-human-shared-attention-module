@@ -255,6 +255,14 @@ public sealed class AshaVoiceSession : IDisposable
         you are uncertain. Do not say that you cannot see the screen when an
         image is supplied.
 
+        When the runtime offers asha_request_view but has not supplied an
+        image, use that tool whenever the person's request genuinely depends
+        on what is currently visible. This includes naturally phrased requests
+        to look, identify, read, compare, locate, demonstrate, or act on the
+        desktop. Do not guess and do not claim sight before the runtime returns
+        a view. Do not request a view for ordinary conversation that does not
+        need the desktop.
+
         When the runtime gives you the safe asha_mark tool together with a
         coordinate-mapped image, you may use it once to point out a visible
         target. It creates a visual overlay only; it never moves the person's
@@ -284,17 +292,18 @@ public sealed class AshaVoiceSession : IDisposable
 
     public async Task<VoiceTurnResult> RespondAsync(
         byte[] wav,
-        Func<string, CancellationToken, Task<VisionAttachment?>>? visionResolver,
+        Func<string, VisionRequestKind, CancellationToken, Task<VisionAttachment?>>? visionResolver,
         Func<AshaVisualToolCall, VisionAttachment, CancellationToken, Task<string>>? visualToolExecutor,
         bool allowComputerControl,
+        bool allowModelRequestedVision,
         CancellationToken cancellationToken)
     {
         var transcript = await TranscribeAsync(wav, cancellationToken).ConfigureAwait(false);
         if (string.IsNullOrWhiteSpace(transcript))
             return new VoiceTurnResult("", "I did not catch that. Please try again.");
 
-        var vision = visionResolver is null ? null : await visionResolver(transcript, cancellationToken).ConfigureAwait(false);
-        var reply = await AskGroqAsync(transcript, vision, visualToolExecutor, allowComputerControl, cancellationToken).ConfigureAwait(false);
+        var vision = visionResolver is null ? null : await visionResolver(transcript, VisionRequestKind.PersonSelected, cancellationToken).ConfigureAwait(false);
+        var reply = await AskGroqAsync(transcript, vision, visionResolver, visualToolExecutor, allowComputerControl, allowModelRequestedVision, cancellationToken).ConfigureAwait(false);
         return new VoiceTurnResult(transcript, reply);
     }
 
@@ -333,8 +342,10 @@ public sealed class AshaVoiceSession : IDisposable
     private async Task<string> AskGroqAsync(
         string userText,
         VisionAttachment? vision,
+        Func<string, VisionRequestKind, CancellationToken, Task<VisionAttachment?>>? visionResolver,
         Func<AshaVisualToolCall, VisionAttachment, CancellationToken, Task<string>>? visualToolExecutor,
         bool allowComputerControl,
+        bool allowModelRequestedVision,
         CancellationToken cancellationToken)
     {
         var key = GroqApiKey();
@@ -343,56 +354,54 @@ public sealed class AshaVoiceSession : IDisposable
 
         var messages = new List<object> { new { role = "system", content = SystemPrompt } };
         messages.AddRange(_history.Select(turn => new { role = turn.Role, content = turn.Content }));
-        object currentUserContent = userText;
-        if (vision is not null)
-        {
-            currentUserContent = new object[]
-            {
-                new { type = "text", text = $"{userText}\n\nASHA attached one current desktop image under the person's enabled shared-attention consent. Use it as visual context for this response. {vision.CoordinateInstruction}" },
-                new { type = "image_url", image_url = new { url = vision.DataUrl } },
-            };
-        }
-        messages.Add(new { role = "user", content = currentUserContent });
+        messages.Add(CreateUserMessage(userText, vision));
 
         var baseUrl = (Environment.GetEnvironmentVariable("ASHA_GROQ_BASE_URL") ?? GroqBaseUrl).TrimEnd('/');
         var model = GroqModel();
-        var tools = vision is not null && vision.HasDesktopMapping && visualToolExecutor is not null && SupportsVision
+        IReadOnlyList<object>? tools = vision is not null && vision.HasDesktopMapping && visualToolExecutor is not null && SupportsVision
             ? allowComputerControl ? VisualAndControlToolDefinitions : VisualToolDefinitions
-            : null;
+            : allowModelRequestedVision && visionResolver is not null && SupportsVision
+                ? ViewRequestToolDefinitions
+                : null;
         string? reply;
         using (var first = await SendChatCompletionAsync(key, baseUrl, model, messages, tools, cancellationToken).ConfigureAwait(false))
         {
             var message = first.RootElement.GetProperty("choices")[0].GetProperty("message");
             var toolCalls = ReadToolCalls(message);
-            if (toolCalls.Count == 0 || vision is null || visualToolExecutor is null)
+            var viewRequests = toolCalls.Where(call => string.Equals(call.Name, "asha_request_view", StringComparison.Ordinal)).ToArray();
+            if (vision is null && viewRequests.Length > 0 && visionResolver is not null)
             {
-                reply = ReadMessageContent(message);
-            }
-            else
-            {
-                messages.Add(new
+                vision = await visionResolver(userText, VisionRequestKind.ModelRequested, cancellationToken).ConfigureAwait(false);
+                if (vision is not null)
                 {
-                    role = "assistant",
-                    content = ReadMessageContent(message) ?? string.Empty,
-                    tool_calls = toolCalls.Select(call => new
-                    {
-                        id = call.Id,
-                        type = "function",
-                        function = new { name = call.Name, arguments = call.Arguments.GetRawText() },
-                    }).ToArray(),
-                });
-
-                foreach (var toolCall in toolCalls)
-                {
-                    string output;
-                    try { output = await visualToolExecutor(toolCall, vision, cancellationToken).ConfigureAwait(false); }
-                    catch (Exception error) { output = JsonSerializer.Serialize(new { ok = false, error = error.Message }); }
-                    messages.Add(new { role = "tool", tool_call_id = toolCall.Id, content = output });
+                    messages[^1] = CreateUserMessage(userText, vision);
+                    tools = vision.HasDesktopMapping && visualToolExecutor is not null
+                        ? allowComputerControl ? VisualAndControlToolDefinitions : VisualToolDefinitions
+                        : null;
+                    using var grounded = await SendChatCompletionAsync(key, baseUrl, model, messages, tools, cancellationToken).ConfigureAwait(false);
+                    var groundedMessage = grounded.RootElement.GetProperty("choices")[0].GetProperty("message");
+                    reply = await CompleteVisualToolCallsAsync(messages, groundedMessage, vision, visualToolExecutor, tools, key, baseUrl, model, cancellationToken).ConfigureAwait(false);
                 }
-
-                using var final = await SendChatCompletionAsync(key, baseUrl, model, messages, tools, cancellationToken).ConfigureAwait(false);
-                reply = ReadMessageContent(final.RootElement.GetProperty("choices")[0].GetProperty("message"));
+                else
+                {
+                    AppendAssistantToolCalls(messages, message, viewRequests);
+                    foreach (var request in viewRequests)
+                    {
+                        messages.Add(new
+                        {
+                            role = "tool",
+                            tool_call_id = request.Id,
+                            content = JsonSerializer.Serialize(new { ok = false, error = "A current desktop view is not available under the active session and privacy settings." }),
+                        });
+                    }
+                    using var unavailable = await SendChatCompletionAsync(key, baseUrl, model, messages, null, cancellationToken).ConfigureAwait(false);
+                    reply = ReadMessageContent(unavailable.RootElement.GetProperty("choices")[0].GetProperty("message"));
+                }
             }
+            else if (vision is not null && visualToolExecutor is not null)
+                reply = await CompleteVisualToolCallsAsync(messages, message, vision, visualToolExecutor, tools, key, baseUrl, model, cancellationToken).ConfigureAwait(false);
+            else
+                reply = ReadMessageContent(message);
         }
         reply = NormalizeHumanFacingReply(StripReasoningMarkup(reply));
         if (string.IsNullOrWhiteSpace(reply)) reply = "I have highlighted the relevant area for you.";
@@ -401,6 +410,62 @@ public sealed class AshaVoiceSession : IDisposable
         _history.Add(new ChatTurn("assistant", reply));
         while (_history.Count > 16) _history.RemoveRange(0, 2);
         return reply;
+    }
+
+    private static object CreateUserMessage(string userText, VisionAttachment? vision)
+    {
+        if (vision is null) return new { role = "user", content = (object)userText };
+        return new
+        {
+            role = "user",
+            content = (object)new object[]
+            {
+                new { type = "text", text = $"{userText}\n\nASHA attached one current desktop image under the person's enabled shared-attention consent. Use it as visual context for this response. {vision.CoordinateInstruction}" },
+                new { type = "image_url", image_url = new { url = vision.DataUrl } },
+            },
+        };
+    }
+
+    private async Task<string?> CompleteVisualToolCallsAsync(
+        List<object> messages,
+        JsonElement message,
+        VisionAttachment vision,
+        Func<AshaVisualToolCall, VisionAttachment, CancellationToken, Task<string>>? visualToolExecutor,
+        IReadOnlyList<object>? tools,
+        string key,
+        string baseUrl,
+        string model,
+        CancellationToken cancellationToken)
+    {
+        var toolCalls = ReadToolCalls(message);
+        if (toolCalls.Count == 0 || visualToolExecutor is null) return ReadMessageContent(message);
+
+        AppendAssistantToolCalls(messages, message, toolCalls);
+        foreach (var toolCall in toolCalls)
+        {
+            string output;
+            try { output = await visualToolExecutor(toolCall, vision, cancellationToken).ConfigureAwait(false); }
+            catch (Exception error) { output = JsonSerializer.Serialize(new { ok = false, error = error.Message }); }
+            messages.Add(new { role = "tool", tool_call_id = toolCall.Id, content = output });
+        }
+
+        using var final = await SendChatCompletionAsync(key, baseUrl, model, messages, tools, cancellationToken).ConfigureAwait(false);
+        return ReadMessageContent(final.RootElement.GetProperty("choices")[0].GetProperty("message"));
+    }
+
+    private static void AppendAssistantToolCalls(List<object> messages, JsonElement message, IReadOnlyList<AshaVisualToolCall> toolCalls)
+    {
+        messages.Add(new
+        {
+            role = "assistant",
+            content = ReadMessageContent(message) ?? string.Empty,
+            tool_calls = toolCalls.Select(call => new
+            {
+                id = call.Id,
+                type = "function",
+                function = new { name = call.Name, arguments = call.Arguments.GetRawText() },
+            }).ToArray(),
+        });
     }
 
     private async Task<JsonDocument> SendChatCompletionAsync(
@@ -465,6 +530,29 @@ public sealed class AshaVoiceSession : IDisposable
         }
         return calls;
     }
+
+    private static readonly IReadOnlyList<object> ViewRequestToolDefinitions =
+    [
+        new
+        {
+            type = "function",
+            function = new
+            {
+                name = "asha_request_view",
+                description = "Request one fresh, permission-gated view of the person's current desktop context when their request cannot be answered reliably without seeing what is visible. This does not click, type, or control the computer.",
+                parameters = new
+                {
+                    type = "object",
+                    additionalProperties = false,
+                    required = new[] { "reason" },
+                    properties = new
+                    {
+                        reason = new { type = "string", description = "A short human-facing reason the current view is needed." },
+                    },
+                },
+            },
+        },
+    ];
 
     private static readonly IReadOnlyList<object> VisualToolDefinitions =
     [
@@ -624,6 +712,7 @@ public sealed class AshaVoiceSession : IDisposable
 }
 
 public sealed record VoiceTurnResult(string Transcript, string Reply);
+public enum VisionRequestKind { PersonSelected, ModelRequested }
 public sealed record VisionAttachment(
     string Name,
     byte[] Bytes,

@@ -816,8 +816,8 @@ public partial class MainWindow : Window
         _preferences.AllowRemoteVision = RemoteVisionCheckBox.IsChecked == true;
         _preferences.Save();
         Log(_preferences.AllowRemoteVision
-            ? "Remote vision is allowed only for an explicit visual request in an active session."
-            : "Remote vision is off; selected desktop evidence remains local.");
+            ? "One-view remote vision is allowed during an active session when the person selects a view or ASHA requests current visual context."
+            : "Remote vision is off; desktop samples and selected evidence remain local.");
     }
 
     private async void CaptureVisionEvidence_Click(object sender, RoutedEventArgs e)
@@ -1154,6 +1154,10 @@ public partial class MainWindow : Window
                 ResolveVisionForTranscriptAsync,
                 ExecuteVisualToolAsync,
                 _controlSessionActive,
+                !string.IsNullOrWhiteSpace(_activeSessionId) &&
+                    _preferences.Vision != VisionPreference.Off &&
+                    _preferences.AllowRemoteVision &&
+                    _voiceSession.SupportsVision,
                 _voiceTurnCancellation.Token);
             if (!string.IsNullOrWhiteSpace(result.Transcript)) AddConversation("You", result.Transcript);
             AddConversation("ASHA", result.Reply);
@@ -1910,14 +1914,37 @@ public partial class MainWindow : Window
         }
     }
 
-    private async Task<VisionAttachment?> ResolveVisionForTranscriptAsync(string transcript, CancellationToken cancellationToken)
+    private async Task<VisionAttachment?> ResolveVisionForTranscriptAsync(string transcript, VisionRequestKind requestKind, CancellationToken cancellationToken)
     {
-        if (!_shareVisionOnNextTurn) return null;
-        _shareVisionOnNextTurn = false;
+        if (!Dispatcher.CheckAccess())
+            return await Dispatcher.InvokeAsync(() => ResolveVisionForTranscriptAsync(transcript, requestKind, cancellationToken)).Task.Unwrap();
+
+        var personSelected = requestKind == VisionRequestKind.PersonSelected;
+        if (personSelected && !_shareVisionOnNextTurn) return null;
+        if (personSelected) _shareVisionOnNextTurn = false;
+
+        if (string.IsNullOrWhiteSpace(_activeSessionId) ||
+            _preferences.Vision == VisionPreference.Off ||
+            !_preferences.AllowRemoteVision ||
+            !_voiceSession.SupportsVision)
+            return null;
 
         var evidence = _latestVisionEvidence;
-        if (evidence is null || string.IsNullOrWhiteSpace(_activeSessionId) || !_preferences.AllowRemoteVision || !_voiceSession.SupportsVision)
-            return null;
+        if (requestKind == VisionRequestKind.ModelRequested)
+        {
+            var scene = _awarenessCoordinator.Current;
+            var pointer = scene?.Pointer;
+            if (pointer is null && GetCursorPos(out var currentPointer))
+                pointer = new AwarenessPoint(currentPointer.X, currentPointer.Y);
+            if (pointer is null) return null;
+
+            var nativePoint = new NativePoint { X = pointer.X, Y = pointer.Y };
+            var surface = ResolveTopmostSurface(nativePoint);
+            evidence = await CaptureVisionEvidenceAsync("model requested view", pointer.X, pointer.Y, surface);
+            if (evidence is not null) await ShowTransientCaptureBoundaryAsync(evidence);
+        }
+
+        if (evidence is null) return null;
 
         var attachment = LoadVisionAttachment(evidence);
         if (attachment is null)
@@ -1928,13 +1955,55 @@ public partial class MainWindow : Window
 
         await RecordActiveSessionEventAsync(
             "vision.shared_with_provider",
-            "The person selected one current desktop view for ASHA's next spoken turn.",
+            personSelected
+                ? "The person selected one current desktop view for ASHA's next spoken turn."
+                : "ASHA requested one current desktop view because the person's spoken turn required visual context.",
             "system",
-            "selected_voice_turn_awareness",
-            new { app = "desktop", label = "person-selected view", control = "one-shot visual share", x = evidence.ContextX, y = evidence.ContextY, w = evidence.ContextWidth, h = evidence.ContextHeight },
+            personSelected ? "selected_voice_turn_awareness" : "model_requested_awareness",
+            new
+            {
+                app = "desktop",
+                label = personSelected ? "person-selected view" : "model-requested view",
+                control = "one-view visual share",
+                x = evidence.ContextX,
+                y = evidence.ContextY,
+                w = evidence.ContextWidth,
+                h = evidence.ContextHeight,
+            },
             EvidencePayload(evidence));
-        StatusText.Text = "ASHA is looking at the selected view…";
+        StatusText.Text = personSelected ? "ASHA is looking at the selected view…" : "ASHA requested and received one current view…";
         return attachment;
+    }
+
+    private async Task ShowTransientCaptureBoundaryAsync(VisualEvidenceBundle evidence)
+    {
+        if (!evidence.ContextX.HasValue || !evidence.ContextY.HasValue ||
+            !evidence.ContextWidth.HasValue || !evidence.ContextHeight.HasValue) return;
+
+        var id = $"asha-capture-{Guid.NewGuid():N}";
+        var boundary = new MarkRequest(
+            id,
+            "frame",
+            evidence.ContextX.Value,
+            evidence.ContextY.Value,
+            evidence.ContextWidth.Value,
+            evidence.ContextHeight.Value,
+            null,
+            "#76B6FF");
+        try
+        {
+            await RunAshaAsync("mark", JsonSerializer.Serialize(boundary, JsonOptions));
+            Log("ASHA briefly showed the exact desktop region included in her requested view.");
+            _ = Task.Run(async () =>
+            {
+                await Task.Delay(1_200);
+                try { StartAshaWithoutWaiting("clear", id); } catch { }
+            });
+        }
+        catch (Exception error)
+        {
+            Log($"Could not show the temporary capture boundary: {error.Message}");
+        }
     }
 
     private static VisionAttachment? LoadVisionAttachment(VisualEvidenceBundle evidence)

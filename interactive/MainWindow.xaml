@@ -204,9 +204,9 @@
                                 <TextBlock x:Name="AwarenessStatusText" Margin="0,7,0,0" FontSize="10" Foreground="#496C8C" TextWrapping="Wrap"
                                            Text="Local awareness is idle until you start a session." />
                                 <CheckBox x:Name="RemoteVisionCheckBox" Margin="0,9,0,0" Checked="RemoteVisionChanged" Unchecked="RemoteVisionChanged"
-                                          Content="Allow ASHA to send a view I explicitly select to the configured AI" />
+                                          Content="Allow ASHA to request and send one current view when needed" />
                                 <TextBlock Margin="0,3,0,0" FontSize="10" Foreground="#71869B" TextWrapping="Wrap"
-                                           Text="This is off by default. Let ASHA look once sends one selected view with your next spoken turn, never a desktop video or ordinary chat." />
+                                           Text="This is off by default. During an active session, ASHA may request one fresh view for a visual question. It never sends a desktop video or images with ordinary chat." />
                                 <CheckBox x:Name="ControlPresenceCheckBox" Margin="0,9,0,0" Checked="ControlPresenceChanged" Unchecked="ControlPresenceChanged"
                                           Content="Show the blue-violet desktop-control presence when ASHA is acting" />
                             </StackPanel>

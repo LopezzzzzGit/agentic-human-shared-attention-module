@@ -158,6 +158,32 @@ export class SessionLedger {
     return session;
   }
 
+  async listSessions(projectId?: string): Promise<AshaSession[]> {
+    const sessions = await this.readSessions();
+    return sessions
+      .filter((session) => !projectId || session.projectId === projectId)
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
+      .map((session) => structuredClone(session));
+  }
+
+  async resumeSession(sessionId: string): Promise<AshaSession> {
+    const session = await this.requireSession(sessionId);
+    if (session.closedAt) delete session.closedAt;
+    session.updatedAt = this.timestamp();
+    await this.saveSession(session);
+    await this.touchProject(session.projectId, session.updatedAt);
+    return session;
+  }
+
+  async renameSession(sessionId: string, title: string): Promise<AshaSession> {
+    const session = await this.requireSession(sessionId);
+    session.title = requiredText(title, "Session title");
+    session.updatedAt = this.timestamp();
+    await this.saveSession(session);
+    await this.touchProject(session.projectId, session.updatedAt);
+    return session;
+  }
+
   async addLink(sessionId: string, link: HarnessLink): Promise<AshaSession> {
     const session = await this.requireSession(sessionId);
     const normalized = normalizeLink(link);

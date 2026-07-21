@@ -104,6 +104,7 @@ function usage(): string {
     "  asha project create <title> [--id <id>] | asha project list",
     "  asha session start --project <project-id> --title <title> [--harness <name> --harness-project <id> --harness-session <id> --url <url>]",
     "  asha session link <session-id> --harness <name> [--harness-project <id> --harness-session <id> --url <url>]",
+    "  asha session list [--project <id>] | resume <session-id> | rename <session-id> --title <title>",
     "  asha session record <session-id> '<semantic-event-json>' | record-many <session-id> '<semantic-event-array-json>' | show <session-id> | find <words> [--project <id>] | close <session-id>",
   ].join("\n");
 }
@@ -150,6 +151,15 @@ async function manageProject(args: string[]): Promise<Record<string, unknown>> {
 async function manageSession(args: string[]): Promise<Record<string, unknown>> {
   const ledger = new SessionLedger();
   switch (args[0]) {
+    case "list":
+      return { sessions: await ledger.listSessions(option(args, "--project")) };
+    case "resume":
+      return { session: await ledger.resumeSession(requireArgument(args[1], "asha session resume <session-id>")) };
+    case "rename": {
+      const sessionId = requireArgument(args[1], "asha session rename <session-id> --title <title>");
+      const title = requireArgument(option(args, "--title"), "asha session rename <session-id> --title <title>");
+      return { session: await ledger.renameSession(sessionId, title) };
+    }
     case "start": {
       const projectId = requireArgument(option(args, "--project"), "asha session start --project <project-id> --title <title>");
       const title = requireArgument(option(args, "--title"), "asha session start --project <project-id> --title <title>");
@@ -182,7 +192,7 @@ async function manageSession(args: string[]): Promise<Record<string, unknown>> {
     case "close":
       return { session: await ledger.closeSession(requireArgument(args[1], "asha session close <session-id>")) };
     default:
-      throw new Error("Usage: asha session start|link|record|show|find|close …");
+      throw new Error("Usage: asha session start|list|resume|rename|link|record|show|find|close …");
   }
 }
 

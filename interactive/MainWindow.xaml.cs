@@ -57,6 +57,7 @@ public partial class MainWindow : Window
     private readonly Forms.NotifyIcon _trayIcon;
     private readonly string _repositoryRoot;
     private ConversationWindow? _conversationWindow;
+    private SessionLibraryWindow? _sessionLibraryWindow;
     private HwndSource? _source;
     private bool _markHotkeyRegistered;
     private Point _dragOrigin;
@@ -94,14 +95,18 @@ public partial class MainWindow : Window
     private string? _latestCuratedRecordingPath;
     private TeachingReviewWindow? _teachingReviewWindow;
     private string? _activeSessionId;
+    private string? _activeSessionTitle;
+    private bool _activeSessionNeedsTitle;
     private VisualEvidenceBundle? _latestVisionEvidence;
     private bool _shareVisionOnNextTurn;
     private DesktopAwarenessContext? _liveAwarenessContext;
+    private LocalScreenChange? _pendingLiveScreenChange;
     private bool _liveAwarenessRefreshInFlight;
     private DateTime _lastLiveAwarenessRefreshUtc;
     private CancellationTokenSource? _voiceTurnCancellation;
     private readonly CancellationTokenSource _lifetimeCancellation = new();
     private readonly SemaphoreSlim _sessionWriteGate = new(1, 1);
+    private readonly SemaphoreSlim _memoryRefreshGate = new(1, 1);
 
     public MainWindow()
     {
@@ -400,6 +405,32 @@ public partial class MainWindow : Window
 
     private void Profile_Click(object sender, RoutedEventArgs e) => TogglePanel(ProfilePanel, SettingsPanel);
 
+    private async void Sessions_Click(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            var sessions = await ReadSessionLibraryAsync();
+            _sessionLibraryWindow?.Close();
+            var window = new SessionLibraryWindow(sessions) { Owner = this, Topmost = Topmost };
+            _sessionLibraryWindow = window;
+            window.Closed += (_, _) =>
+            {
+                if (ReferenceEquals(_sessionLibraryWindow, window)) _sessionLibraryWindow = null;
+            };
+            window.ContinueRequested += sessionId => _ = ContinueSessionAsync(sessionId, window);
+            window.NewSessionRequested += () => _ = StartNewSessionFromLibraryAsync(window);
+            window.Left = Math.Max(SystemParameters.WorkArea.Left + 18, SystemParameters.WorkArea.Right - window.Width - 28);
+            window.Top = Math.Max(SystemParameters.WorkArea.Top + 18, SystemParameters.WorkArea.Top + 74);
+            window.Show();
+            window.Activate();
+        }
+        catch (Exception error)
+        {
+            SessionStatusText.Text = $"Could not open sessions: {ShortReason(error)}";
+            Log($"Session library error: {error.Message}");
+        }
+    }
+
     private void Settings_Click(object sender, RoutedEventArgs e) => TogglePanel(SettingsPanel, ProfilePanel);
 
     private void TogglePanel(FrameworkElement target, FrameworkElement other)
@@ -423,33 +454,15 @@ public partial class MainWindow : Window
     {
         if (!string.IsNullOrWhiteSpace(_activeSessionId))
         {
-            if (_teachRecorder is { HasExited: false })
-            {
-                SessionStatusText.Text = "Finish the teaching recording with Esc before ending this session.";
-                return;
-            }
-
-            var endingId = _activeSessionId;
-            try
-            {
-                await RecordActiveSessionEventAsync("session.ended", "The person ended this shared-attention session.");
-                await _sessionWriteGate.WaitAsync();
-                try { await RunAshaAsync("session", "close", endingId); }
-                finally { _sessionWriteGate.Release(); }
-
-                ClearActiveSession();
-                SessionStatusText.Text = "Session closed. Casual conversation remains available but is no longer retained.";
-                StatusText.Text = _voiceSession.IsGroqConfigured ? "Session ended. Tap the orb to talk casually." : "Configure Groq, then restart ASHA.";
-                Log("Shared-attention session ended.");
-            }
-            catch (Exception error)
-            {
-                SessionStatusText.Text = ShortReason(error);
-                Log($"Could not end the shared-attention session: {error.Message}");
-            }
+            await EndCurrentSessionAsync();
             return;
         }
 
+        await StartNewSessionAsync();
+    }
+
+    private async Task StartNewSessionAsync()
+    {
         try
         {
             try { await RunAshaAsync("project", "create", "Personal desktop", "--id", PersonalDesktopProjectId); }
@@ -458,16 +471,131 @@ public partial class MainWindow : Window
             var sessionId = $"desktop-{DateTime.Now:yyyyMMdd-HHmmss}-{Guid.NewGuid():N}"[..31];
             var title = $"Shared attention {DateTime.Now:yyyy-MM-dd HH:mm}";
             await RunAshaAsync("session", "start", "--project", PersonalDesktopProjectId, "--title", title, "--id", sessionId);
+            _conversationMessages.Clear();
+            _voiceSession.ResetConversationMemory();
             SetActiveSession(sessionId, title);
-            await RecordActiveSessionEventAsync("session.started", "The person explicitly started a local shared-attention session.");
-            StatusText.Text = "Session is recording locally. Talk, point, or start a teaching demonstration.";
-            Log("Shared-attention session started; casual conversation before this point was not captured.");
+            _activeSessionNeedsTitle = true;
+            await RecordActiveSessionEventAsync("session.started", "A new local shared-attention session started.");
+            StatusText.Text = "Session memory is active. Talk, point, or start a teaching demonstration.";
+            Log("New retained session started; its full transcript and semantic log remain local.");
         }
         catch (Exception error)
         {
             SessionStatusText.Text = ShortReason(error);
             Log($"Could not start the shared-attention session: {error.Message}");
         }
+    }
+
+    private async Task EndCurrentSessionAsync()
+    {
+        if (string.IsNullOrWhiteSpace(_activeSessionId)) return;
+        if (_teachRecorder is { HasExited: false })
+        {
+            SessionStatusText.Text = "Finish the teaching recording with Esc before ending this session.";
+            return;
+        }
+
+        var endingId = _activeSessionId;
+        try
+        {
+            await RefreshSessionMemoryAsync(endingId, forceCompression: true);
+            await RecordActiveSessionEventAsync("session.ended", "The person ended this shared-attention session.");
+            await _sessionWriteGate.WaitAsync();
+            try { await RunAshaAsync("session", "close", endingId); }
+            finally { _sessionWriteGate.Release(); }
+
+            ClearActiveSession();
+            SessionStatusText.Text = "Session saved and closed. Open Sessions whenever you want to continue it.";
+            StatusText.Text = _voiceSession.IsGroqConfigured ? "Session saved. Tap the orb to begin a new one." : "Configure Groq, then restart ASHA.";
+            Log("Shared-attention session saved and closed.");
+        }
+        catch (Exception error)
+        {
+            SessionStatusText.Text = ShortReason(error);
+            Log($"Could not end the shared-attention session: {error.Message}");
+        }
+    }
+
+    private async Task StartNewSessionFromLibraryAsync(SessionLibraryWindow window)
+    {
+        if (!string.IsNullOrWhiteSpace(_activeSessionId)) await EndCurrentSessionAsync();
+        if (!string.IsNullOrWhiteSpace(_activeSessionId)) return;
+        await StartNewSessionAsync();
+        window.Close();
+    }
+
+    private async Task ContinueSessionAsync(string sessionId, SessionLibraryWindow window)
+    {
+        try
+        {
+            if (string.Equals(_activeSessionId, sessionId, StringComparison.Ordinal))
+            {
+                window.Close();
+                SessionStatusText.Text = $"Active now: {_activeSessionTitle}.";
+                return;
+            }
+
+            if (!string.IsNullOrWhiteSpace(_activeSessionId)) await EndCurrentSessionAsync();
+            if (!string.IsNullOrWhiteSpace(_activeSessionId)) return;
+
+            var result = await RunAshaAsync("session", "resume", sessionId);
+            using var document = JsonDocument.Parse(result.StandardOutput);
+            var session = document.RootElement.GetProperty("session");
+            var title = session.TryGetProperty("title", out var titleValue)
+                ? titleValue.GetString() ?? "Saved ASHA session"
+                : "Saved ASHA session";
+            SetActiveSession(sessionId, title);
+            _activeSessionNeedsTitle = title.StartsWith("Shared attention ", StringComparison.OrdinalIgnoreCase);
+            await LoadSessionMemoryAsync(sessionId);
+            await RecordActiveSessionEventAsync("session.resumed", "The person continued this retained shared-attention session.");
+            SessionStatusText.Text = $"Continuing: {title}. Full history is available and its memory is loaded.";
+            StatusText.Text = "Session restored. Tap the orb to continue the conversation.";
+            Log($"Continued retained session: {title}.");
+            window.Close();
+        }
+        catch (Exception error)
+        {
+            SessionStatusText.Text = $"Could not continue session: {ShortReason(error)}";
+            Log($"Continue-session error: {error.Message}");
+        }
+    }
+
+    private async Task<IReadOnlyList<SessionLibraryItem>> ReadSessionLibraryAsync()
+    {
+        var projectTask = RunAshaAsync("project", "list");
+        var sessionTask = RunAshaAsync("session", "list");
+        await Task.WhenAll(projectTask, sessionTask);
+
+        using var projectDocument = JsonDocument.Parse(projectTask.Result.StandardOutput);
+        using var sessionDocument = JsonDocument.Parse(sessionTask.Result.StandardOutput);
+        var projects = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var project in projectDocument.RootElement.GetProperty("projects").EnumerateArray())
+        {
+            var id = project.GetProperty("id").GetString();
+            var title = project.GetProperty("title").GetString();
+            if (!string.IsNullOrWhiteSpace(id)) projects[id] = title ?? id;
+        }
+
+        var items = new List<SessionLibraryItem>();
+        foreach (var session in sessionDocument.RootElement.GetProperty("sessions").EnumerateArray())
+        {
+            var id = session.GetProperty("id").GetString();
+            if (string.IsNullOrWhiteSpace(id)) continue;
+            var projectId = session.GetProperty("projectId").GetString() ?? PersonalDesktopProjectId;
+            var title = session.GetProperty("title").GetString() ?? "Untitled ASHA session";
+            var updated = session.TryGetProperty("updatedAt", out var updatedValue) && DateTime.TryParse(updatedValue.GetString(), out var parsed)
+                ? parsed.ToLocalTime()
+                : DateTime.Now;
+            var closed = session.TryGetProperty("closedAt", out var closedValue) && closedValue.ValueKind == JsonValueKind.String;
+            items.Add(new SessionLibraryItem(
+                id,
+                title,
+                projects.TryGetValue(projectId, out var projectTitle) ? projectTitle : projectId,
+                updated,
+                string.Equals(id, _activeSessionId, StringComparison.Ordinal),
+                closed));
+        }
+        return items;
     }
 
     private async void StartTeaching_Click(object sender, RoutedEventArgs e)
@@ -850,13 +978,18 @@ public partial class MainWindow : Window
 
     private void QueueLiveAwarenessRefresh(LocalScreenChange change)
     {
-        if (_liveAwarenessRefreshInFlight || _voiceTurnInFlight || _voiceCapturing ||
-            string.IsNullOrWhiteSpace(_activeSessionId) ||
+        if (string.IsNullOrWhiteSpace(_activeSessionId) ||
             _preferences.Vision != VisionPreference.Live ||
             !_preferences.AllowRemoteVision ||
             !_preferences.LiveProviderAwareness ||
-            !_voiceSession.SupportsVision ||
-            DateTime.UtcNow - _lastLiveAwarenessRefreshUtc < TimeSpan.FromSeconds(5)) return;
+            !_voiceSession.SupportsVision) return;
+
+        if (_liveAwarenessRefreshInFlight || _voiceTurnInFlight || _voiceCapturing)
+        {
+            _pendingLiveScreenChange = change;
+            return;
+        }
+        if (DateTime.UtcNow - _lastLiveAwarenessRefreshUtc < TimeSpan.FromSeconds(5)) return;
 
         _lastLiveAwarenessRefreshUtc = DateTime.UtcNow;
         _ = RefreshLiveAwarenessAsync(change);
@@ -1116,10 +1249,12 @@ public partial class MainWindow : Window
         return $"Groq · {model} · {keyState}";
     }
 
-    private void TapToListenTimer_Tick(object? sender, EventArgs e)
+    private async void TapToListenTimer_Tick(object? sender, EventArgs e)
     {
         _tapToListenTimer.Stop();
         if (_voiceCapturing || _voiceTurnInFlight) return;
+        if (string.IsNullOrWhiteSpace(_activeSessionId)) await StartNewSessionAsync();
+        if (string.IsNullOrWhiteSpace(_activeSessionId)) return;
         _conversationActive = true;
         if (StartVoiceCapture()) AshaEarcons.ConversationStarted();
     }
@@ -1280,8 +1415,14 @@ public partial class MainWindow : Window
                     _voiceSession.SupportsVision,
                 _liveAwarenessContext,
                 _voiceTurnCancellation.Token);
-            if (!string.IsNullOrWhiteSpace(result.Transcript)) AddConversation("You", result.Transcript);
-            AddConversation("ASHA", result.Reply);
+            if (!string.IsNullOrWhiteSpace(result.Transcript))
+            {
+                await AddConversationAsync("You", result.Transcript);
+                await MaybeNameActiveSessionAsync(result.Transcript);
+            }
+            await AddConversationAsync("ASHA", result.Reply);
+            if (!string.IsNullOrWhiteSpace(_activeSessionId))
+                _ = RefreshSessionMemoryAsync(_activeSessionId, forceCompression: false);
 
             OrbSurface.SetPresenceState(OrbPresenceState.Speaking);
             StatusText.Text = "ASHA is speaking…";
@@ -1303,6 +1444,12 @@ public partial class MainWindow : Window
             _voiceTurnCancellation?.Dispose();
             _voiceTurnCancellation = null;
             _voiceTurnInFlight = false;
+
+            if (_pendingLiveScreenChange is { } pendingChange)
+            {
+                _pendingLiveScreenChange = null;
+                QueueLiveAwarenessRefresh(pendingChange);
+            }
 
             if (_conversationActive && !_reallyQuitting && _voiceSession.IsGroqConfigured)
             {
@@ -1941,6 +2088,8 @@ public partial class MainWindow : Window
                 ? titleValue.GetString() ?? "Shared-attention session"
                 : "Shared-attention session";
             SetActiveSession(_activeSessionId, title, save: false);
+            _activeSessionNeedsTitle = title.StartsWith("Shared attention ", StringComparison.OrdinalIgnoreCase);
+            await LoadSessionMemoryAsync(_activeSessionId);
             Log("Resumed the existing local shared-attention session.");
         }
         catch (Exception error)
@@ -1953,12 +2102,14 @@ public partial class MainWindow : Window
     private void SetActiveSession(string sessionId, string title, bool save = true)
     {
         _activeSessionId = sessionId;
+        _activeSessionTitle = title;
         _preferences.ActiveSessionId = sessionId;
         if (save) _preferences.Save();
         _screenObserver.Start(_preferences.Vision);
         _awarenessCoordinator.Start(_preferences.Vision);
         SessionButton.Content = "End session";
         SessionStatusText.Text = $"Recording locally: {title}. Conversation and teaching from this point are kept together.";
+        CurrentSessionText.Text = $"Session: {title}";
         AwarenessStatusText.Text = _preferences.Vision == VisionPreference.Off
             ? "Local awareness is off."
             : "Local awareness is starting…";
@@ -1970,13 +2121,112 @@ public partial class MainWindow : Window
         _awarenessCoordinator.Stop();
         _latestVisionEvidence = null;
         _liveAwarenessContext = null;
+        _pendingLiveScreenChange = null;
         _lastLiveAwarenessRefreshUtc = DateTime.MinValue;
         _activeSessionId = null;
+        _activeSessionTitle = null;
+        _activeSessionNeedsTitle = false;
         _preferences.ActiveSessionId = null;
         _preferences.Save();
         SessionButton.Content = "Start session";
         SessionStatusText.Text = "No durable session is active.";
+        CurrentSessionText.Text = "Session: none — the next conversation starts one";
         AwarenessStatusText.Text = "Local awareness is idle until you start a session.";
+        _conversationMessages.Clear();
+        _voiceSession.ResetConversationMemory();
+    }
+
+    private async Task LoadSessionMemoryAsync(string sessionId)
+    {
+        var fullTranscript = await SessionTranscriptStore.ReadAsync(sessionId);
+        _conversationMessages.Clear();
+        foreach (var message in fullTranscript) _conversationMessages.Add(message);
+        await RefreshSessionMemoryAsync(sessionId, forceCompression: true);
+        Log($"Loaded {fullTranscript.Count} full-log conversation messages for this session.");
+    }
+
+    private async Task RefreshSessionMemoryAsync(string sessionId, bool forceCompression)
+    {
+        await _memoryRefreshGate.WaitAsync(_lifetimeCancellation.Token);
+        try
+        {
+            var fullTranscript = await SessionTranscriptStore.ReadAsync(sessionId);
+            var partition = SessionMemoryStore.Partition(fullTranscript);
+            var snapshot = await SessionMemoryStore.ReadAsync(sessionId);
+            var covered = snapshot.CoveredMessageCount;
+            var summary = snapshot.Summary;
+            if (covered < 0 || covered > partition.OlderMessageCount)
+            {
+                covered = 0;
+                summary = string.Empty;
+            }
+
+            var uncoveredCount = partition.OlderMessageCount - covered;
+            if (uncoveredCount > 0 && (forceCompression || uncoveredCount >= 8))
+            {
+                var segment = fullTranscript.Skip(covered).Take(uncoveredCount).ToArray();
+                summary = await _voiceSession.CompressConversationAsync(summary, segment, _lifetimeCancellation.Token);
+                covered = partition.OlderMessageCount;
+                snapshot = new SessionMemorySnapshot(covered, summary, DateTime.UtcNow);
+                await SessionMemoryStore.WriteAsync(sessionId, snapshot);
+                Log($"Updated derived session-memory summary through full-log message {covered}; the complete transcript was not changed.");
+            }
+
+            if (string.Equals(_activeSessionId, sessionId, StringComparison.Ordinal))
+            {
+                // Until a small new segment reaches the compression threshold,
+                // keep it verbatim alongside the normal recent window so there
+                // is never a gap between the summary and recent conversation.
+                var contextStart = Math.Min(covered, fullTranscript.Count);
+                _voiceSession.LoadConversationMemory(fullTranscript.Skip(contextStart), summary);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // ASHA is closing.
+        }
+        catch (Exception error)
+        {
+            Log($"Session-memory refresh error: {error.Message}");
+        }
+        finally
+        {
+            _memoryRefreshGate.Release();
+        }
+    }
+
+    private async Task MaybeNameActiveSessionAsync(string firstMeaningfulWords)
+    {
+        if (!_activeSessionNeedsTitle || string.IsNullOrWhiteSpace(_activeSessionId)) return;
+        var normalized = Regex.Replace(firstMeaningfulWords, @"\s+", " ").Trim(' ', '.', ',', '?', '!', ':', ';', '-', '—');
+        if (string.IsNullOrWhiteSpace(normalized) ||
+            Regex.IsMatch(normalized, @"^(asha[,.]?\s*)?(can you hear me|hello|hi|test(ing)?|one[, ]+two[, ]+three)\b", RegexOptions.IgnoreCase))
+            return;
+
+        normalized = Regex.Replace(normalized, @"^(asha[,.]?\s*)?(please\s+)?(can|could|would|will)\s+you\s+", string.Empty, RegexOptions.IgnoreCase);
+        if (normalized.Length > 68)
+        {
+            normalized = normalized[..68];
+            var finalSpace = normalized.LastIndexOf(' ');
+            if (finalSpace >= 36) normalized = normalized[..finalSpace];
+        }
+        if (normalized.Length < 3) return;
+        var title = char.ToUpperInvariant(normalized[0]) + normalized[1..];
+        var sessionId = _activeSessionId;
+        try
+        {
+            await RunAshaAsync("session", "rename", sessionId, "--title", title);
+            if (!string.Equals(_activeSessionId, sessionId, StringComparison.Ordinal)) return;
+            _activeSessionTitle = title;
+            _activeSessionNeedsTitle = false;
+            SessionStatusText.Text = $"Saved locally: {title}. Full logs and session memory stay together.";
+            CurrentSessionText.Text = $"Session: {title}";
+            Log($"Session received an automatic title: {title}.");
+        }
+        catch (Exception error)
+        {
+            Log($"Could not name the active session: {error.Message}");
+        }
     }
 
     private async Task PersistConversationAsync(string sessionId, ConversationMessage message)
@@ -2539,14 +2789,15 @@ public partial class MainWindow : Window
         LogBox.ScrollToEnd();
     }
 
-    private void AddConversation(string speaker, string text)
+    private async Task AddConversationAsync(string speaker, string text)
     {
         if (string.IsNullOrWhiteSpace(text)) return;
         var message = new ConversationMessage(DateTime.Now, speaker, text);
         _conversationMessages.Add(message);
         Log($"{speaker}: {text}");
-        if (!string.IsNullOrWhiteSpace(_activeSessionId))
-            _ = PersistConversationAsync(_activeSessionId, message);
+        var sessionId = _activeSessionId;
+        if (!string.IsNullOrWhiteSpace(sessionId))
+            await PersistConversationAsync(sessionId, message);
     }
 
     private sealed record MarkRequest(string Id, string Kind, int X, int Y, int? W, int? H, string? Label, string Color);

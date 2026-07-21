@@ -34,6 +34,15 @@ test("ASHA projects retain semantic teaching sessions and harness links", async 
     assert.equal(matches.length, 1);
     assert.equal(matches[0].session.id, session.id);
     assert.equal(matches[0].matchingEvents[0].actor, "human");
+
+    await ledger.closeSession(session.id);
+    const closed = await ledger.listSessions(project.id);
+    assert.equal(closed[0].closedAt, "2026-07-20T16:00:00.000Z");
+    const renamed = await ledger.renameSession(session.id, "GMX mailbox lesson");
+    assert.equal(renamed.title, "GMX mailbox lesson");
+    const resumed = await ledger.resumeSession(session.id);
+    assert.equal(resumed.closedAt, undefined);
+    assert.equal((await ledger.listSessions())[0].id, session.id);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

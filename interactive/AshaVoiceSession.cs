@@ -287,10 +287,60 @@ public sealed class AshaVoiceSession : IDisposable
 
     private readonly HttpClient _http = new() { Timeout = TimeSpan.FromSeconds(90) };
     private readonly List<ChatTurn> _history = [];
+    private string _sessionSummary = string.Empty;
     private bool _disposed;
 
     public bool IsGroqConfigured => !string.IsNullOrWhiteSpace(GroqApiKey());
     public bool SupportsVision => string.Equals(GroqModel(), "qwen/qwen3.6-27b", StringComparison.OrdinalIgnoreCase);
+
+    public void LoadConversationMemory(IEnumerable<ConversationMessage> recentMessages, string? summary)
+    {
+        _history.Clear();
+        foreach (var message in recentMessages)
+        {
+            var role = string.Equals(message.Speaker, "ASHA", StringComparison.OrdinalIgnoreCase) ? "assistant" : "user";
+            _history.Add(new ChatTurn(role, message.Text));
+        }
+        _sessionSummary = summary?.Trim() ?? string.Empty;
+        TrimRecentHistory();
+    }
+
+    public void ResetConversationMemory()
+    {
+        _history.Clear();
+        _sessionSummary = string.Empty;
+    }
+
+    public async Task<string> CompressConversationAsync(
+        string? existingSummary,
+        IReadOnlyList<ConversationMessage> additionalMessages,
+        CancellationToken cancellationToken)
+    {
+        if (additionalMessages.Count == 0) return existingSummary?.Trim() ?? string.Empty;
+        var key = GroqApiKey();
+        if (string.IsNullOrWhiteSpace(key)) return existingSummary?.Trim() ?? string.Empty;
+
+        var transcript = string.Join("\n", additionalMessages.Select(message =>
+            $"[{message.Timestamp:yyyy-MM-dd HH:mm}] {message.Speaker}: {message.Text}"));
+        var previous = string.IsNullOrWhiteSpace(existingSummary) ? "No earlier summary exists." : existingSummary.Trim();
+        var messages = new List<object>
+        {
+            new
+            {
+                role = "system",
+                content = "Maintain ASHA's durable session-memory summary. Preserve the person's goals, decisions, preferences, named applications and targets, explanations, unresolved questions, demonstrations, permissions, actions, visual observations, and verified outcomes. Remove repetition and small talk, but never invent facts. Return compact plain prose without Markdown. This is a derived index; the full transcript remains stored separately.",
+            },
+            new
+            {
+                role = "user",
+                content = $"Earlier session summary:\n{previous}\n\nNew full-log segment to incorporate:\n{transcript}\n\nReturn the updated session summary.",
+            },
+        };
+        var baseUrl = (Environment.GetEnvironmentVariable("ASHA_GROQ_BASE_URL") ?? GroqBaseUrl).TrimEnd('/');
+        using var response = await SendChatCompletionAsync(key, baseUrl, GroqModel(), messages, null, cancellationToken, 900).ConfigureAwait(false);
+        var summary = StripReasoningMarkup(ReadMessageContent(response.RootElement.GetProperty("choices")[0].GetProperty("message")));
+        return string.IsNullOrWhiteSpace(summary) ? previous : Regex.Replace(summary, @"\s+", " ").Trim();
+    }
 
     public async Task<VoiceTurnResult> RespondAsync(
         byte[] wav,
@@ -391,6 +441,14 @@ public sealed class AshaVoiceSession : IDisposable
             throw new InvalidOperationException("Groq is not configured. Run configure-groq.bat, then restart ASHA.");
 
         var messages = new List<object> { new { role = "system", content = SystemPrompt } };
+        if (!string.IsNullOrWhiteSpace(_sessionSummary))
+        {
+            messages.Add(new
+            {
+                role = "system",
+                content = $"Retained memory from the active ASHA session: {_sessionSummary} Treat it as prior conversation context. The complete log remains local; ask naturally when a remembered detail is ambiguous.",
+            });
+        }
         if (awarenessContext is not null && DateTime.UtcNow - awarenessContext.ObservedAtUtc <= TimeSpan.FromSeconds(30))
         {
             var age = Math.Max(0, (int)Math.Round((DateTime.UtcNow - awarenessContext.ObservedAtUtc).TotalSeconds));
@@ -455,8 +513,20 @@ public sealed class AshaVoiceSession : IDisposable
 
         _history.Add(new ChatTurn("user", userText));
         _history.Add(new ChatTurn("assistant", reply));
-        while (_history.Count > 16) _history.RemoveRange(0, 2);
+        TrimRecentHistory();
         return reply;
+    }
+
+    private void TrimRecentHistory()
+    {
+        var characters = _history.Sum(turn => turn.Content.Length + turn.Role.Length + 8);
+        while (_history.Count > 2 && characters > SessionMemoryStore.RecentCharacterBudget)
+        {
+            var remove = Math.Min(2, _history.Count - 2);
+            for (var index = 0; index < remove; index++)
+                characters -= _history[index].Content.Length + _history[index].Role.Length + 8;
+            _history.RemoveRange(0, remove);
+        }
     }
 
     private static object CreateUserMessage(string userText, VisionAttachment? vision)
@@ -521,14 +591,15 @@ public sealed class AshaVoiceSession : IDisposable
         string model,
         List<object> messages,
         IReadOnlyList<object>? tools,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        int maxTokens = 420)
     {
         var payload = new Dictionary<string, object?>
         {
             ["model"] = model,
             ["messages"] = messages,
             ["temperature"] = 0.55,
-            ["max_tokens"] = 420,
+            ["max_tokens"] = maxTokens,
         };
         if (tools is not null)
         {

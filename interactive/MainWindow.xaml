@@ -110,6 +110,7 @@
                         </Border>
                         <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Top" Margin="0,-3,0,0">
                             <Button Style="{StaticResource HeaderIconButton}" Margin="0,0,3,0" Click="Profile_Click" ToolTip="Profile">◉</Button>
+                            <Button Style="{StaticResource HeaderIconButton}" Margin="0,0,3,0" Click="Sessions_Click" ToolTip="Sessions">▤</Button>
                             <Button Style="{StaticResource HeaderIconButton}" Margin="0,0,3,0" Click="Settings_Click" ToolTip="Global settings">⚙</Button>
                             <Button Style="{StaticResource HeaderIconButton}" Margin="0,0,3,0" Click="HideControls_Click" ToolTip="Hide this menu; keep the orb available">—</Button>
                             <Button Style="{StaticResource HeaderIconButton}" Click="Quit_Click" ToolTip="Quit ASHA">⏻</Button>
@@ -120,6 +121,8 @@
                         <StackPanel>
                             <TextBlock FontWeight="SemiBold" Foreground="#214E7D">Live voice</TextBlock>
                             <TextBlock x:Name="StatusText" Margin="0,3,0,0" FontSize="12" TextWrapping="Wrap" Foreground="#4B6683" />
+                            <TextBlock x:Name="CurrentSessionText" Margin="0,7,0,0" FontSize="10" TextWrapping="Wrap" Foreground="#295A8D"
+                                       Text="Session: none — the next conversation starts one" />
                             <TextBlock Margin="0,10,0,0" FontSize="11" Foreground="#62788D" TextWrapping="Wrap">Tap once to talk · ASHA detects pauses · centre ends</TextBlock>
                         </StackPanel>
                     </Border>
@@ -153,7 +156,10 @@
                                     <TextBlock FontWeight="SemiBold" Foreground="#214E7D">Shared-attention session</TextBlock>
                                     <TextBlock Margin="0,3,0,0" FontSize="11" Foreground="#526A84" TextWrapping="Wrap"
                                                Text="Conversation alone stays casual. Start a session when you want ASHA to keep the chat, cues, and teaching events together locally for review." />
-                                    <Button x:Name="SessionButton" Margin="0,9,0,0" Padding="9,5" HorizontalAlignment="Left" Click="Session_Click">Start session</Button>
+                                    <StackPanel Orientation="Horizontal" Margin="0,9,0,0">
+                                        <Button x:Name="SessionButton" Padding="9,5" Click="Session_Click">Start session</Button>
+                                        <Button Margin="8,0,0,0" Padding="9,5" Click="Sessions_Click">Open sessions</Button>
+                                    </StackPanel>
                                     <TextBlock x:Name="SessionStatusText" Margin="0,8,0,0" FontSize="11" Foreground="#62788D" TextWrapping="Wrap"
                                                Text="No durable session is active." />
                                 </StackPanel>

@@ -49,6 +49,7 @@ public partial class MainWindow : Window
     private readonly MicrophoneCapture _microphone = new();
     private readonly AshaVoiceSession _voiceSession = new();
     private readonly ScreenObserver _screenObserver = new();
+    private readonly DesktopAwarenessCoordinator _awarenessCoordinator = new();
     private readonly AshaPreferences _preferences;
     private readonly DispatcherTimer _tapToListenTimer;
     private readonly DispatcherTimer _conversationBoundaryTimer;
@@ -129,6 +130,7 @@ public partial class MainWindow : Window
             OrbSurface.SetAudioEnergy(energy);
             ObserveIncomingSpeech(energy);
         });
+        _awarenessCoordinator.SceneChanged += scene => Dispatcher.BeginInvoke(() => ShowAwarenessScene(scene));
     }
 
     private void Window_Loaded(object sender, RoutedEventArgs e)
@@ -778,8 +780,34 @@ public partial class MainWindow : Window
         if (!IsLoaded || VisionModeBox.SelectedItem is not ComboBoxItem { Tag: string value } || !Enum.TryParse<VisionPreference>(value, out var mode)) return;
         _preferences.Vision = mode;
         _preferences.Save();
-        if (!string.IsNullOrWhiteSpace(_activeSessionId)) _screenObserver.SetMode(mode);
+        if (!string.IsNullOrWhiteSpace(_activeSessionId))
+        {
+            _screenObserver.SetMode(mode);
+            _awarenessCoordinator.SetMode(mode);
+            if (mode == VisionPreference.Off) AwarenessStatusText.Text = "Local awareness is off.";
+        }
+        else
+        {
+            AwarenessStatusText.Text = mode == VisionPreference.Off
+                ? "Local awareness is off."
+                : "Start a session when you want local desktop awareness.";
+        }
         Log($"Desktop-awareness policy: {VisionDisplayName(mode)}.");
+    }
+
+    private void ShowAwarenessScene(AwarenessScene scene)
+    {
+        if (string.IsNullOrWhiteSpace(_activeSessionId) || scene.Mode == VisionPreference.Off) return;
+
+        var pace = scene.Mode == VisionPreference.Live ? "Live local awareness" : "Local session awareness";
+        var foreground = scene.Foreground?.DisplayName ?? "the desktop";
+        if (scene.Hovered is not null && scene.Hovered.Handle != scene.Foreground?.Handle)
+        {
+            AwarenessStatusText.Text = $"{pace}: {foreground}. Pointer over {scene.Hovered.DisplayName}. No image is being shared.";
+            return;
+        }
+
+        AwarenessStatusText.Text = $"{pace}: {foreground}. No image is being shared.";
     }
 
     private void RemoteVisionChanged(object sender, RoutedEventArgs e)
@@ -1673,6 +1701,7 @@ public partial class MainWindow : Window
         _microphone.Dispose();
         _voiceSession.Dispose();
         _screenObserver.Dispose();
+        _awarenessCoordinator.Dispose();
         _trayIcon.Visible = false;
         _trayIcon.Dispose();
         if (_source is not null)
@@ -1800,19 +1829,25 @@ public partial class MainWindow : Window
         _preferences.ActiveSessionId = sessionId;
         if (save) _preferences.Save();
         _screenObserver.Start(_preferences.Vision);
+        _awarenessCoordinator.Start(_preferences.Vision);
         SessionButton.Content = "End session";
         SessionStatusText.Text = $"Recording locally: {title}. Conversation and teaching from this point are kept together.";
+        AwarenessStatusText.Text = _preferences.Vision == VisionPreference.Off
+            ? "Local awareness is off."
+            : "Local awareness is starting…";
     }
 
     private void ClearActiveSession()
     {
         _screenObserver.Stop();
+        _awarenessCoordinator.Stop();
         _latestVisionEvidence = null;
         _activeSessionId = null;
         _preferences.ActiveSessionId = null;
         _preferences.Save();
         SessionButton.Content = "Start session";
         SessionStatusText.Text = "No durable session is active.";
+        AwarenessStatusText.Text = "Local awareness is idle until you start a session.";
     }
 
     private async Task PersistConversationAsync(string sessionId, ConversationMessage message)

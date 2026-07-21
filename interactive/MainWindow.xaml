@@ -201,6 +201,8 @@
                                     <ComboBoxItem Tag="Live" Content="Live awareness — faster local samples during a session" />
                                 </ComboBox>
                                 <Button Margin="0,9,0,0" Padding="9,5" HorizontalAlignment="Left" Click="CaptureVisionEvidence_Click">Let ASHA look once</Button>
+                                <TextBlock x:Name="AwarenessStatusText" Margin="0,7,0,0" FontSize="10" Foreground="#496C8C" TextWrapping="Wrap"
+                                           Text="Local awareness is idle until you start a session." />
                                 <CheckBox x:Name="RemoteVisionCheckBox" Margin="0,9,0,0" Checked="RemoteVisionChanged" Unchecked="RemoteVisionChanged"
                                           Content="Allow ASHA to send a view I explicitly select to the configured AI" />
                                 <TextBlock Margin="0,3,0,0" FontSize="10" Foreground="#71869B" TextWrapping="Wrap"

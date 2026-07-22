@@ -78,6 +78,24 @@ test("an arrow retains a signed start-to-tip vector", async () => {
   }
 });
 
+test("renaming one cue does not rename other cues of the same shape", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "asha-test-"));
+  try {
+    const driver = new FakeDriver();
+    const engine = new MarkEngine({ driver, runtimeDir: directory });
+    const first = await engine.mark({ kind: "circle", x: 100, y: 100, label: "First" });
+    const second = await engine.mark({ kind: "circle", x: 300, y: 100, label: "Second" });
+
+    await engine.update(first, { label: "Renamed first" });
+
+    const saved = JSON.parse(await readFile(join(directory, "marks.json"), "utf8"));
+    assert.equal(saved.marks[first].label, "Renamed first");
+    assert.equal(saved.marks[second].label, "Second");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("an active mark can move without being recreated", async () => {
   const directory = await mkdtemp(join(tmpdir(), "asha-test-"));
   try {

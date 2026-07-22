@@ -250,7 +250,7 @@
 
                         <StackPanel Orientation="Horizontal" Margin="0,11,0,0">
                             <Button Click="ClearAll_Click">Clear all visual cues</Button>
-                            <TextBlock Margin="12,0,0,0" VerticalAlignment="Center" FontSize="11" Foreground="#62788D">Ctrl+Alt+M places a cue</TextBlock>
+                            <TextBlock Margin="12,0,0,0" VerticalAlignment="Center" FontSize="11" Foreground="#62788D">Ctrl+Alt+M places or draws the selected cue</TextBlock>
                         </StackPanel>
 
                         <StackPanel Orientation="Horizontal" Margin="0,11,0,0">
@@ -261,7 +261,7 @@
                         <Expander Margin="0,16,0,0" Header="Diagnostics and visual cues" Foreground="#2E69AE">
                         <StackPanel Margin="0,12,0,0">
                             <TextBlock TextWrapping="Wrap" FontSize="12" Foreground="#526A84" Margin="0,0,0,10">
-                                Choose a cue and use Place at pointer for an exact numeric cue. Draw box captures a real press-drag-release gesture. Cues stay click-through until Edit cues is on.
+                                Choose a cue and use Place at pointer for an exact numeric cue. With box or arrow selected, Ctrl+Alt+M or Draw selected arms a real press-drag-release gesture. An arrow starts where you press and points where you release. Repeat the shortcut or press Escape to cancel.
                             </TextBlock>
                             <Grid Margin="0,0,0,9">
                                 <Grid.ColumnDefinitions>
@@ -277,7 +277,7 @@
                                     <RowDefinition Height="Auto" />
                                 </Grid.RowDefinitions>
                                 <TextBlock Grid.Row="0" Grid.Column="0" VerticalAlignment="Center">Cue</TextBlock>
-                                <ComboBox x:Name="KindBox" Grid.Row="0" Grid.Column="1" Margin="0,0,7,8" SelectedIndex="0">
+                                <ComboBox x:Name="KindBox" Grid.Row="0" Grid.Column="1" Margin="0,0,7,8" SelectedIndex="0" SelectionChanged="KindBox_SelectionChanged">
                                     <ComboBoxItem Content="dot" />
                                     <ComboBoxItem Content="circle" />
                                     <ComboBoxItem Content="box" />
@@ -288,6 +288,8 @@
                                 <TextBox x:Name="WidthBox" Grid.Row="0" Grid.Column="3" Text="220" Margin="0,0,0,8" ToolTip="Width; for an arrow this is its horizontal distance" />
                                 <TextBlock Grid.Row="1" Grid.Column="0" VerticalAlignment="Center">Label</TextBlock>
                                 <TextBox x:Name="LabelBox" Grid.Row="1" Grid.Column="1" Margin="0,0,7,8"
+                                         GotKeyboardFocus="LabelBox_GotKeyboardFocus"
+                                         TextChanged="LabelBox_TextChanged"
                                          KeyDown="LabelBox_KeyDown"
                                          PreviewLostKeyboardFocus="LabelBox_PreviewLostKeyboardFocus" />
                                 <TextBlock Grid.Row="1" Grid.Column="2" VerticalAlignment="Center" TextAlignment="Center">H</TextBlock>
@@ -313,7 +315,7 @@
                                     <RowDefinition Height="34" />
                                 </Grid.RowDefinitions>
                                 <Button Grid.Row="0" Grid.Column="0" HorizontalContentAlignment="Center" Click="PlaceCueAtPointer_Click">Place at pointer</Button>
-                                <Button x:Name="DrawBoxButton" Grid.Row="0" Grid.Column="2" HorizontalContentAlignment="Center" Click="DrawBox_Click">Draw box</Button>
+                                <Button x:Name="DrawCueButton" Grid.Row="0" Grid.Column="2" HorizontalContentAlignment="Center" Click="DrawCue_Click" IsEnabled="False">Draw selected</Button>
                                 <Button Grid.Row="2" Grid.Column="0" HorizontalContentAlignment="Center" Click="ApplyCueChanges_Click">Apply changes</Button>
                                 <Button x:Name="EditCuesButton" Grid.Row="2" Grid.Column="2" HorizontalContentAlignment="Center" Click="EditCues_Click">Edit cues</Button>
                                 <Button Grid.Row="4" Grid.Column="0" Grid.ColumnSpan="3" HorizontalContentAlignment="Center" Click="ClearSelected_Click">Clear selected</Button>

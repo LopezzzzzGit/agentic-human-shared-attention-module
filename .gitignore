@@ -8,6 +8,8 @@ overlay/bin/
 overlay/obj/
 teach-recorder/bin/
 teach-recorder/obj/
+interactive-tests/bin/
+interactive-tests/obj/
 *.user
 *.suo
 .env

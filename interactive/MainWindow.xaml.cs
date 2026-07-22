@@ -15,6 +15,8 @@ using System.Windows.Media;
 using System.Windows.Threading;
 using Drawing = System.Drawing;
 using Forms = System.Windows.Forms;
+using WpfLine = System.Windows.Shapes.Line;
+using WpfPolyline = System.Windows.Shapes.Polyline;
 using SharedInference;
 
 namespace AshaLive;
@@ -73,14 +75,17 @@ public partial class MainWindow : Window
     private bool _cueEditing;
     private bool _processingCueEditEvents;
     private bool _labelCommitInProgress;
-    private IntPtr _boxDrawHook;
-    private LowLevelMouseProc? _boxDrawMouseProc;
-    private IntPtr _boxDrawKeyboardHook;
-    private LowLevelKeyboardProc? _boxDrawKeyboardProc;
-    private bool _boxDrawingArmed;
-    private bool _boxDrawingStarted;
-    private NativePoint _boxDrawingStart;
-    private BoxDrawingPreviewWindow? _boxDrawingPreview;
+    private string? _labelEditingCueId;
+    private string? _labelEditingText;
+    private IntPtr _cueDrawHook;
+    private LowLevelMouseProc? _cueDrawMouseProc;
+    private IntPtr _cueDrawKeyboardHook;
+    private LowLevelKeyboardProc? _cueDrawKeyboardProc;
+    private bool _cueDrawingArmed;
+    private bool _cueDrawingStarted;
+    private string? _cueDrawingKind;
+    private NativePoint _cueDrawingStart;
+    private CueDrawingPreviewWindow? _cueDrawingPreview;
     private bool _conversationActive;
     private bool _voiceCapturing;
     private bool _voiceTurnInFlight;
@@ -144,7 +149,7 @@ public partial class MainWindow : Window
         _screenObserver.MeaningfulChange += change => Dispatcher.BeginInvoke(() => QueueLiveAwarenessRefresh(change));
     }
 
-    private void Window_Loaded(object sender, RoutedEventArgs e)
+    private async void Window_Loaded(object sender, RoutedEventArgs e)
     {
         _source = PresentationSource.FromVisual(this) as HwndSource;
         if (_source is null) return;
@@ -153,6 +158,11 @@ public partial class MainWindow : Window
         RegisterHotKey(_source.Handle, MoveHotkeyId, ModControl | ModAlt | ModShift, VkM);
         RegisterHotKey(_source.Handle, ControlsHotkeyId, ModControl | ModAlt, VkA);
         if (!_markHotkeyRegistered) StatusText.Text = "Ctrl+Alt+M is already in use. Free it to place a visual cue.";
+        // Computer-control permission is intentionally process-local. Its
+        // presence frame must therefore never survive a restart and imply a
+        // permission that is no longer active.
+        try { await RunAshaAsync("clear", ControlPresenceMarkId); }
+        catch (Exception error) { Log($"Could not clear stale control-presence frame: {error.Message}"); }
         _ = RestoreActiveSessionAsync();
     }
 
@@ -168,7 +178,12 @@ public partial class MainWindow : Window
         switch (wParam.ToInt32())
         {
             case MarkHotkeyId:
-                _ = MarkAtCurrentMouseAsync();
+                if (_cueDrawingArmed)
+                    CancelCueDrawing("Cue drawing cancelled.");
+                else if (SelectedCueKind() is "box" or "arrow")
+                    BeginCueDrawing(SelectedCueKind());
+                else
+                    _ = MarkAtCurrentMouseAsync();
                 handled = true;
                 break;
             case MoveHotkeyId:
@@ -937,7 +952,7 @@ public partial class MainWindow : Window
         var pace = scene.Mode == VisionPreference.Live ? "Live local awareness" : "Local session awareness";
         var foreground = scene.Foreground?.DisplayName ?? "the desktop";
         var providerContext = _preferences.LiveProviderAwareness && _liveAwarenessContext is not null
-            ? $" Qwen's latest context: {_liveAwarenessContext.Summary}"
+            ? $" The configured model's latest context: {_liveAwarenessContext.Summary}"
             : " No image is being shared.";
         if (scene.Hovered is not null && scene.Hovered.Handle != scene.Foreground?.Handle)
         {
@@ -967,13 +982,13 @@ public partial class MainWindow : Window
         _preferences.Save();
         if (_preferences.LiveProviderAwareness)
         {
-            Log("Adaptive Qwen live awareness enabled. Only throttled changed keyframes may leave the PC while Live mode and a session are active.");
+            Log("Adaptive model awareness enabled. Only throttled changed keyframes may leave the PC while Live mode and a session are active.");
             QueueLiveAwarenessRefresh(new LocalScreenChange(DateTime.UtcNow, 1));
         }
         else
         {
             _liveAwarenessContext = null;
-            Log("Adaptive Qwen live awareness disabled. Local desktop sampling is unchanged.");
+            Log("Adaptive model awareness disabled. Local desktop sampling is unchanged.");
         }
     }
 
@@ -1019,7 +1034,7 @@ public partial class MainWindow : Window
             if (string.IsNullOrWhiteSpace(summary)) return;
 
             _liveAwarenessContext = new DesktopAwarenessContext(DateTime.UtcNow, summary, change.ChangedScore);
-            AwarenessStatusText.Text = $"Qwen live awareness: {summary}";
+            AwarenessStatusText.Text = $"Model live awareness: {summary}";
             await RecordActiveSessionEventAsync(
                 "vision.live_awareness_updated",
                 summary,
@@ -1106,7 +1121,7 @@ public partial class MainWindow : Window
         }
         if (!_voiceSession.SupportsVision)
         {
-            StatusText.Text = "The current AI cannot receive images. Select Qwen 3.6 before asking ASHA to look.";
+            StatusText.Text = "The configured model cannot receive images. Select a vision-capable model before asking ASHA to look.";
             return;
         }
 
@@ -1551,111 +1566,162 @@ public partial class MainWindow : Window
 
     private async void PlaceCueAtPointer_Click(object sender, RoutedEventArgs e) => await MarkAtCurrentMouseAsync();
 
-    private void DrawBox_Click(object sender, RoutedEventArgs e)
+    private void KindBox_SelectionChanged(object sender, SelectionChangedEventArgs e) => UpdateDrawCueButton();
+
+    private void DrawCue_Click(object sender, RoutedEventArgs e)
     {
-        if (_boxDrawingArmed)
+        if (_cueDrawingArmed)
         {
-            CancelBoxDrawing("Box drawing cancelled.");
+            CancelCueDrawing("Cue drawing cancelled.");
             return;
         }
 
-        _boxDrawMouseProc = BoxDrawingMouseHook;
-        _boxDrawHook = SetWindowsHookEx(WhMouseLl, _boxDrawMouseProc, GetModuleHandle(null), 0);
-        if (_boxDrawHook == IntPtr.Zero)
+        var kind = SelectedCueKind();
+        if (kind is not ("box" or "arrow"))
         {
-            StatusText.Text = "ASHA could not prepare box drawing.";
-            Log("Could not install the temporary box-drawing mouse hook.");
+            StatusText.Text = "Select box or arrow before drawing.";
             return;
         }
-
-        _boxDrawKeyboardProc = BoxDrawingKeyboardHook;
-        _boxDrawKeyboardHook = SetWindowsHookExKeyboard(WhKeyboardLl, _boxDrawKeyboardProc, GetModuleHandle(null), 0);
-
-        _boxDrawingArmed = true;
-        _boxDrawingStarted = false;
-        DrawBoxButton.Content = "Cancel drawing";
-        StatusText.Text = "Draw box is ready. Press, drag, and release anywhere on the desktop. Press Escape to cancel.";
-        Log("Box drawing armed; the next drag is reserved for an ASHA visual cue.");
+        BeginCueDrawing(kind);
     }
 
-    private IntPtr BoxDrawingMouseHook(int code, IntPtr wParam, IntPtr lParam)
+    private void BeginCueDrawing(string kind)
     {
-        if (code < 0 || !_boxDrawingArmed) return CallNextHookEx(_boxDrawHook, code, wParam, lParam);
+        if (kind is not ("box" or "arrow")) return;
+        SelectCueKind(kind);
+
+        _cueDrawMouseProc = CueDrawingMouseHook;
+        _cueDrawHook = SetWindowsHookEx(WhMouseLl, _cueDrawMouseProc, GetModuleHandle(null), 0);
+        if (_cueDrawHook == IntPtr.Zero)
+        {
+            StatusText.Text = $"ASHA could not prepare {kind} drawing.";
+            Log($"Could not install the temporary {kind}-drawing mouse hook.");
+            return;
+        }
+
+        _cueDrawKeyboardProc = CueDrawingKeyboardHook;
+        _cueDrawKeyboardHook = SetWindowsHookExKeyboard(WhKeyboardLl, _cueDrawKeyboardProc, GetModuleHandle(null), 0);
+
+        _cueDrawingKind = kind;
+        _cueDrawingArmed = true;
+        _cueDrawingStarted = false;
+        DrawCueButton.Content = "Cancel drawing";
+        StatusText.Text = $"Draw {kind} is ready. Press, drag, and release anywhere on the desktop. Press Escape to cancel.";
+        Log($"{kind} drawing armed; the next drag is reserved for an ASHA visual cue.");
+        _ = RecordActiveSessionEventAsync(
+            "cue.drawing_armed",
+            $"The person armed one press-drag-release {kind} cue.",
+            "human",
+            "teach_surface",
+            new { app = "desktop", label = $"Draw {kind}", control = "press-drag-release", kind });
+    }
+
+    private IntPtr CueDrawingMouseHook(int code, IntPtr wParam, IntPtr lParam)
+    {
+        if (code < 0 || !_cueDrawingArmed) return CallNextHookEx(_cueDrawHook, code, wParam, lParam);
         var mouse = Marshal.PtrToStructure<LowLevelMouseData>(lParam);
         var message = unchecked((int)wParam.ToInt64());
 
-        if (message == WmLButtonDown && !_boxDrawingStarted)
+        if (message == WmLButtonDown && !_cueDrawingStarted)
         {
-            _boxDrawingStarted = true;
-            _boxDrawingStart = mouse.Point;
+            _cueDrawingStarted = true;
+            _cueDrawingStart = mouse.Point;
+            var kind = _cueDrawingKind ?? "box";
             Dispatcher.BeginInvoke(() =>
             {
-                _boxDrawingPreview ??= new BoxDrawingPreviewWindow();
-                _boxDrawingPreview.UpdateBounds(_boxDrawingStart, _boxDrawingStart);
-                StatusText.Text = "Drawing box… release when the important area is framed.";
+                _cueDrawingPreview ??= new CueDrawingPreviewWindow(kind);
+                _cueDrawingPreview.UpdateGesture(_cueDrawingStart, _cueDrawingStart);
+                StatusText.Text = kind == "arrow"
+                    ? "Drawing arrow… release where its tip should point."
+                    : "Drawing box… release when the important area is framed.";
             });
             return new IntPtr(1);
         }
 
-        if (message == WmMouseMove && _boxDrawingStarted)
+        if (message == WmMouseMove && _cueDrawingStarted)
         {
-            var start = _boxDrawingStart;
-            Dispatcher.BeginInvoke(() => _boxDrawingPreview?.UpdateBounds(start, mouse.Point));
+            var start = _cueDrawingStart;
+            Dispatcher.BeginInvoke(() => _cueDrawingPreview?.UpdateGesture(start, mouse.Point));
             return new IntPtr(1);
         }
 
-        if (message == WmLButtonUp && _boxDrawingStarted)
+        if (message == WmLButtonUp && _cueDrawingStarted)
         {
-            var start = _boxDrawingStart;
-            StopBoxDrawingHook();
-            Dispatcher.BeginInvoke(async () => await FinishDrawnBoxAsync(start, mouse.Point));
+            var start = _cueDrawingStart;
+            var kind = _cueDrawingKind ?? "box";
+            StopCueDrawingHook();
+            Dispatcher.BeginInvoke(async () => await FinishDrawnCueAsync(kind, start, mouse.Point));
             return new IntPtr(1);
         }
 
-        return CallNextHookEx(_boxDrawHook, code, wParam, lParam);
+        return CallNextHookEx(_cueDrawHook, code, wParam, lParam);
     }
 
-    private IntPtr BoxDrawingKeyboardHook(int code, IntPtr wParam, IntPtr lParam)
+    private IntPtr CueDrawingKeyboardHook(int code, IntPtr wParam, IntPtr lParam)
     {
-        if (code >= 0 && _boxDrawingArmed && unchecked((int)wParam.ToInt64()) == WmKeyDown)
+        if (code >= 0 && _cueDrawingArmed && unchecked((int)wParam.ToInt64()) == WmKeyDown)
         {
             var key = Marshal.PtrToStructure<LowLevelKeyboardData>(lParam);
             if (key.VirtualKeyCode == VkEscape)
             {
-                Dispatcher.BeginInvoke(() => CancelBoxDrawing("Box drawing cancelled."));
+                Dispatcher.BeginInvoke(() => CancelCueDrawing("Cue drawing cancelled."));
                 return new IntPtr(1);
             }
         }
-        return CallNextHookEx(_boxDrawKeyboardHook, code, wParam, lParam);
+        return CallNextHookEx(_cueDrawKeyboardHook, code, wParam, lParam);
     }
 
-    private void CancelBoxDrawing(string status)
+    private void CancelCueDrawing(string status)
     {
-        StopBoxDrawingHook();
-        _boxDrawingPreview?.Close();
-        _boxDrawingPreview = null;
+        var wasArmed = _cueDrawingArmed;
+        var kind = _cueDrawingKind;
+        StopCueDrawingHook();
+        _cueDrawingPreview?.Close();
+        _cueDrawingPreview = null;
         StatusText.Text = status;
+        if (wasArmed)
+            _ = RecordActiveSessionEventAsync(
+                "cue.drawing_cancelled",
+                $"The person cancelled the armed {kind ?? "visual"} cue before completing it.",
+                "human",
+                "teach_surface",
+                new { app = "desktop", label = $"Draw {kind ?? "cue"}", control = "cancel", kind });
     }
 
-    private void StopBoxDrawingHook()
+    private void StopCueDrawingHook()
     {
-        _boxDrawingArmed = false;
-        _boxDrawingStarted = false;
-        if (_boxDrawHook != IntPtr.Zero) _ = UnhookWindowsHookEx(_boxDrawHook);
-        _boxDrawHook = IntPtr.Zero;
-        _boxDrawMouseProc = null;
-        if (_boxDrawKeyboardHook != IntPtr.Zero) _ = UnhookWindowsHookEx(_boxDrawKeyboardHook);
-        _boxDrawKeyboardHook = IntPtr.Zero;
-        _boxDrawKeyboardProc = null;
-        Dispatcher.BeginInvoke(() => DrawBoxButton.Content = "Draw box");
+        _cueDrawingArmed = false;
+        _cueDrawingStarted = false;
+        _cueDrawingKind = null;
+        if (_cueDrawHook != IntPtr.Zero) _ = UnhookWindowsHookEx(_cueDrawHook);
+        _cueDrawHook = IntPtr.Zero;
+        _cueDrawMouseProc = null;
+        if (_cueDrawKeyboardHook != IntPtr.Zero) _ = UnhookWindowsHookEx(_cueDrawKeyboardHook);
+        _cueDrawKeyboardHook = IntPtr.Zero;
+        _cueDrawKeyboardProc = null;
+        Dispatcher.BeginInvoke((Action)UpdateDrawCueButton);
     }
 
-    private async Task FinishDrawnBoxAsync(NativePoint start, NativePoint end)
+    private async Task FinishDrawnCueAsync(string kind, NativePoint start, NativePoint end)
     {
-        _boxDrawingPreview?.Close();
-        _boxDrawingPreview = null;
-        var width = Math.Abs(end.X - start.X);
-        var height = Math.Abs(end.Y - start.Y);
+        _cueDrawingPreview?.Close();
+        _cueDrawingPreview = null;
+        var dx = end.X - start.X;
+        var dy = end.Y - start.Y;
+
+        if (kind == "arrow")
+        {
+            if (Math.Sqrt((double)dx * dx + (double)dy * dy) < 12)
+            {
+                StatusText.Text = "Arrow ignored because its vector was too short. Drag from its origin to its tip.";
+                return;
+            }
+            await CreateVisualCueAsync("arrow", start, dx, dy);
+            return;
+        }
+
+        var width = Math.Abs(dx);
+        var height = Math.Abs(dy);
         if (width < 12 || height < 12)
         {
             StatusText.Text = "Box ignored because it was too small. Drag a visible area.";
@@ -1666,6 +1732,19 @@ public partial class MainWindow : Window
         await CreateVisualCueAsync("box", center, width, height);
     }
 
+    private void UpdateDrawCueButton()
+    {
+        if (DrawCueButton is null || _cueDrawingArmed) return;
+        var kind = SelectedCueKind();
+        DrawCueButton.Content = kind switch
+        {
+            "box" => "Draw box",
+            "arrow" => "Draw arrow",
+            _ => "Draw selected",
+        };
+        DrawCueButton.IsEnabled = kind is "box" or "arrow";
+    }
+
     private async Task MarkAtCurrentMouseAsync()
     {
         if (!GetCursorPos(out var point))
@@ -1674,10 +1753,20 @@ public partial class MainWindow : Window
             return;
         }
 
-        var kind = (KindBox.SelectedItem as ComboBoxItem)?.Content?.ToString() ?? "dot";
+        var kind = SelectedCueKind();
         var width = kind == "arrow" ? ReadVectorDimension(WidthBox, 220) : ReadDimension(WidthBox, 220);
         var height = kind == "arrow" ? ReadVectorDimension(HeightBox, 100) : ReadDimension(HeightBox, 100);
         await CreateVisualCueAsync(kind, point, kind is "box" or "arrow" ? width : null, kind is "box" or "arrow" ? height : null);
+    }
+
+    private string SelectedCueKind() =>
+        (KindBox.SelectedItem as ComboBoxItem)?.Content?.ToString() ?? "dot";
+
+    private void SelectCueKind(string kind)
+    {
+        KindBox.SelectedItem = KindBox.Items
+            .OfType<ComboBoxItem>()
+            .FirstOrDefault(item => string.Equals(item.Content?.ToString(), kind, StringComparison.OrdinalIgnoreCase));
     }
 
     private async Task CreateVisualCueAsync(string kind, NativePoint point, int? width = null, int? height = null)
@@ -1719,10 +1808,15 @@ public partial class MainWindow : Window
     private void MarkList_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
         if (MarkList.SelectedItem is not LiveMark mark) return;
+        LoadCueIntoEditor(mark, preserveLabel: LabelBox.IsKeyboardFocusWithin && _labelEditingCueId is not null);
+    }
+
+    private void LoadCueIntoEditor(LiveMark mark, bool preserveLabel = false)
+    {
         KindBox.SelectedItem = KindBox.Items
             .OfType<ComboBoxItem>()
             .FirstOrDefault(item => string.Equals(item.Content?.ToString(), mark.Kind, StringComparison.OrdinalIgnoreCase));
-        LabelBox.Text = mark.Label ?? string.Empty;
+        if (!preserveLabel) LabelBox.Text = mark.Label ?? string.Empty;
         WidthBox.Text = (mark.W ?? DefaultWidth(mark.Kind)).ToString();
         HeightBox.Text = (mark.H ?? DefaultHeight(mark.Kind)).ToString();
         XBox.Text = mark.X.ToString();
@@ -1730,21 +1824,42 @@ public partial class MainWindow : Window
         ColorBox.Text = mark.Color;
     }
 
+    private void LabelBox_GotKeyboardFocus(object sender, KeyboardFocusChangedEventArgs e)
+    {
+        _labelEditingCueId = (MarkList.SelectedItem as LiveMark)?.Id;
+        _labelEditingText = LabelBox.Text;
+    }
+
+    private void LabelBox_TextChanged(object sender, TextChangedEventArgs e)
+    {
+        if (LabelBox.IsKeyboardFocusWithin && _labelEditingCueId is not null)
+            _labelEditingText = LabelBox.Text;
+    }
+
     private async void LabelBox_KeyDown(object sender, KeyEventArgs e)
     {
         if (e.Key != Key.Enter) return;
         e.Handled = true;
-        await CommitSelectedCueLabelAsync(LabelBox.Text);
+        var cueId = _labelEditingCueId;
+        var text = _labelEditingText ?? LabelBox.Text;
+        await CommitCueLabelAsync(cueId, text);
     }
 
     private async void LabelBox_PreviewLostKeyboardFocus(object sender, KeyboardFocusChangedEventArgs e)
     {
-        await CommitSelectedCueLabelAsync(LabelBox.Text);
+        var cueId = _labelEditingCueId;
+        var text = _labelEditingText ?? LabelBox.Text;
+        _labelEditingCueId = null;
+        _labelEditingText = null;
+        await CommitCueLabelAsync(cueId, text);
+        if (MarkList.SelectedItem is LiveMark selected) LoadCueIntoEditor(selected);
     }
 
-    private async Task CommitSelectedCueLabelAsync(string rawLabel)
+    private async Task CommitCueLabelAsync(string? cueId, string rawLabel)
     {
-        if (_labelCommitInProgress || MarkList.SelectedItem is not LiveMark mark) return;
+        if (_labelCommitInProgress || string.IsNullOrWhiteSpace(cueId)) return;
+        var mark = _marks.FirstOrDefault(candidate => string.Equals(candidate.Id, cueId, StringComparison.Ordinal));
+        if (mark is null) return;
         var label = string.IsNullOrWhiteSpace(rawLabel) ? null : rawLabel.Trim();
         if (string.Equals(mark.Label, label, StringComparison.Ordinal)) return;
 
@@ -2051,8 +2166,8 @@ public partial class MainWindow : Window
         _tapToListenTimer.Stop();
         _conversationBoundaryTimer.Stop();
         _cueEditEventTimer.Stop();
-        StopBoxDrawingHook();
-        _boxDrawingPreview?.Close();
+        StopCueDrawingHook();
+        _cueDrawingPreview?.Close();
         _conversationActive = false;
         _voiceTurnCancellation?.Cancel();
         _lifetimeCancellation.Cancel();
@@ -2152,6 +2267,8 @@ public partial class MainWindow : Window
         contextY = bundle.ContextY,
         contextWidth = bundle.ContextWidth,
         contextHeight = bundle.ContextHeight,
+        contextPixelWidth = bundle.ContextPixelWidth,
+        contextPixelHeight = bundle.ContextPixelHeight,
     };
 
     private async Task RestoreActiveSessionAsync()
@@ -2341,7 +2458,12 @@ public partial class MainWindow : Window
         }
     }
 
-    private async Task<VisualEvidenceBundle?> CaptureVisionEvidenceAsync(string reason, int anchorX, int anchorY, SurfaceTarget? surface)
+    private async Task<VisualEvidenceBundle?> CaptureVisionEvidenceAsync(
+        string reason,
+        int anchorX,
+        int anchorY,
+        SurfaceTarget? surface,
+        DesktopCaptureRegion? requestedRegion = null)
     {
         var sessionId = _activeSessionId;
         if (string.IsNullOrWhiteSpace(sessionId) || _preferences.Vision == VisionPreference.Off) return null;
@@ -2349,7 +2471,7 @@ public partial class MainWindow : Window
         try
         {
             StatusText.Text = "Saving local visual evidence…";
-            var bundle = await _screenObserver.PreserveEvidenceAsync(sessionId, reason, anchorX, anchorY);
+            var bundle = await _screenObserver.PreserveEvidenceAsync(sessionId, reason, anchorX, anchorY, requestedRegion);
             if (bundle is null) return null;
             object target = surface is null
                 ? new { app = "desktop", label = reason, control = "screen", x = anchorX, y = anchorY }
@@ -2374,12 +2496,12 @@ public partial class MainWindow : Window
         }
     }
 
-    private async Task<VisionAttachment?> ResolveVisionForTranscriptAsync(string transcript, VisionRequestKind requestKind, CancellationToken cancellationToken)
+    private async Task<VisionAttachment?> ResolveVisionForTranscriptAsync(string transcript, VisionRequest request, CancellationToken cancellationToken)
     {
         if (!Dispatcher.CheckAccess())
-            return await Dispatcher.InvokeAsync(() => ResolveVisionForTranscriptAsync(transcript, requestKind, cancellationToken)).Task.Unwrap();
+            return await Dispatcher.InvokeAsync(() => ResolveVisionForTranscriptAsync(transcript, request, cancellationToken)).Task.Unwrap();
 
-        var personSelected = requestKind == VisionRequestKind.PersonSelected;
+        var personSelected = request.Kind == VisionRequestKind.PersonSelected;
         if (personSelected && !_shareVisionOnNextTurn) return null;
         if (personSelected) _shareVisionOnNextTurn = false;
 
@@ -2390,23 +2512,35 @@ public partial class MainWindow : Window
             return null;
 
         var evidence = _latestVisionEvidence;
-        if (requestKind == VisionRequestKind.ModelRequested)
+        var effectiveScope = request.Scope;
+        var scene = _awarenessCoordinator.Current;
+        SurfaceTarget? selectedSurface = null;
+        if (request.Kind == VisionRequestKind.ModelRequested)
         {
-            var scene = _awarenessCoordinator.Current;
             var pointer = scene?.Pointer;
             if (pointer is null && GetCursorPos(out var currentPointer))
                 pointer = new AwarenessPoint(currentPointer.X, currentPointer.Y);
-            if (pointer is null) return null;
+            if (pointer is null && request.Region is null) return null;
 
-            var nativePoint = new NativePoint { X = pointer.X, Y = pointer.Y };
-            var surface = ResolveTopmostSurface(nativePoint);
-            evidence = await CaptureVisionEvidenceAsync("model requested view", pointer.X, pointer.Y, surface);
+            effectiveScope = request.Region is null
+                ? ResolveVisionScope(transcript, request.Scope, scene)
+                : VisionRequestScope.Region;
+            var requestedRegion = request.Region ?? ResolveViewRegion(effectiveScope, scene, pointer!);
+            if (requestedRegion is not null && request.PreferTextDetail && !requestedRegion.PreferTextDetail)
+                requestedRegion = requestedRegion with { PreferTextDetail = true };
+            var anchorX = requestedRegion is null ? pointer!.X : requestedRegion.X + (requestedRegion.Width / 2);
+            var anchorY = requestedRegion is null ? pointer!.Y : requestedRegion.Y + (requestedRegion.Height / 2);
+            var nativePoint = new NativePoint { X = anchorX, Y = anchorY };
+            selectedSurface = effectiveScope == VisionRequestScope.ForegroundWindow && scene?.Foreground is { } foreground
+                ? new SurfaceTarget(foreground.ProcessName, foreground.Title, foreground.WindowClass, foreground.X, foreground.Y, foreground.Width, foreground.Height)
+                : ResolveTopmostSurface(nativePoint);
+            evidence = await CaptureVisionEvidenceAsync($"model requested {VisionScopeLabel(effectiveScope)}", anchorX, anchorY, selectedSurface, requestedRegion);
             if (evidence is not null) await ShowTransientCaptureBoundaryAsync(evidence);
         }
 
         if (evidence is null) return null;
 
-        var attachment = LoadVisionAttachment(evidence);
+        var attachment = LoadVisionAttachment(evidence, BuildVisionRuntimeContext(scene, selectedSurface, effectiveScope));
         if (attachment is null)
         {
             StatusText.Text = "ASHA could not read the selected view.";
@@ -2423,8 +2557,8 @@ public partial class MainWindow : Window
             new
             {
                 app = "desktop",
-                label = personSelected ? "person-selected view" : "model-requested view",
-                control = "one-view visual share",
+                label = personSelected ? "person-selected view" : $"model-requested {VisionScopeLabel(effectiveScope)}",
+                control = personSelected ? "one-view visual share" : VisionScopeLabel(effectiveScope),
                 x = evidence.ContextX,
                 y = evidence.ContextY,
                 w = evidence.ContextWidth,
@@ -2434,6 +2568,104 @@ public partial class MainWindow : Window
         StatusText.Text = personSelected ? "ASHA is looking at the selected view…" : "ASHA requested and received one current view…";
         return attachment;
     }
+
+    private static string? BuildVisionRuntimeContext(AwarenessScene? scene, SurfaceTarget? selectedSurface, VisionRequestScope scope)
+    {
+        var parts = new List<string>(2);
+        if (scene?.Foreground is { } foreground)
+            parts.Add($"Windows identifies the current foreground application as {foreground.ProcessName}, with window title {foreground.DisplayName}.");
+        if (selectedSurface is not null && scope != VisionRequestScope.EntireDesktop)
+            parts.Add($"Windows identifies the top-level surface at the selected region as {selectedSurface.ProcessName}, with window title {selectedSurface.DisplayName}.");
+        return parts.Count == 0 ? null : string.Join(" ", parts);
+    }
+
+    private static DesktopCaptureRegion? ResolveViewRegion(VisionRequestScope scope, AwarenessScene? scene, AwarenessPoint pointer)
+    {
+        if (scope == VisionRequestScope.PointerArea) return null;
+        if (scope == VisionRequestScope.ForegroundWindow && scene?.Foreground is { Width: > 0, Height: > 0 } foreground)
+            return new DesktopCaptureRegion(foreground.X, foreground.Y, foreground.Width, foreground.Height, PreferTextDetail: true);
+
+        var virtualScreen = Forms.SystemInformation.VirtualScreen;
+        if (scope == VisionRequestScope.EntireDesktop)
+            return new DesktopCaptureRegion(virtualScreen.Left, virtualScreen.Top, virtualScreen.Width, virtualScreen.Height);
+
+        var monitor = Forms.Screen.FromPoint(new Drawing.Point(pointer.X, pointer.Y)).Bounds;
+        var leftWidth = Math.Max(1, monitor.Width / 2);
+        var upperHeight = Math.Max(1, monitor.Height / 2);
+        return scope switch
+        {
+            VisionRequestScope.LeftScreen => new DesktopCaptureRegion(monitor.Left, monitor.Top, leftWidth, monitor.Height),
+            VisionRequestScope.RightScreen => new DesktopCaptureRegion(monitor.Left + leftWidth, monitor.Top, monitor.Width - leftWidth, monitor.Height),
+            VisionRequestScope.UpperScreen => new DesktopCaptureRegion(monitor.Left, monitor.Top, monitor.Width, upperHeight),
+            VisionRequestScope.LowerScreen => new DesktopCaptureRegion(monitor.Left, monitor.Top + upperHeight, monitor.Width, monitor.Height - upperHeight),
+            VisionRequestScope.UpperLeftScreen => new DesktopCaptureRegion(monitor.Left, monitor.Top, leftWidth, upperHeight),
+            VisionRequestScope.UpperRightScreen => new DesktopCaptureRegion(monitor.Left + leftWidth, monitor.Top, monitor.Width - leftWidth, upperHeight),
+            VisionRequestScope.LowerLeftScreen => new DesktopCaptureRegion(monitor.Left, monitor.Top + upperHeight, leftWidth, monitor.Height - upperHeight),
+            VisionRequestScope.LowerRightScreen => new DesktopCaptureRegion(monitor.Left + leftWidth, monitor.Top + upperHeight, monitor.Width - leftWidth, monitor.Height - upperHeight),
+            _ => null,
+        };
+    }
+
+    private static VisionRequestScope ResolveVisionScope(string transcript, VisionRequestScope requested, AwarenessScene? scene)
+    {
+        if (string.IsNullOrWhiteSpace(transcript)) return requested;
+        var text = transcript.Trim();
+        var explicitlyPointerBound = Regex.IsMatch(
+            text,
+            @"\b(mouse|cursor|pointer|mouse\s+pointer|maus|mauszeiger|cursor|zeiger)\b|\b(where\s+i(?:'m|\s+am)\s+(?:looking|pointing))\b|\b(here|hier|this\s+(?:spot|area)|diese\s+stelle)\b",
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        if (explicitlyPointerBound) return VisionRequestScope.PointerArea;
+
+        var explicitlyUpper = Regex.IsMatch(text, @"\b(upper|top|oben|ober\w*)\b", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        var explicitlyLower = Regex.IsMatch(text, @"\b(lower|bottom|unten|unter\w*)\b", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        var explicitlyLeft = Regex.IsMatch(text, @"\b(left|links|linke\w*)\b", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        var explicitlyRight = Regex.IsMatch(text, @"\b(right|rechts|rechte\w*)\b", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        if (explicitlyUpper && explicitlyLeft) return VisionRequestScope.UpperLeftScreen;
+        if (explicitlyUpper && explicitlyRight) return VisionRequestScope.UpperRightScreen;
+        if (explicitlyLower && explicitlyLeft) return VisionRequestScope.LowerLeftScreen;
+        if (explicitlyLower && explicitlyRight) return VisionRequestScope.LowerRightScreen;
+        if (explicitlyUpper) return VisionRequestScope.UpperScreen;
+        if (explicitlyLower) return VisionRequestScope.LowerScreen;
+        if (explicitlyLeft) return VisionRequestScope.LeftScreen;
+        if (explicitlyRight) return VisionRequestScope.RightScreen;
+
+        var explicitlyBroad = Regex.IsMatch(
+            text,
+            @"\b(entire|whole|full|all)\s+(?:desktop|screen|monitor|display)\b|\bdesktop\s+overview\b|\b(gesamte[nrms]?|ganze[nrms]?)\s+(?:desktop|bildschirm|monitor|anzeige)\b",
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        if (explicitlyBroad) return VisionRequestScope.EntireDesktop;
+
+        var targetsApplicationOrWindow = Regex.IsMatch(
+            text,
+            @"\b(app|application|program|window|browser|explorer|desktop\s+icon)\b|\b(anwendung|programm|fenster|browser|explorer|desktop\s*symbol)\b|\bwhere\s+(?:is|are).{0,60}\b(open|running)\b|\bwo\s+.{0,60}\b(offen|ge.ffnet|l.uft)\b",
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        if (targetsApplicationOrWindow) return VisionRequestScope.EntireDesktop;
+
+        var targetsInterfaceElement = Regex.IsMatch(
+            text,
+            @"\b(button|tab|menu|menu\s+item|field|label|link|icon|control|setting|option|panel|sidebar|section|docs|documentation)\b|\b(knopf|schaltfl.che|tab|men.|men.punkt|feld|beschriftung|link|symbol|einstellung|option|bereich|seitenleiste|dokumentation)\b",
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        if (targetsInterfaceElement && scene?.Foreground is { Width: > 0, Height: > 0 })
+            return VisionRequestScope.ForegroundWindow;
+
+        return requested;
+    }
+
+    private static string VisionScopeLabel(VisionRequestScope scope) => scope switch
+    {
+        VisionRequestScope.ForegroundWindow => "foreground-window view",
+        VisionRequestScope.EntireDesktop => "entire-desktop view",
+        VisionRequestScope.LeftScreen => "left-screen view",
+        VisionRequestScope.RightScreen => "right-screen view",
+        VisionRequestScope.UpperScreen => "upper-screen view",
+        VisionRequestScope.LowerScreen => "lower-screen view",
+        VisionRequestScope.UpperLeftScreen => "upper-left-screen view",
+        VisionRequestScope.UpperRightScreen => "upper-right-screen view",
+        VisionRequestScope.LowerLeftScreen => "lower-left-screen view",
+        VisionRequestScope.LowerRightScreen => "lower-right-screen view",
+        VisionRequestScope.Region => "closer region view",
+        _ => "pointer-area view",
+    };
 
     private async Task ShowTransientCaptureBoundaryAsync(VisualEvidenceBundle evidence)
     {
@@ -2466,7 +2698,7 @@ public partial class MainWindow : Window
         }
     }
 
-    private static VisionAttachment? LoadVisionAttachment(VisualEvidenceBundle evidence)
+    private static VisionAttachment? LoadVisionAttachment(VisualEvidenceBundle evidence, string? desktopContext = null)
     {
         var relative = evidence.ContextFile ?? evidence.AfterFile;
         var runtimeRoot = Path.GetFullPath(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "asha"));
@@ -2487,47 +2719,131 @@ public partial class MainWindow : Window
             evidence.ContextX,
             evidence.ContextY,
             evidence.ContextWidth,
-            evidence.ContextHeight);
+            evidence.ContextHeight,
+            evidence.ContextPixelWidth,
+            evidence.ContextPixelHeight,
+            desktopContext);
     }
 
-    private async Task<string> ExecuteVisualToolAsync(AshaVisualToolCall call, VisionAttachment vision, CancellationToken cancellationToken)
+    private async Task<string> ExecuteVisualToolAsync(AshaVisualToolCall call, VisionAttachment? vision, CancellationToken cancellationToken)
     {
         return await Dispatcher.InvokeAsync(() => ExecuteVisualToolOnUiAsync(call, vision, cancellationToken)).Task.Unwrap();
     }
 
-    private async Task<string> ExecuteVisualToolOnUiAsync(AshaVisualToolCall call, VisionAttachment vision, CancellationToken cancellationToken)
+    private async Task<string> ExecuteVisualToolOnUiAsync(AshaVisualToolCall call, VisionAttachment? vision, CancellationToken cancellationToken)
     {
+        if (string.Equals(call.Name, "asha_clear_guidance", StringComparison.Ordinal))
+            return await ExecuteClearGuidanceOnUiAsync(call);
+        if (string.Equals(call.Name, "asha_open_application", StringComparison.Ordinal))
+            return await ExecuteOpenApplicationOnUiAsync(call, cancellationToken);
+        if (string.Equals(call.Name, "asha_open_folder", StringComparison.Ordinal))
+            return await ExecuteOpenFolderOnUiAsync(call, cancellationToken);
         if (string.Equals(call.Name, "asha_desktop_action", StringComparison.Ordinal))
-            return await ExecuteDesktopActionOnUiAsync(call, vision, cancellationToken);
+            return vision is null
+                ? JsonSerializer.Serialize(new { ok = false, error = "A current coordinate-mapped desktop view is required before physical pointer input." })
+                : await ExecuteDesktopActionOnUiAsync(call, vision, cancellationToken);
         if (!string.Equals(call.Name, "asha_mark", StringComparison.Ordinal))
-            return JsonSerializer.Serialize(new { ok = false, error = "Only the safe asha_mark visual-guidance tool is available." });
-        if (string.IsNullOrWhiteSpace(_activeSessionId) || !vision.HasDesktopMapping)
+            return JsonSerializer.Serialize(new { ok = false, error = "That ASHA tool is not available." });
+        if (string.IsNullOrWhiteSpace(_activeSessionId) || vision is null || !vision.HasDesktopMapping)
             return JsonSerializer.Serialize(new { ok = false, error = "An active session and coordinate-mapped visual evidence are required." });
         if (!TryReadToolString(call.Arguments, "kind", out var kind) || !new[] { "dot", "circle", "box", "arrow", "label" }.Contains(kind, StringComparer.Ordinal))
             return JsonSerializer.Serialize(new { ok = false, error = "Choose dot, circle, box, arrow, or label." });
-        if (!TryReadToolCoordinate(call.Arguments, "x", out var x) || !TryReadToolCoordinate(call.Arguments, "y", out var y))
-            return JsonSerializer.Serialize(new { ok = false, error = "Visual guidance requires finite desktop x and y coordinates." });
-        var contextX = vision.ContextX!.Value;
-        var contextY = vision.ContextY!.Value;
-        var contextWidth = vision.ContextWidth!.Value;
-        var contextHeight = vision.ContextHeight!.Value;
-        if (x < contextX || x > contextX + contextWidth || y < contextY || y > contextY + contextHeight)
-            return JsonSerializer.Serialize(new { ok = false, error = "The mark must remain inside the supplied visual-evidence crop." });
+        if (!TryReadToolCoordinate(call.Arguments, "x", out var imageX) || !TryReadToolCoordinate(call.Arguments, "y", out var imageY))
+            return JsonSerializer.Serialize(new { ok = false, error = "Visual guidance requires a point inside the supplied image." });
 
+        var label = TryReadToolString(call.Arguments, "label", out var suppliedLabel) && suppliedLabel.Length <= 80 ? suppliedLabel : null;
+        var requiresTextGrounding = TryReadToolString(call.Arguments, "target_type", out var targetType) &&
+                                    string.Equals(targetType, "text", StringComparison.Ordinal);
+        int? imageWidth = null;
+        int? imageHeight = null;
+        if (kind == "box")
+        {
+            if (!TryReadToolDimension(call.Arguments, "w", 2, vision.ImageWidth, out imageWidth) ||
+                !TryReadToolDimension(call.Arguments, "h", 2, vision.ImageHeight, out imageHeight) ||
+                imageX + imageWidth > vision.ImageWidth || imageY + imageHeight > vision.ImageHeight)
+                return JsonSerializer.Serialize(new { ok = false, error = "A box must fit inside the supplied image." });
+        }
+        else if (kind == "arrow")
+        {
+            if (!TryReadToolSignedDimension(call.Arguments, "w", -vision.ImageWidth, vision.ImageWidth, out imageWidth) ||
+                !TryReadToolSignedDimension(call.Arguments, "h", -vision.ImageHeight, vision.ImageHeight, out imageHeight) ||
+                (imageWidth == 0 && imageHeight == 0) ||
+                !vision.TryMapImagePoint(imageX + imageWidth!.Value, imageY + imageHeight!.Value, out _, out _))
+                return JsonSerializer.Serialize(new { ok = false, error = "An arrow and its tip must fit inside the supplied image." });
+        }
+
+        var grounding = "model_coordinates";
+        if (kind == "box" && !string.IsNullOrWhiteSpace(label))
+        {
+            OcrTextMatch? match = null;
+            try
+            {
+                match = await LocalOcrGrounder.FindNearestAsync(
+                    vision.Bytes,
+                    label,
+                    imageX + (imageWidth!.Value / 2),
+                    imageY + (imageHeight!.Value / 2),
+                    cancellationToken);
+                if (match is { } text)
+                {
+                    const int horizontalPadding = 7;
+                    const int verticalPadding = 4;
+                    imageX = Math.Max(0, text.X - horizontalPadding);
+                    imageY = Math.Max(0, text.Y - verticalPadding);
+                    var right = Math.Min(vision.ImageWidth, text.X + text.Width + horizontalPadding);
+                    var bottom = Math.Min(vision.ImageHeight, text.Y + text.Height + verticalPadding);
+                    imageWidth = Math.Max(2, right - imageX);
+                    imageHeight = Math.Max(2, bottom - imageY);
+                    grounding = "local_windows_ocr";
+                }
+            }
+            catch (Exception error) when (error is not OperationCanceledException)
+            {
+                Log($"Local OCR grounding was unavailable: {error.Message}");
+            }
+            if (requiresTextGrounding && match is null)
+                return JsonSerializer.Serialize(new
+                {
+                    ok = false,
+                    error = $"ASHA could not verify the visible text {label} in the selected view, so no mark was shown.",
+                });
+        }
+
+        if (!vision.TryMapImagePoint(imageX, imageY, out var x, out var y))
+            return JsonSerializer.Serialize(new { ok = false, error = "Visual guidance requires a point inside the supplied image." });
         int? width = null;
         int? height = null;
         if (kind == "box")
         {
-            if (!TryReadToolDimension(call.Arguments, "w", 12, 1_200, out width) || !TryReadToolDimension(call.Arguments, "h", 12, 1_200, out height))
-                return JsonSerializer.Serialize(new { ok = false, error = "A box needs a width and height between 12 and 1200 pixels." });
+            width = Math.Max(12, vision.MapImageWidth(imageWidth!.Value));
+            height = Math.Max(12, vision.MapImageHeight(imageHeight!.Value));
         }
         else if (kind == "arrow")
         {
-            if (!TryReadToolSignedDimension(call.Arguments, "w", -1_200, 1_200, out width) || !TryReadToolSignedDimension(call.Arguments, "h", -1_200, 1_200, out height) || (width == 0 && height == 0))
-                return JsonSerializer.Serialize(new { ok = false, error = "An arrow needs a non-zero horizontal or vertical vector." });
+            width = vision.MapImageWidth(imageWidth!.Value);
+            height = vision.MapImageHeight(imageHeight!.Value);
         }
 
-        var label = TryReadToolString(call.Arguments, "label", out var suppliedLabel) && suppliedLabel.Length <= 80 ? suppliedLabel : null;
+        var expectedApp = TryReadToolString(call.Arguments, "expected_app", out var suppliedExpectedApp) && suppliedExpectedApp.Length <= 80
+            ? suppliedExpectedApp
+            : ExpectedAppFromWindowLabel(label);
+        if (!string.IsNullOrWhiteSpace(expectedApp))
+        {
+            var verificationX = kind == "box" && width.HasValue ? x + (width.Value / 2) : x;
+            var verificationY = kind == "box" && height.HasValue ? y + (height.Value / 2) : y;
+            var exposedSurface = ResolveTopmostSurface(new NativePoint { X = verificationX, Y = verificationY });
+            if (!SurfaceMatchesExpectedApplication(expectedApp, exposedSurface))
+            {
+                var actual = exposedSurface?.DisplayName;
+                return JsonSerializer.Serialize(new
+                {
+                    ok = false,
+                    error = string.IsNullOrWhiteSpace(actual)
+                        ? $"ASHA could not verify that {expectedApp} is visibly exposed at that location."
+                        : $"That location is on {actual}, not visibly on {expectedApp}. ASHA did not show the mark.",
+                });
+            }
+        }
         var id = $"asha-guidance-{Guid.NewGuid():N}";
         var mark = new MarkRequest(id, kind, x, y, width, height, label, VisualGuidanceColor(kind));
         var result = await RunAshaAsync("mark", JsonSerializer.Serialize(mark, JsonOptions));
@@ -2540,10 +2856,121 @@ public partial class MainWindow : Window
             $"ASHA showed a {kind} to guide the person to a visible target.",
             "model",
             "teach_human",
-            new { app = "desktop", label, control = kind, x, y, w = width, h = height },
+            new { app = "desktop", label, control = kind, x, y, w = width, h = height, grounding },
             cue: CuePayload(guidanceCue));
-        Log($"ASHA visual guidance: {kind} at {x}, {y}.");
-        return JsonSerializer.Serialize(new { ok = true, id = markId, kind, x, y, label, action = "visual overlay shown; no mouse or keyboard input occurred" });
+        Log($"ASHA visual guidance: {kind} at {x}, {y}; grounding: {grounding}.");
+        return JsonSerializer.Serialize(new { ok = true, id = markId, kind, x, y, label, grounding, action = "visual overlay shown; no mouse or keyboard input occurred" });
+    }
+
+    private async Task<string> ExecuteClearGuidanceOnUiAsync(AshaVisualToolCall call)
+    {
+        var scope = TryReadToolString(call.Arguments, "scope", out var suppliedScope) && suppliedScope is "latest" or "all"
+            ? suppliedScope
+            : "latest";
+        var ids = ReadPersistedGuidanceMarkIds().ToList();
+        foreach (var mark in _marks.Where(mark => mark.Id.StartsWith("asha-guidance-", StringComparison.Ordinal)))
+        {
+            if (!ids.Contains(mark.Id, StringComparer.Ordinal)) ids.Add(mark.Id);
+        }
+
+        var selected = scope == "all" ? ids : ids.TakeLast(1).ToList();
+        foreach (var id in selected)
+            await RunAshaAsync("clear", id);
+        foreach (var mark in _marks.Where(mark => selected.Contains(mark.Id, StringComparer.Ordinal)).ToArray())
+            _marks.Remove(mark);
+
+        if (selected.Count > 0)
+        {
+            await RecordActiveSessionEventAsync(
+                "guidance.visual_marks_cleared",
+                scope == "all" ? "ASHA removed all of her visual guidance marks." : "ASHA removed her latest visual guidance mark.",
+                "model",
+                "teach_human",
+                new { app = "desktop", label = "ASHA visual guidance", control = $"clear_{scope}", count = selected.Count });
+        }
+        StatusText.Text = selected.Count == 0 ? "ASHA has no highlights to remove." : "ASHA removed her visual guidance.";
+        Log(selected.Count == 0 ? "No ASHA guidance marks were present." : $"ASHA cleared {selected.Count} model-created guidance mark(s).");
+        return JsonSerializer.Serialize(new { ok = true, scope, removed = selected.Count, action = "only ASHA-created visual guidance was removed" });
+    }
+
+    private static IReadOnlyList<string> ReadPersistedGuidanceMarkIds()
+    {
+        try
+        {
+            var path = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "asha", "marks.json");
+            if (!File.Exists(path)) return [];
+            using var document = JsonDocument.Parse(File.ReadAllText(path));
+            if (!document.RootElement.TryGetProperty("marks", out var marks) || marks.ValueKind != JsonValueKind.Object) return [];
+            return marks.EnumerateObject()
+                .Select(mark => mark.Name)
+                .Where(id => id.StartsWith("asha-guidance-", StringComparison.Ordinal))
+                .ToArray();
+        }
+        catch (JsonException)
+        {
+            return [];
+        }
+        catch (IOException)
+        {
+            return [];
+        }
+    }
+
+    private async Task<string> ExecuteOpenApplicationOnUiAsync(AshaVisualToolCall call, CancellationToken cancellationToken)
+    {
+        if (!_controlSessionActive)
+            return JsonSerializer.Serialize(new { ok = false, error = "Computer control is disabled. Ask the person to enable the explicit control session." });
+        if (string.IsNullOrWhiteSpace(_activeSessionId))
+            return JsonSerializer.Serialize(new { ok = false, error = "Start a shared-attention session before opening an application." });
+        if (!TryReadToolString(call.Arguments, "application", out var application))
+            return JsonSerializer.Serialize(new { ok = false, error = "Choose an installed application by its display name." });
+
+        var result = await ApplicationLauncher.OpenAsync(application, cancellationToken);
+        await RecordActiveSessionEventAsync(
+            "control.application_opened",
+            $"ASHA opened or activated the installed application {result.ResolvedName} after the person enabled computer control.",
+            "model",
+            "computer_control",
+            new { app = result.ProcessName, label = result.WindowTitle, control = "open_application" });
+        StatusText.Text = $"Opened {result.ResolvedName}.";
+        Log($"ASHA opened {result.ResolvedName}; visible window verified as {result.WindowTitle}.");
+        return JsonSerializer.Serialize(new
+        {
+            ok = true,
+            requested = result.RequestedName,
+            application = result.ResolvedName,
+            process = result.ProcessName,
+            window = result.WindowTitle,
+            activated_existing = result.ActivatedExisting,
+            verification = "a visible application window was found and brought forward",
+        });
+    }
+
+    private async Task<string> ExecuteOpenFolderOnUiAsync(AshaVisualToolCall call, CancellationToken cancellationToken)
+    {
+        if (!_controlSessionActive)
+            return JsonSerializer.Serialize(new { ok = false, error = "Computer control is disabled. Ask the person to enable the explicit control session." });
+        if (string.IsNullOrWhiteSpace(_activeSessionId))
+            return JsonSerializer.Serialize(new { ok = false, error = "Start a shared-attention session before opening a folder." });
+        if (!TryReadToolString(call.Arguments, "folder", out var folder))
+            return JsonSerializer.Serialize(new { ok = false, error = "Choose an existing ordinary folder by name or local path." });
+
+        var result = await FolderLauncher.OpenAsync(folder, cancellationToken);
+        await RecordActiveSessionEventAsync(
+            "control.folder_opened",
+            "ASHA opened one existing non-system folder in Explorer after the person enabled computer control.",
+            "model",
+            "computer_control",
+            new { app = "explorer", label = result.WindowTitle, control = "open_folder" });
+        StatusText.Text = $"Opened {Path.GetFileName(result.Path.TrimEnd(Path.DirectorySeparatorChar))}.";
+        Log($"ASHA opened a folder in Explorer and verified the visible window {result.WindowTitle}.");
+        return JsonSerializer.Serialize(new
+        {
+            ok = true,
+            folder = result.RequestedFolder,
+            window = result.WindowTitle,
+            verification = "a visible Explorer window was found",
+        });
     }
 
     private async Task<string> ExecuteDesktopActionOnUiAsync(AshaVisualToolCall call, VisionAttachment vision, CancellationToken cancellationToken)
@@ -2559,13 +2986,20 @@ public partial class MainWindow : Window
         string visibleLabel;
         switch (action)
         {
+            case "move":
             case "click":
             case "double_click":
             case "right_click":
                 if (!TryReadVisiblePoint(call.Arguments, "x", "y", vision, out var x, out var y))
                     return JsonSerializer.Serialize(new { ok = false, error = "The requested target must be inside the supplied desktop image." });
                 input = new DesktopAction(action, x, y);
-                visibleLabel = action == "click" ? "ASHA clicks" : action == "double_click" ? "ASHA double-clicks" : "ASHA right-clicks";
+                visibleLabel = action switch
+                {
+                    "move" => "ASHA moves the pointer",
+                    "click" => "ASHA clicks",
+                    "double_click" => "ASHA double-clicks",
+                    _ => "ASHA right-clicks",
+                };
                 break;
             case "drag":
                 if (!TryReadVisiblePoint(call.Arguments, "x", "y", vision, out var startX, out var startY) ||
@@ -2607,6 +3041,20 @@ public partial class MainWindow : Window
                 return JsonSerializer.Serialize(new { ok = false, error = "That physical desktop action is not available." });
         }
 
+        SurfaceTarget? exposedSurface = null;
+        if (input.X.HasValue && input.Y.HasValue)
+        {
+            exposedSurface = ResolveTopmostSurface(new NativePoint { X = input.X.Value, Y = input.Y.Value });
+            if (exposedSurface is null)
+                return JsonSerializer.Serialize(new { ok = false, error = "Windows could not verify a visible top-layer surface at that target." });
+        }
+        else if (action is "type_text" or "key" && _awarenessCoordinator.Current?.Foreground is { } focused)
+        {
+            if (IsProtectedInputSurface(focused.ProcessName, focused.WindowClass))
+                return JsonSerializer.Serialize(new { ok = false, error = "ASHA does not type or send keys into terminal, shell, registry, or administrative control surfaces." });
+            exposedSurface = new SurfaceTarget(focused.ProcessName, focused.Title, focused.WindowClass, focused.X, focused.Y, focused.Width, focused.Height);
+        }
+
         await ShowTransientControlCueAsync(input, visibleLabel);
         await Task.Delay(180, cancellationToken);
         await DesktopControlExecutor.ExecuteAsync(input, cancellationToken);
@@ -2614,8 +3062,6 @@ public partial class MainWindow : Window
 
         SurfaceTarget? resultingSurface = null;
         if (GetCursorPos(out var pointer)) resultingSurface = ResolveTopmostSurface(pointer);
-        if (resultingSurface is not null)
-            _ = CaptureVisionEvidenceAsync($"control action {action}", pointer.X, pointer.Y, resultingSurface);
         await RecordActiveSessionEventAsync(
             "control.input_sent",
             $"ASHA sent one visible physical {action.Replace('_', ' ')} input after the person enabled computer control.",
@@ -2626,18 +3072,22 @@ public partial class MainWindow : Window
                 app = resultingSurface?.ProcessName ?? "desktop",
                 label = visibleLabel,
                 control = action,
+                exposedApp = exposedSurface?.ProcessName,
+                exposedWindow = exposedSurface?.DisplayName,
                 x = input.X,
                 y = input.Y,
                 endX = input.EndX,
                 endY = input.EndY,
             });
         Log($"{visibleLabel}: physical input sent.");
-        StatusText.Text = $"{visibleLabel}. ASHA captured follow-up visual evidence for review.";
+        StatusText.Text = $"{visibleLabel}. ASHA is checking the visible result.";
         return JsonSerializer.Serialize(new
         {
             ok = true,
             action,
-            input = "physical desktop input was sent visibly; ASHA has not claimed the requested result without further verification",
+            top_layer = exposedSurface is null ? null : new { app = exposedSurface.ProcessName, window = exposedSurface.DisplayName },
+            input = "physical desktop input was sent visibly",
+            verification = "a fresh post-action view is required before claiming the intended result",
         });
     }
 
@@ -2662,15 +3112,50 @@ public partial class MainWindow : Window
     {
         x = 0;
         y = 0;
-        if (!TryReadToolCoordinate(arguments, xName, out x) || !TryReadToolCoordinate(arguments, yName, out y)) return false;
-        return x >= vision.ContextX!.Value && x <= vision.ContextX.Value + vision.ContextWidth!.Value &&
-               y >= vision.ContextY!.Value && y <= vision.ContextY.Value + vision.ContextHeight!.Value;
+        return TryReadToolCoordinate(arguments, xName, out var imageX) &&
+               TryReadToolCoordinate(arguments, yName, out var imageY) &&
+               vision.TryMapImagePoint(imageX, imageY, out x, out y);
     }
+
+    private static string? ExpectedAppFromWindowLabel(string? label)
+    {
+        if (string.IsNullOrWhiteSpace(label)) return null;
+        var match = Regex.Match(label, @"^\s*(.+?)\s+(?:window|app|application|fenster|anwendung)\s*$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        return match.Success ? match.Groups[1].Value.Trim() : null;
+    }
+
+    private static bool SurfaceMatchesExpectedApplication(string expected, SurfaceTarget? surface)
+    {
+        if (surface is null) return false;
+        var expectedName = NormalizeSurfaceName(expected);
+        if (expectedName.Length == 0) return true;
+        var candidates = new[] { surface.ProcessName, surface.DisplayName, surface.WindowClass }
+            .Select(NormalizeSurfaceName)
+            .Where(value => value.Length >= 3)
+            .ToArray();
+        if (candidates.Any(candidate => candidate.Contains(expectedName, StringComparison.Ordinal) || expectedName.Contains(candidate, StringComparison.Ordinal)))
+            return true;
+        if (expectedName.Contains("fileexplorer", StringComparison.Ordinal) && candidates.Any(candidate => candidate.Contains("explorer", StringComparison.Ordinal))) return true;
+        if (expectedName.Contains("outlook", StringComparison.Ordinal) && candidates.Any(candidate => candidate.Contains("outlook", StringComparison.Ordinal) || candidate == "olk")) return true;
+        if (expectedName.Contains("edge", StringComparison.Ordinal) && candidates.Any(candidate => candidate.Contains("msedge", StringComparison.Ordinal))) return true;
+        if (expectedName.Contains("visualstudiocode", StringComparison.Ordinal) && candidates.Any(candidate => candidate == "code" || candidate.Contains("visualstudiocode", StringComparison.Ordinal))) return true;
+        if (expectedName == "desktop" && candidates.Any(candidate => candidate.Contains("progman", StringComparison.Ordinal) || candidate.Contains("workerw", StringComparison.Ordinal))) return true;
+        return false;
+    }
+
+    private static string NormalizeSurfaceName(string value) =>
+        Regex.Replace(value.ToLowerInvariant(), @"\b(window|app|application|program|fenster|anwendung|programm)\b|[^a-z0-9]+", string.Empty, RegexOptions.CultureInvariant);
 
     private static bool LooksSensitive(string text) => Regex.IsMatch(
         text,
         @"(password|passwort|token|secret|api[_ -]?key|recoverys*code|one[- ]?times*(?:code|password)|otp)",
         RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+
+    private static bool IsProtectedInputSurface(string processName, string windowClass) =>
+        Regex.IsMatch(
+            $"{processName} {windowClass}",
+            @"\b(cmd|powershell|pwsh|windowsterminal|wsl|bash|regedit|mmc|taskmgr|consolewindowclass|cascadia_hosting_window_class)\b",
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
 
     private static bool TryReadToolString(JsonElement arguments, string name, out string value)
     {
@@ -2956,7 +3441,7 @@ public partial class MainWindow : Window
     private const uint SwpNoActivate = 0x0010;
     private const uint SwpShowWindow = 0x0040;
 
-    private sealed class BoxDrawingPreviewWindow : Window
+    private sealed class CueDrawingPreviewWindow : Window
     {
         private const int GwlExStyle = -20;
         private const int WsExTransparent = 0x00000020;
@@ -2965,9 +3450,14 @@ public partial class MainWindow : Window
         private const uint SwpNoActivate = 0x0010;
         private const uint SwpShowWindow = 0x0040;
         private static readonly IntPtr HwndTopmost = new(-1);
+        private readonly string _kind;
+        private readonly Canvas? _arrowCanvas;
+        private readonly WpfLine? _arrowLine;
+        private readonly WpfPolyline? _arrowHead;
 
-        public BoxDrawingPreviewWindow()
+        public CueDrawingPreviewWindow(string kind)
         {
+            _kind = kind;
             WindowStyle = WindowStyle.None;
             ResizeMode = ResizeMode.NoResize;
             AllowsTransparency = true;
@@ -2977,26 +3467,76 @@ public partial class MainWindow : Window
             Topmost = true;
             Width = 1;
             Height = 1;
-            Content = new Border
+            if (kind == "arrow")
             {
-                BorderBrush = new SolidColorBrush(Color.FromRgb(76, 141, 255)),
-                BorderThickness = new Thickness(3),
-                CornerRadius = new CornerRadius(8),
-                Background = new SolidColorBrush(Color.FromArgb(22, 76, 141, 255)),
-            };
+                var stroke = new SolidColorBrush(Color.FromRgb(118, 108, 255));
+                _arrowCanvas = new Canvas { Background = Brushes.Transparent };
+                _arrowLine = new WpfLine
+                {
+                    Stroke = stroke,
+                    StrokeThickness = 6,
+                    StrokeStartLineCap = PenLineCap.Round,
+                    StrokeEndLineCap = PenLineCap.Round,
+                };
+                _arrowHead = new WpfPolyline
+                {
+                    Stroke = stroke,
+                    StrokeThickness = 6,
+                    StrokeLineJoin = PenLineJoin.Round,
+                    StrokeStartLineCap = PenLineCap.Round,
+                    StrokeEndLineCap = PenLineCap.Round,
+                };
+                _arrowCanvas.Children.Add(_arrowLine);
+                _arrowCanvas.Children.Add(_arrowHead);
+                Content = _arrowCanvas;
+            }
+            else
+            {
+                Content = new Border
+                {
+                    BorderBrush = new SolidColorBrush(Color.FromRgb(76, 141, 255)),
+                    BorderThickness = new Thickness(3),
+                    CornerRadius = new CornerRadius(8),
+                    Background = new SolidColorBrush(Color.FromArgb(22, 76, 141, 255)),
+                };
+            }
             SourceInitialized += (_, _) => MakeClickThrough();
         }
 
-        public void UpdateBounds(NativePoint start, NativePoint current)
+        public void UpdateGesture(NativePoint start, NativePoint current)
         {
             if (!IsVisible) Show();
             var handle = new WindowInteropHelper(this).Handle;
             if (handle == IntPtr.Zero) return;
-            var left = Math.Min(start.X, current.X);
-            var top = Math.Min(start.Y, current.Y);
-            var width = Math.Max(2, Math.Abs(current.X - start.X));
-            var height = Math.Max(2, Math.Abs(current.Y - start.Y));
+            var padding = _kind == "arrow" ? 24 : 0;
+            var left = Math.Min(start.X, current.X) - padding;
+            var top = Math.Min(start.Y, current.Y) - padding;
+            var width = Math.Max(2, Math.Abs(current.X - start.X) + padding * 2);
+            var height = Math.Max(2, Math.Abs(current.Y - start.Y) + padding * 2);
             _ = SetWindowPos(handle, HwndTopmost, left, top, width, height, SwpNoActivate | SwpShowWindow);
+
+            if (_kind != "arrow" || _arrowCanvas is null || _arrowLine is null || _arrowHead is null) return;
+            var dpi = VisualTreeHelper.GetDpi(this);
+            var scaleX = Math.Max(0.1, dpi.DpiScaleX);
+            var scaleY = Math.Max(0.1, dpi.DpiScaleY);
+            var startX = (start.X - left) / scaleX;
+            var startY = (start.Y - top) / scaleY;
+            var endX = (current.X - left) / scaleX;
+            var endY = (current.Y - top) / scaleY;
+            _arrowCanvas.Width = width / scaleX;
+            _arrowCanvas.Height = height / scaleY;
+            _arrowLine.X1 = startX;
+            _arrowLine.Y1 = startY;
+            _arrowLine.X2 = endX;
+            _arrowLine.Y2 = endY;
+            var angle = Math.Atan2(endY - startY, endX - startX);
+            const double wingLength = 19;
+            _arrowHead.Points =
+            [
+                new Point(endX + wingLength * Math.Cos(angle + Math.PI * .82), endY + wingLength * Math.Sin(angle + Math.PI * .82)),
+                new Point(endX, endY),
+                new Point(endX + wingLength * Math.Cos(angle - Math.PI * .82), endY + wingLength * Math.Sin(angle - Math.PI * .82)),
+            ];
         }
 
         private void MakeClickThrough()

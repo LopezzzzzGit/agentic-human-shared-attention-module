@@ -56,11 +56,17 @@ public sealed class ScreenObserver : IDisposable
         }
     }
 
-    public async Task<VisualEvidenceBundle?> PreserveEvidenceAsync(string sessionId, string reason, int? anchorX, int? anchorY, CancellationToken cancellationToken = default)
+    public async Task<VisualEvidenceBundle?> PreserveEvidenceAsync(
+        string sessionId,
+        string reason,
+        int? anchorX,
+        int? anchorY,
+        DesktopCaptureRegion? requestedRegion = null,
+        CancellationToken cancellationToken = default)
     {
         if (_mode == VisionPreference.Off || string.IsNullOrWhiteSpace(sessionId)) return null;
 
-        return await Task.Run(() => PreserveEvidence(sessionId, reason, anchorX, anchorY, cancellationToken), cancellationToken).ConfigureAwait(false);
+        return await Task.Run(() => PreserveEvidence(sessionId, reason, anchorX, anchorY, requestedRegion, cancellationToken), cancellationToken).ConfigureAwait(false);
     }
 
     public async Task<VisionAttachment?> CaptureCurrentContextAsync(int anchorX, int anchorY, CancellationToken cancellationToken = default)
@@ -82,11 +88,19 @@ public sealed class ScreenObserver : IDisposable
                 context.Left,
                 context.Top,
                 context.Width,
-                context.Height);
+                context.Height,
+                context.Image.Width,
+                context.Image.Height);
         }, cancellationToken).ConfigureAwait(false);
     }
 
-    private VisualEvidenceBundle PreserveEvidence(string sessionId, string reason, int? anchorX, int? anchorY, CancellationToken cancellationToken)
+    private VisualEvidenceBundle PreserveEvidence(
+        string sessionId,
+        string reason,
+        int? anchorX,
+        int? anchorY,
+        DesktopCaptureRegion? requestedRegion,
+        CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
         ScreenSnapshot? before;
@@ -123,15 +137,21 @@ public sealed class ScreenObserver : IDisposable
         int? contextY = null;
         int? contextWidth = null;
         int? contextHeight = null;
-        if (anchorX.HasValue && anchorY.HasValue)
+        int? contextPixelWidth = null;
+        int? contextPixelHeight = null;
+        if (requestedRegion is not null || (anchorX.HasValue && anchorY.HasValue))
         {
-            using var context = CaptureContext(anchorX.Value, anchorY.Value);
+            using var context = requestedRegion is not null
+                ? CaptureRegion(requestedRegion)
+                : CaptureContext(anchorX!.Value, anchorY!.Value);
             contextFile = Path.Combine(relativeDirectory, $"{stem}-context.png");
             context.Image.Save(Path.Combine(RuntimeDirectory(), contextFile), ImageFormat.Png);
             contextX = context.Left;
             contextY = context.Top;
             contextWidth = context.Width;
             contextHeight = context.Height;
+            contextPixelWidth = context.Image.Width;
+            contextPixelHeight = context.Image.Height;
         }
 
         return new VisualEvidenceBundle(
@@ -139,7 +159,8 @@ public sealed class ScreenObserver : IDisposable
             afterFile.Replace('\\', '/'),
             ToLedgerPath(contextFile),
             Math.Round(changedScore, 4),
-            contextX, contextY, contextWidth, contextHeight);
+            contextX, contextY, contextWidth, contextHeight,
+            contextPixelWidth, contextPixelHeight);
     }
 
     private void SampleIntoMemory()
@@ -199,6 +220,26 @@ public sealed class ScreenObserver : IDisposable
         var top = Math.Clamp(anchorY - (height / 2), bounds.Top, bounds.Bottom - height);
         var targetWidth = Math.Clamp(outputWidth ?? width, 1, width);
         var targetHeight = Math.Clamp(outputHeight ?? height, 1, height);
+        return new ContextCapture(CaptureScaled(left, top, width, height, targetWidth, targetHeight), left, top, width, height);
+    }
+
+    private static ContextCapture CaptureRegion(DesktopCaptureRegion requested)
+    {
+        var bounds = System.Windows.Forms.SystemInformation.VirtualScreen;
+        var left = Math.Clamp(requested.X, bounds.Left, bounds.Right - 1);
+        var top = Math.Clamp(requested.Y, bounds.Top, bounds.Bottom - 1);
+        var right = Math.Clamp((long)requested.X + requested.Width, left + 1L, bounds.Right);
+        var bottom = Math.Clamp((long)requested.Y + requested.Height, top + 1L, bounds.Bottom);
+        var width = Math.Max(1, (int)(right - left));
+        var height = Math.Max(1, (int)(bottom - top));
+        // A foreground-window request is commonly used to locate text-sized
+        // controls. Preserve a little more detail there, while broad screen
+        // scans keep the lower token and bandwidth budget.
+        var maxWidth = requested.PreferTextDetail ? 1600d : 1280d;
+        var maxHeight = requested.PreferTextDetail ? 1000d : 800d;
+        var scale = Math.Min(1d, Math.Min(maxWidth / width, maxHeight / height));
+        var targetWidth = Math.Max(1, (int)Math.Round(width * scale));
+        var targetHeight = Math.Max(1, (int)Math.Round(height * scale));
         return new ContextCapture(CaptureScaled(left, top, width, height, targetWidth, targetHeight), left, top, width, height);
     }
 
@@ -281,6 +322,10 @@ public sealed record VisualEvidenceBundle(
     int? ContextX,
     int? ContextY,
     int? ContextWidth,
-    int? ContextHeight);
+    int? ContextHeight,
+    int? ContextPixelWidth,
+    int? ContextPixelHeight);
+
+public sealed record DesktopCaptureRegion(int X, int Y, int Width, int Height, bool PreferTextDetail = false);
 
 public sealed record LocalScreenChange(DateTime TimestampUtc, double ChangedScore);

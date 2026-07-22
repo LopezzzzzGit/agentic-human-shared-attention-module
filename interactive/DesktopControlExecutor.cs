@@ -24,6 +24,9 @@ internal static class DesktopControlExecutor
         cancellationToken.ThrowIfCancellationRequested();
         switch (action.Kind)
         {
+            case "move":
+                Move(action.X!.Value, action.Y!.Value);
+                break;
             case "click":
                 Move(action.X!.Value, action.Y!.Value);
                 SendMouse(MouseLeftDown | MouseLeftUp);

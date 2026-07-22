@@ -7,11 +7,14 @@ independent of Lantern and any individual model provider: a local tool-calling
 model belongs in the host harness, while ASHA supplies the desktop capability.
 
 The implementation follows the build order in [SPEC.md](SPEC.md). The current
-first milestone is the dependency-free TypeScript mark engine and the `asha`
-command-line interface.
+Windows demonstrator combines the dependency-free mark engine with the ASHA
+orb, local speech, permission-gated vision, retained sessions, teaching
+telemetry, and visible computer control.
 
 The intended product lifecycle, memory hierarchy, retention choices, and
-delivery order are maintained in [ROADMAP.md](ROADMAP.md).
+delivery order are maintained in [ROADMAP.md](ROADMAP.md). The short
+competition setup and test sequence is in
+[docs/hackathon-demonstrator.md](docs/hackathon-demonstrator.md).
 
 ## Mark engine
 
@@ -57,7 +60,7 @@ whole chat history.
 
 ## Host integration
 
-The future agentic harness can use Gemma QAT or any other local model capable
+An agentic harness can use Gemma QAT or any other local model capable
 of tool calls. Ask ASHA for its provider-neutral function schemas with:
 
 ```powershell
@@ -126,10 +129,37 @@ clear them. Select an existing cue, then move the cursor to a new location and
 press **Ctrl+Alt+Shift+M** to move it.
 
 These marks are virtual, click-through overlays: they never move or click the
-person's physical mouse. The future model uses the same CLI and tool manifest
-to show an attention cue before asking a clarification or requesting a real
-action. See [the interaction model](docs/interaction-model.md) for the
+person's physical mouse. The live ASHA runtime uses the same visual language
+before guidance or a separately permitted physical action. See
+[the interaction model](docs/interaction-model.md) for the
 voice-and-desktop architecture and the physical-control consent boundary.
+
+### Permission-gated computer control
+
+Start a retained session and press **Enable computer control** before asking
+ASHA to act. While that visible lease is active, the voice model can:
+
+- open or activate any application returned by Windows' installed Start-app
+  catalog, using its ordinary display name rather than an executable path;
+- open an existing non-system folder in Explorer without modifying it;
+- move the physical pointer, click, double-click, right-click, drag, scroll,
+  type short non-sensitive text, and press approved navigation keys;
+- request a fresh pointer-area, foreground-window, entire-desktop, left-screen,
+  or right-screen view independently of the person's mouse position.
+
+Application names are resolved dynamically; Outlook, LM Studio, DaVinci
+Resolve, Photoshop, and other applications are not individual command
+implementations. The launch tool never accepts a command line, executable
+path, or URL. Folder opening blocks Windows, program, and application-data
+locations. Physical pointer actions require a recent coordinate-mapped view,
+validate the currently exposed top-layer surface, remain visibly framed, and
+are written to the active session ledger. Stop the control session to remove
+the capability immediately.
+
+Groq is the demonstrator's swappable research provider. Keys remain outside
+the repository and judges bring their own key. The provider boundary can be
+replaced by a private local tool-calling model without changing ASHA's desktop
+tools or session format.
 
 On Windows, ASHA renders its marks with a native, click-through WPF overlay.
 This avoids relying on the driver cursor overlay for static shapes while the

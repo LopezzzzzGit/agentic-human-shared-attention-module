@@ -216,9 +216,9 @@
                                 <TextBlock Margin="0,3,0,0" FontSize="10" Foreground="#71869B" TextWrapping="Wrap"
                                            Text="This is off by default. During an active session, ASHA may request one fresh view for a visual question. It never sends a desktop video or images with ordinary chat." />
                                 <CheckBox x:Name="LiveProviderAwarenessCheckBox" Margin="0,9,0,0" Checked="LiveProviderAwarenessChanged" Unchecked="LiveProviderAwarenessChanged"
-                                          Content="Keep ASHA visually aware of screen changes" />
+                                          Content="Allow changed frames when a conversation needs them" />
                                 <TextBlock Margin="0,3,0,0" FontSize="10" Foreground="#71869B" TextWrapping="Wrap"
-                                           Text="When enabled, meaningful local changes may send at most one current crop every five seconds. The configured vision model keeps a compact scene summary; unchanged frames are skipped." />
+                                           Text="Fast samples stay local. A changed frame may leave this computer only when the current conversation, grounding, or verification needs visual evidence; idle pixel changes are never uploaded." />
                                 <Border Height="92" Margin="0,10,0,0" Padding="9" CornerRadius="11" Background="#E8F6FF" BorderBrush="#C7E2F4" BorderThickness="1">
                                     <Grid>
                                         <Grid.RowDefinitions>

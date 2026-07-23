@@ -33,10 +33,8 @@ internal static class LocalOcrGrounder
         if (png.Length == 0 || query.Length == 0) return null;
 
         cancellationToken.ThrowIfCancellationRequested();
-        using var memory = new MemoryStream(png, writable: false);
-        using var randomAccess = memory.AsRandomAccessStream();
-        var decoder = await BitmapDecoder.CreateAsync(randomAccess);
-        using var bitmap = await decoder.GetSoftwareBitmapAsync(BitmapPixelFormat.Bgra8, BitmapAlphaMode.Premultiplied);
+        var decoded = await DecodeForOcrAsync(png);
+        using var bitmap = decoded.Bitmap;
         var engine = OcrEngine.TryCreateFromUserProfileLanguages();
         if (engine is null) return null;
         var result = await engine.RecognizeAsync(bitmap);
@@ -57,10 +55,10 @@ internal static class LocalOcrGrounder
                 var right = selected.Max(rectangle => rectangle.X + rectangle.Width);
                 var bottom = selected.Max(rectangle => rectangle.Y + rectangle.Height);
                 var candidate = new OcrTextMatch(
-                    Math.Max(0, (int)Math.Floor(left)),
-                    Math.Max(0, (int)Math.Floor(top)),
-                    Math.Max(1, (int)Math.Ceiling(right - left)),
-                    Math.Max(1, (int)Math.Ceiling(bottom - top)));
+                    Math.Max(0, (int)Math.Floor(left / decoded.Scale)),
+                    Math.Max(0, (int)Math.Floor(top / decoded.Scale)),
+                    Math.Max(1, (int)Math.Ceiling((right - left) / decoded.Scale)),
+                    Math.Max(1, (int)Math.Ceiling((bottom - top) / decoded.Scale)));
                 var centerX = candidate.X + (candidate.Width / 2d);
                 var centerY = candidate.Y + (candidate.Height / 2d);
                 var distance = Math.Pow(centerX - hintX, 2) + Math.Pow(centerY - hintY, 2);
@@ -79,6 +77,47 @@ internal static class LocalOcrGrounder
         var query = SignificantTokens(requestedText);
         var recognized = Tokenize(recognizedLine);
         return MatchingSpans(recognized, query).Select(span => span.Length).DefaultIfEmpty(0).Max();
+    }
+
+    internal static async Task<IReadOnlyList<string>> RecognizeLinesForTestingAsync(
+        byte[] png,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var decoded = await DecodeForOcrAsync(png);
+        using var bitmap = decoded.Bitmap;
+        var engine = OcrEngine.TryCreateFromUserProfileLanguages();
+        if (engine is null) return [];
+        var result = await engine.RecognizeAsync(bitmap);
+        cancellationToken.ThrowIfCancellationRequested();
+        return result.Lines.Select(line => line.Text).ToArray();
+    }
+
+    private static async Task<(SoftwareBitmap Bitmap, double Scale)> DecodeForOcrAsync(byte[] png)
+    {
+        using var memory = new MemoryStream(png, writable: false);
+        using var randomAccess = memory.AsRandomAccessStream();
+        var decoder = await BitmapDecoder.CreateAsync(randomAccess);
+        const double maximumDimension = 2400d;
+        var scale = Math.Min(
+            2d,
+            Math.Min(
+                maximumDimension / Math.Max(1u, decoder.PixelWidth),
+                maximumDimension / Math.Max(1u, decoder.PixelHeight)));
+        scale = Math.Max(1d, scale);
+        var transform = new BitmapTransform
+        {
+            ScaledWidth = (uint)Math.Max(1, Math.Round(decoder.PixelWidth * scale)),
+            ScaledHeight = (uint)Math.Max(1, Math.Round(decoder.PixelHeight * scale)),
+            InterpolationMode = BitmapInterpolationMode.Fant,
+        };
+        var bitmap = await decoder.GetSoftwareBitmapAsync(
+            BitmapPixelFormat.Bgra8,
+            BitmapAlphaMode.Premultiplied,
+            transform,
+            ExifOrientationMode.IgnoreExifOrientation,
+            ColorManagementMode.DoNotColorManage);
+        return (bitmap, scale);
     }
 
     private static IEnumerable<TokenSpan> MatchingSpans(IReadOnlyList<string> recognized, IReadOnlyList<string> query)

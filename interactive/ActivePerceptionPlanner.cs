@@ -51,14 +51,17 @@ internal static class ActivePerceptionPlanner
             @"\b(highlight|mark|point\s+(?:out|to)|show\s+me\s+where|circle|draw\s+(?:a\s+)?(?:box|arrow)|annotate|hervorheben|markier\w*|zeig\w*\s+mir|einkreisen|umkreisen|rahmen|pfeil)\b");
         var physicalAction = Matches(value,
             @"\b(click|double[- ]click|right[- ]click|drag|scroll|move\s+(?:the\s+)?(?:mouse|pointer|cursor)|klick\w*|doppelklick\w*|rechtsklick\w*|zieh\w*|scroll\w*|beweg\w*\s+(?:die\s+)?(?:maus|zeiger))\b");
+        var inApplicationOpenAction = Matches(value,
+            @"\b(?:open|activate|select|expand|öffn\w*|oeffn\w*|aktivier\w*|wähl\w*|waehl\w*|klapp\w*\s+auf)\b.{0,90}\b(?:account|folder|inbox|email|message|item|document|link|menu|tab|konto|ordner|posteingang|e-?mail|nachricht|element|dokument|menü|registerkarte)\b");
+        physicalAction |= inApplicationOpenAction;
         var verification = Matches(value,
             @"\b(did\s+(?:that|it|this).{0,35}(?:work|open|change|move|appear)|is\s+(?:it|that|this).{0,30}(?:open|visible|selected|active)|verify|confirm|hat\s+(?:das|es).{0,35}(?:geklappt|funktioniert|geöffnet|geaendert|geändert)|ist\s+(?:es|das).{0,30}(?:offen|sichtbar|ausgewählt|aktiv)|prüf\w*|verifizier\w*)\b");
         var observation = Matches(value,
-            @"\b(look|see|read|inspect|check\s+(?:the|my|this|that|what|whether|if)|take\s+(?:a\s+)?screen\s*shot|screen\s*capture|what(?:'s|\s+is)\s+(?:on|in)|schau\w*|sieh\w*|sehen|lies|lesen|prüf\w*|ueberpruef\w*|überprüf\w*|bildschirmfoto|screenshot)\b");
+            @"\b(look|see|read|inspect|check\s+(?:the|my|this|that|what|whether|if)|take\s+(?:a\s+)?screen\s*shot|screen\s*capture|what(?:'s|\s+is)\s+(?:on|in)|what\b.{0,55}\b(?:visible|shown|displayed)|which\b.{0,55}\b(?:visible|shown|displayed)|schau\w*|sieh\w*|sehen|lies|lesen|prüf\w*|ueberpruef\w*|überprüf\w*|bildschirmfoto|screenshot|was\b.{0,55}\b(?:sichtbar|angezeigt)|welch\w*\b.{0,55}\b(?:sichtbar|angezeigt))\b");
         var location = Matches(value,
             @"\b(where\s+(?:is|are|did)|find|locate|which\s+(?:button|control|item|window|app)|wo\s+(?:ist|sind|finde)|find\w*|lokalisier\w*|welch\w*\s+(?:knopf|schaltfläche|element|fenster|app))\b");
         var visualObject = Matches(value,
-            @"\b(screen|desktop|monitor|display|window|app|application|program|button|tab|menu|field|label|link|icon|control|setting|option|panel|sidebar|section|text|document|image|dialog|mouse|cursor|pointer|error|message|bildschirm|desktop|monitor|anzeige|fenster|anwendung|programm|knopf|schaltfläche|registerkarte|menü|feld|beschriftung|symbol|einstellung|bereich|seitenleiste|text|dokument|bild|dialog|maus|zeiger|fehler|meldung)\b");
+            @"\b(screen|desktop|monitor|display|window|app|application|program|button|tab|menu|field|label|link|icon|control|setting|option|panel|sidebar|section|text|document|image|dialog|mouse|cursor|pointer|error|message|email|inbox|sender|subject|list|bildschirm|desktop|monitor|anzeige|fenster|anwendung|programm|knopf|schaltfläche|registerkarte|menü|feld|beschriftung|symbol|einstellung|bereich|seitenleiste|text|dokument|bild|dialog|maus|zeiger|fehler|meldung|e-?mail|posteingang|absender|betreff|liste)\b");
         var spatialReference = Matches(value,
             @"\b(left|right|upper|lower|top|bottom|corner|side|here|there|links|rechts|oben|unten|ecke|seite|hier|dort)\b");
 
@@ -79,7 +82,7 @@ internal static class ActivePerceptionPlanner
 
         var scope = InferScope(value, goal);
         var textDetail = Matches(value,
-            @"\b(read|text|words?|letters?|label|button|menu|field|document|docs|documentation|error|message|lies|lesen|text|wörter|woerter|buchstaben|beschriftung|knopf|schaltfläche|menü|feld|dokument|dokumentation|fehler|meldung)\b");
+            @"\b(read|text|words?|letters?|label|button|menu|field|document|docs|documentation|error|message|email|inbox|sender|subject|list|lies|lesen|text|wörter|woerter|buchstaben|beschriftung|knopf|schaltfläche|menü|feld|dokument|dokumentation|fehler|meldung|e-?mail|posteingang|absender|betreff|liste)\b");
         var broadScope = scope is VisionRequestScope.EntireDesktop or
             VisionRequestScope.LeftScreen or VisionRequestScope.RightScreen or
             VisionRequestScope.UpperScreen or VisionRequestScope.LowerScreen or
@@ -128,9 +131,12 @@ internal static class ActivePerceptionPlanner
         // Unknown-location requests begin with a cheap overview. Verification
         // and direct interaction default to the active window where the user
         // is already working.
-        return goal is ActivePerceptionGoal.Locate or ActivePerceptionGoal.Observe
-            ? VisionRequestScope.EntireDesktop
-            : VisionRequestScope.ForegroundWindow;
+        if (goal == ActivePerceptionGoal.Locate)
+            return VisionRequestScope.EntireDesktop;
+        if (goal == ActivePerceptionGoal.Observe &&
+            Matches(text, @"\b(screen|desktop|monitor|display|bildschirm|desktop|monitor|anzeige)\b"))
+            return VisionRequestScope.EntireDesktop;
+        return VisionRequestScope.ForegroundWindow;
     }
 
     private static bool Matches(string value, string pattern) => Regex.IsMatch(value, pattern, Options);

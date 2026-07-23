@@ -10,7 +10,10 @@ namespace AshaLive;
 /// </summary>
 public static class SessionMemoryStore
 {
-    public const int RecentCharacterBudget = 28_000;
+    // Full transcripts remain append-only on disk. Provider turns carry only
+    // a compact recent conversational window; older material is available
+    // through the durable session summary.
+    public const int RecentCharacterBudget = 8_000;
 
     public static async Task<SessionMemorySnapshot> ReadAsync(string sessionId)
     {

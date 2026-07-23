@@ -75,15 +75,14 @@ public sealed class ScreenObserver : IDisposable
         return await Task.Run(() =>
         {
             cancellationToken.ThrowIfCancellationRequested();
-            // Ambient summaries need scene understanding, not pixel-perfect
-            // OCR. Preserve the same 960 by 620 desktop region and visible
-            // blue boundary, but send roughly half as many image pixels to the
-            // provider. Explicit one-view evidence remains full resolution.
-            using var context = CaptureContext(anchorX, anchorY, 672, 434);
+            // If an explicitly justified live summary is requested, begin
+            // with a cheap overview. Text-sized details use a later focused
+            // crop rather than making every ambient frame expensive.
+            using var context = CaptureContext(anchorX, anchorY, 576, 372);
             using var stream = new MemoryStream();
-            context.Image.Save(stream, ImageFormat.Png);
+            SaveProviderJpeg(context.Image, stream);
             return new VisionAttachment(
-                $"asha-live-{DateTime.UtcNow:yyyyMMdd-HHmmss-fff}.png",
+                $"asha-live-{DateTime.UtcNow:yyyyMMdd-HHmmss-fff}.jpg",
                 stream.ToArray(),
                 context.Left,
                 context.Top,
@@ -143,9 +142,9 @@ public sealed class ScreenObserver : IDisposable
         {
             using var context = requestedRegion is not null
                 ? CaptureRegion(requestedRegion)
-                : CaptureContext(anchorX!.Value, anchorY!.Value);
-            contextFile = Path.Combine(relativeDirectory, $"{stem}-context.png");
-            context.Image.Save(Path.Combine(RuntimeDirectory(), contextFile), ImageFormat.Png);
+                : CaptureContext(anchorX!.Value, anchorY!.Value, 720, 465);
+            contextFile = Path.Combine(relativeDirectory, $"{stem}-context.jpg");
+            SaveProviderJpeg(context.Image, Path.Combine(RuntimeDirectory(), contextFile));
             contextX = context.Left;
             contextY = context.Top;
             contextWidth = context.Width;
@@ -235,8 +234,11 @@ public sealed class ScreenObserver : IDisposable
         // A foreground-window request is commonly used to locate text-sized
         // controls. Preserve a little more detail there, while broad screen
         // scans keep the lower token and bandwidth budget.
-        var maxWidth = requested.PreferTextDetail ? 1600d : 1280d;
-        var maxHeight = requested.PreferTextDetail ? 1000d : 800d;
+        // Progressive detail: the first foreground/overview image is small
+        // enough for a constrained vision model. If text is still too small,
+        // ASHA requests a tightly cropped region whose native pixels survive.
+        var maxWidth = requested.PreferTextDetail ? 960d : 768d;
+        var maxHeight = requested.PreferTextDetail ? 720d : 512d;
         var scale = Math.Min(1d, Math.Min(maxWidth / width, maxHeight / height));
         var targetWidth = Math.Max(1, (int)Math.Round(width * scale));
         var targetHeight = Math.Max(1, (int)Math.Round(height * scale));
@@ -260,6 +262,21 @@ public sealed class ScreenObserver : IDisposable
             graphics.ReleaseHdc(destination);
         }
         return bitmap;
+    }
+
+    private static void SaveProviderJpeg(Image image, string path)
+    {
+        using var stream = File.Create(path);
+        SaveProviderJpeg(image, stream);
+    }
+
+    private static void SaveProviderJpeg(Image image, Stream stream)
+    {
+        var encoder = ImageCodecInfo.GetImageEncoders()
+            .First(codec => codec.FormatID == ImageFormat.Jpeg.Guid);
+        using var parameters = new EncoderParameters(1);
+        parameters.Param[0] = new EncoderParameter(Encoder.Quality, 86L);
+        image.Save(stream, encoder, parameters);
     }
 
     private static double Difference(Bitmap first, Bitmap second)

@@ -173,7 +173,7 @@ public readonly record struct ComputerControlAccess(
         if (CanUsePhysicalCursor) enabled.Add("visible physical pointer input");
         if (CanInteractWithVirtualCursor)
             enabled.Add(virtualInteractionConnected
-                ? "background virtual-cursor interaction"
+                ? "background UI Automation for accessible controls; arbitrary virtual-pointer input is not connected yet"
                 : "virtual-cursor interaction is permitted by policy but its background driver is not connected in this build");
         else if (CanShowVirtualCursor)
             enabled.Add("visual cursor demonstration only");

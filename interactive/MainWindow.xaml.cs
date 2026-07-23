@@ -53,6 +53,7 @@ public partial class MainWindow : Window
     private readonly AshaVoiceSession _voiceSession = new();
     private readonly ScreenObserver _screenObserver = new();
     private readonly DesktopAwarenessCoordinator _awarenessCoordinator = new();
+    private readonly DesktopStateReader _desktopStateReader = new();
     private readonly AshaPreferences _preferences;
     private readonly DispatcherTimer _tapToListenTimer;
     private readonly DispatcherTimer _conversationBoundaryTimer;
@@ -105,11 +106,10 @@ public partial class MainWindow : Window
     private string? _activeSessionTitle;
     private bool _activeSessionNeedsTitle;
     private VisualEvidenceBundle? _latestVisionEvidence;
+    private DesktopStateSnapshot? _latestDesktopStateSnapshot;
     private bool _shareVisionOnNextTurn;
     private DesktopAwarenessContext? _liveAwarenessContext;
     private LocalScreenChange? _pendingLiveScreenChange;
-    private bool _liveAwarenessRefreshInFlight;
-    private DateTime _lastLiveAwarenessRefreshUtc;
     private CancellationTokenSource? _voiceTurnCancellation;
     private readonly CancellationTokenSource _lifetimeCancellation = new();
     private readonly SemaphoreSlim _sessionWriteGate = new(1, 1);
@@ -148,6 +148,47 @@ public partial class MainWindow : Window
         });
         _awarenessCoordinator.SceneChanged += scene => Dispatcher.BeginInvoke(() => ShowAwarenessScene(scene));
         _screenObserver.MeaningfulChange += change => Dispatcher.BeginInvoke(() => QueueLiveAwarenessRefresh(change));
+        _voiceSession.ModelRequestMeasured += measurement => Dispatcher.BeginInvoke(() =>
+        {
+            var prompt = measurement.PromptTokens is { } tokens
+                ? $"{tokens:N0} prompt tokens"
+                : "prompt token count unavailable";
+            Log(
+                $"Model budget: {prompt}; {measurement.ImageCount} image(s); " +
+                $"{measurement.ToolSchemaCharacters:N0} tool-schema chars; " +
+                $"{measurement.MessageTextCharacters:N0} message chars.");
+            _ = RecordActiveSessionEventAsync(
+                "model.request_budget",
+                $"ASHA used {prompt}, {measurement.ImageCount} image(s), and {measurement.ToolSchemaCharacters:N0} tool-schema characters.",
+                "system",
+                "token_economy",
+                new
+                {
+                    app = "ASHA",
+                    label = measurement.Model,
+                    control = "provider request budget",
+                },
+                content: JsonSerializer.Serialize(measurement, JsonOptions));
+        });
+        _voiceSession.ModelToolPhaseMeasured += measurement => Dispatcher.BeginInvoke(() =>
+        {
+            var tools = measurement.DisclosedTools.Count == 0
+                ? "none"
+                : string.Join(", ", measurement.DisclosedTools);
+            Log($"Model tool phase: {measurement.Phase}; capability: {measurement.Capability ?? "none"}; tools: {tools}; choice: {measurement.ToolChoice}.");
+            _ = RecordActiveSessionEventAsync(
+                "model.tool_phase",
+                $"ASHA entered tool phase {measurement.Phase} with {measurement.DisclosedTools.Count} disclosed tool(s).",
+                "system",
+                "progressive_tool_disclosure",
+                new
+                {
+                    app = "ASHA",
+                    label = measurement.Capability ?? measurement.Phase,
+                    control = measurement.ToolChoice,
+                },
+                content: JsonSerializer.Serialize(measurement, JsonOptions));
+        });
     }
 
     private async void Window_Loaded(object sender, RoutedEventArgs e)
@@ -1059,8 +1100,7 @@ public partial class MainWindow : Window
         _preferences.Save();
         if (_preferences.LiveProviderAwareness)
         {
-            Log("Adaptive model awareness enabled. Only throttled changed keyframes may leave the PC while Live mode and a session are active.");
-            QueueLiveAwarenessRefresh(new LocalScreenChange(DateTime.UtcNow, 1));
+            Log("Conversation-pulled changed-frame awareness enabled. Fast samples remain local until a turn needs current visual evidence.");
         }
         else
         {
@@ -1077,95 +1117,13 @@ public partial class MainWindow : Window
             !_preferences.LiveProviderAwareness ||
             !_voiceSession.SupportsVision) return;
 
-        // Voice is the foreground interaction. During a live conversation,
-        // retain only the newest changed keyframe and analyse it in the safe
-        // window while ASHA speaks. A background vision call must never race
-        // the microphone re-arm or the person's next model turn.
-        if (_liveAwarenessRefreshInFlight || _conversationActive || _voiceTurnInFlight || _voiceCapturing)
-        {
-            _pendingLiveScreenChange = change;
-            return;
-        }
-        if (DateTime.UtcNow - _lastLiveAwarenessRefreshUtc < TimeSpan.FromSeconds(5)) return;
-
-        _lastLiveAwarenessRefreshUtc = DateTime.UtcNow;
-        _ = RefreshLiveAwarenessAsync(change, _lifetimeCancellation.Token);
-    }
-
-    private async Task RefreshLiveAwarenessAsync(LocalScreenChange change, CancellationToken cancellationToken)
-    {
-        _liveAwarenessRefreshInFlight = true;
-        try
-        {
-            var scene = _awarenessCoordinator.Current;
-            var pointer = scene?.Pointer;
-            if (pointer is null && GetCursorPos(out var currentPointer))
-                pointer = new AwarenessPoint(currentPointer.X, currentPointer.Y);
-            if (pointer is null) return;
-
-            AwarenessStatusText.Text = "ASHA noticed a meaningful change and is refreshing her visual context…";
-            var frame = await _screenObserver.CaptureCurrentContextAsync(pointer.X, pointer.Y, cancellationToken);
-            if (frame is null) return;
-            await ShowTransientLiveCaptureBoundaryAsync(frame);
-            var summary = await _voiceSession.DescribeDesktopViewAsync(frame, scene, cancellationToken);
-            if (string.IsNullOrWhiteSpace(summary)) return;
-
-            _liveAwarenessContext = new DesktopAwarenessContext(DateTime.UtcNow, summary, change.ChangedScore);
-            AwarenessStatusText.Text = $"Model live awareness: {summary}";
-            await RecordActiveSessionEventAsync(
-                "vision.live_awareness_updated",
-                summary,
-                "system",
-                "ambient_desktop_awareness",
-                new
-                {
-                    app = scene?.Foreground?.ProcessName ?? "desktop",
-                    label = scene?.Foreground?.DisplayName ?? "current desktop",
-                    control = "adaptive changed keyframe",
-                    x = frame.ContextX,
-                    y = frame.ContextY,
-                    w = frame.ContextWidth,
-                    h = frame.ContextHeight,
-                    changeScore = change.ChangedScore,
-                });
-            Log($"Adaptive live visual context updated (change score {change.ChangedScore:0.000}).");
-        }
-        catch (OperationCanceledException)
-        {
-            // ASHA is closing.
-        }
-        catch (Exception error)
-        {
-            AwarenessStatusText.Text = $"Live visual awareness could not refresh: {ShortReason(error)}";
-            Log($"Adaptive live-awareness error: {error.Message}");
-        }
-        finally
-        {
-            _liveAwarenessRefreshInFlight = false;
-        }
-    }
-
-    private async Task ShowTransientLiveCaptureBoundaryAsync(VisionAttachment frame)
-    {
-        if (!frame.ContextX.HasValue || !frame.ContextY.HasValue ||
-            !frame.ContextWidth.HasValue || !frame.ContextHeight.HasValue) return;
-
-        var id = $"asha-live-capture-{Guid.NewGuid():N}";
-        var boundary = new MarkRequest(id, "frame", frame.ContextX.Value, frame.ContextY.Value,
-            frame.ContextWidth.Value, frame.ContextHeight.Value, null, "#76B6FF");
-        try
-        {
-            await RunAshaAsync("mark", JsonSerializer.Serialize(boundary, JsonOptions));
-            _ = Task.Run(async () =>
-            {
-                await Task.Delay(700);
-                try { StartAshaWithoutWaiting("clear", id); } catch { }
-            });
-        }
-        catch (Exception error)
-        {
-            Log($"Could not show the live-awareness capture boundary: {error.Message}");
-        }
+        // A pixel difference is evidence that a newer frame exists, not a
+        // justification for uploading it. Retain only the newest local signal;
+        // the conversational perception planner will acquire the appropriate
+        // foreground, screen-side, pointer, or detail region if a turn needs
+        // visual evidence.
+        _pendingLiveScreenChange = change;
+        AwarenessStatusText.Text = "Live local awareness: a changed frame is available if the conversation needs it. Nothing was uploaded.";
     }
 
     private async void CaptureVisionEvidence_Click(object sender, RoutedEventArgs e)
@@ -1812,21 +1770,7 @@ public partial class MainWindow : Window
             StatusText.Text = "ASHA is speaking…";
             turnStage = "playing_speech";
 
-            // Continuous visual awareness gets one bounded opportunity while
-            // ASHA is already speaking. It is cancelled as soon as speech
-            // ends, so reopening the microphone is never held up by vision.
-            using var awarenessWindow = CancellationTokenSource.CreateLinkedTokenSource(_voiceTurnCancellation.Token);
-            awarenessWindow.CancelAfter(TimeSpan.FromSeconds(8));
-            var awarenessRefresh = RefreshPendingLiveAwarenessDuringReplyAsync(awarenessWindow.Token);
-            try
-            {
-                await _voiceSession.SpeakAsync(reply, _voiceTurnCancellation.Token);
-            }
-            finally
-            {
-                awarenessWindow.Cancel();
-                await awarenessRefresh;
-            }
+            await _voiceSession.SpeakAsync(reply, _voiceTurnCancellation.Token);
         }
         catch (AllGroqKeysRateLimitedException error)
         {
@@ -1948,7 +1892,7 @@ public partial class MainWindow : Window
             $"error type: {error.GetType().Name}",
             $"diagnostic: {diagnostic}",
             $"transcript retained: {!string.IsNullOrWhiteSpace(transcript)}",
-            "desktop action performed: false");
+            "desktop action status: this failure event does not infer delivery; correlate by action id with control.input_sent events");
         await RecordActiveSessionEventAsync(
             "voice.turn_failed",
             "ASHA retained a failed conversational turn instead of silently dropping it.",
@@ -1969,21 +1913,6 @@ public partial class MainWindow : Window
         value = Regex.Replace(value, @"\bgsk_[A-Za-z0-9_-]+\b", "gsk_[redacted]", RegexOptions.CultureInvariant);
         value = Regex.Replace(value, @"(?i)\bBearer\s+[A-Za-z0-9._~-]+", "Bearer [redacted]", RegexOptions.CultureInvariant);
         return value.Length <= 500 ? value : value[..500] + "…";
-    }
-
-    private async Task RefreshPendingLiveAwarenessDuringReplyAsync(CancellationToken cancellationToken)
-    {
-        if (_pendingLiveScreenChange is not { } change ||
-            _preferences.Vision != VisionPreference.Live ||
-            !_preferences.AllowRemoteVision ||
-            !_preferences.LiveProviderAwareness ||
-            !_voiceSession.SupportsVision ||
-            _liveAwarenessRefreshInFlight) return;
-
-        if (DateTime.UtcNow - _lastLiveAwarenessRefreshUtc < TimeSpan.FromSeconds(5)) return;
-        _pendingLiveScreenChange = null;
-        _lastLiveAwarenessRefreshUtc = DateTime.UtcNow;
-        await RefreshLiveAwarenessAsync(change, cancellationToken);
     }
 
     private async void PlaceCueAtPointer_Click(object sender, RoutedEventArgs e) => await MarkAtCurrentMouseAsync();
@@ -2747,9 +2676,9 @@ public partial class MainWindow : Window
         _screenObserver.Stop();
         _awarenessCoordinator.Stop();
         _latestVisionEvidence = null;
+        _latestDesktopStateSnapshot = null;
         _liveAwarenessContext = null;
         _pendingLiveScreenChange = null;
-        _lastLiveAwarenessRefreshUtc = DateTime.MinValue;
         _activeSessionId = null;
         _activeSessionTitle = null;
         _activeSessionNeedsTitle = false;
@@ -2966,7 +2895,38 @@ public partial class MainWindow : Window
 
         if (evidence is null) return null;
 
-        var attachment = LoadVisionAttachment(evidence, BuildVisionRuntimeContext(scene, selectedSurface, effectiveScope));
+        var desktopState = _desktopStateReader.CaptureForeground();
+        if (desktopState is not null)
+        {
+            _latestDesktopStateSnapshot = desktopState;
+            await RecordActiveSessionEventAsync(
+                "vision.desktop_state_captured",
+                desktopState.IsTreeBlind
+                    ? "ASHA captured a sparse versioned foreground UI tree and retained the screenshot as the primary fallback."
+                    : "ASHA captured a versioned semantic projection of the foreground UI tree.",
+                "system",
+                "ground_desktop",
+                new
+                {
+                    app = desktopState.ProcessName,
+                    label = desktopState.WindowTitle,
+                    control = "ui_automation_tree",
+                },
+                content: desktopState.ToModelContext(transcript, 6_000));
+        }
+
+        var providerCoordinateMap = CreateProviderCoordinateMap(evidence);
+        var attachment = LoadVisionAttachment(
+            evidence,
+            BuildVisionRuntimeContext(
+                transcript,
+                scene,
+                selectedSurface,
+                effectiveScope,
+                desktopState,
+                providerCoordinateMap),
+            desktopState?.Id,
+            desktopState?.Signature);
         if (attachment is null)
         {
             StatusText.Text = "ASHA could not read the selected view.";
@@ -2991,18 +2951,46 @@ public partial class MainWindow : Window
                 h = evidence.ContextHeight,
             },
             EvidencePayload(evidence));
+        _pendingLiveScreenChange = null;
         StatusText.Text = personSelected ? "ASHA is looking at the selected view…" : "ASHA requested and received one current view…";
         return attachment;
     }
 
-    private static string? BuildVisionRuntimeContext(AwarenessScene? scene, SurfaceTarget? selectedSurface, VisionRequestScope scope)
+    private static string? BuildVisionRuntimeContext(
+        string transcript,
+        AwarenessScene? scene,
+        SurfaceTarget? selectedSurface,
+        VisionRequestScope scope,
+        DesktopStateSnapshot? desktopState,
+        DesktopImageCoordinateMap? coordinateMap)
     {
-        var parts = new List<string>(2);
+        var parts = new List<string>(3);
         if (scene?.Foreground is { } foreground)
             parts.Add($"Windows identifies the current foreground application as {foreground.ProcessName}, with window title {foreground.DisplayName}.");
         if (selectedSurface is not null && scope != VisionRequestScope.EntireDesktop)
             parts.Add($"Windows identifies the top-level surface at the selected region as {selectedSurface.ProcessName}, with window title {selectedSurface.DisplayName}.");
+        if (desktopState is not null)
+            parts.Add(desktopState.ToModelContext(transcript, 3_200, coordinateMap));
         return parts.Count == 0 ? null : string.Join(" ", parts);
+    }
+
+    private static DesktopImageCoordinateMap? CreateProviderCoordinateMap(VisualEvidenceBundle evidence)
+    {
+        if (evidence.ContextX is not { } x ||
+            evidence.ContextY is not { } y ||
+            evidence.ContextWidth is not > 0 ||
+            evidence.ContextHeight is not > 0)
+            return null;
+        var imageWidth = evidence.ContextPixelWidth.GetValueOrDefault(evidence.ContextWidth.Value);
+        var imageHeight = evidence.ContextPixelHeight.GetValueOrDefault(evidence.ContextHeight.Value);
+        if (imageWidth <= 0 || imageHeight <= 0) return null;
+        return new DesktopImageCoordinateMap(
+            x,
+            y,
+            evidence.ContextWidth.Value,
+            evidence.ContextHeight.Value,
+            imageWidth,
+            imageHeight);
     }
 
     private static DesktopCaptureRegion? ResolveViewRegion(VisionRequestScope scope, AwarenessScene? scene, AwarenessPoint pointer)
@@ -3124,7 +3112,11 @@ public partial class MainWindow : Window
         }
     }
 
-    private static VisionAttachment? LoadVisionAttachment(VisualEvidenceBundle evidence, string? desktopContext = null)
+    private static VisionAttachment? LoadVisionAttachment(
+        VisualEvidenceBundle evidence,
+        string? desktopContext = null,
+        string? desktopSnapshotId = null,
+        string? desktopSnapshotSignature = null)
     {
         var relative = evidence.ContextFile ?? evidence.AfterFile;
         var runtimeRoot = Path.GetFullPath(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "asha"));
@@ -3148,7 +3140,10 @@ public partial class MainWindow : Window
             evidence.ContextHeight,
             evidence.ContextPixelWidth,
             evidence.ContextPixelHeight,
-            desktopContext);
+            desktopContext,
+            evidence.ChangedScore,
+            desktopSnapshotId,
+            desktopSnapshotSignature);
     }
 
     private async Task<string> ExecuteVisualToolAsync(AshaVisualToolCall call, VisionAttachment? vision, CancellationToken cancellationToken)
@@ -3378,6 +3373,8 @@ public partial class MainWindow : Window
             return JsonSerializer.Serialize(new { ok = false, error = "Start a shared-attention session before opening an application." });
         if (!TryReadToolString(call.Arguments, "application", out var application))
             return JsonSerializer.Serialize(new { ok = false, error = "Choose an installed application by its display name." });
+        var runtimeTaskId = TryReadToolString(call.Arguments, "runtime_task_id", out var suppliedTaskId) ? suppliedTaskId : null;
+        int? runtimeTaskStep = TryReadToolCoordinate(call.Arguments, "runtime_task_step", out var suppliedTaskStep) ? suppliedTaskStep : null;
 
         var result = await ApplicationLauncher.OpenAsync(application, cancellationToken);
         await RecordActiveSessionEventAsync(
@@ -3385,7 +3382,15 @@ public partial class MainWindow : Window
             $"ASHA opened or activated the installed application {result.ResolvedName} after the person enabled computer control.",
             "model",
             "computer_control",
-            new { app = result.ProcessName, label = result.WindowTitle, control = "open_application" });
+            new { app = result.ProcessName, label = result.WindowTitle, control = "open_application" },
+            content: JsonSerializer.Serialize(new
+            {
+                taskId = runtimeTaskId,
+                taskStep = runtimeTaskStep,
+                requestedApplication = application,
+                resolvedApplication = result.ResolvedName,
+                verifiedWindow = result.WindowTitle,
+            }, JsonOptions));
         StatusText.Text = $"Opened {result.ResolvedName}.";
         Log($"ASHA opened {result.ResolvedName}; visible window verified as {result.WindowTitle}.");
         return JsonSerializer.Serialize(new
@@ -3395,6 +3400,8 @@ public partial class MainWindow : Window
             application = result.ResolvedName,
             process = result.ProcessName,
             window = result.WindowTitle,
+            task_id = runtimeTaskId,
+            task_step = runtimeTaskStep,
             activated_existing = result.ActivatedExisting,
             verification = "a visible application window was found and brought forward",
         });
@@ -3411,6 +3418,8 @@ public partial class MainWindow : Window
             return JsonSerializer.Serialize(new { ok = false, error = "Start a shared-attention session before opening a folder." });
         if (!TryReadToolString(call.Arguments, "folder", out var folder))
             return JsonSerializer.Serialize(new { ok = false, error = "Choose an existing ordinary folder by name or local path." });
+        var runtimeTaskId = TryReadToolString(call.Arguments, "runtime_task_id", out var suppliedTaskId) ? suppliedTaskId : null;
+        int? runtimeTaskStep = TryReadToolCoordinate(call.Arguments, "runtime_task_step", out var suppliedTaskStep) ? suppliedTaskStep : null;
 
         var result = await FolderLauncher.OpenAsync(folder, cancellationToken);
         await RecordActiveSessionEventAsync(
@@ -3418,7 +3427,14 @@ public partial class MainWindow : Window
             "ASHA opened one existing non-system folder in Explorer after the person enabled computer control.",
             "model",
             "computer_control",
-            new { app = "explorer", label = result.WindowTitle, control = "open_folder" });
+            new { app = "explorer", label = result.WindowTitle, control = "open_folder" },
+            content: JsonSerializer.Serialize(new
+            {
+                taskId = runtimeTaskId,
+                taskStep = runtimeTaskStep,
+                requestedFolder = folder,
+                verifiedWindow = result.WindowTitle,
+            }, JsonOptions));
         StatusText.Text = $"Opened {Path.GetFileName(result.Path.TrimEnd(Path.DirectorySeparatorChar))}.";
         Log($"ASHA opened a folder in Explorer and verified the visible window {result.WindowTitle}.");
         return JsonSerializer.Serialize(new
@@ -3426,6 +3442,8 @@ public partial class MainWindow : Window
             ok = true,
             folder = result.RequestedFolder,
             window = result.WindowTitle,
+            task_id = runtimeTaskId,
+            task_step = runtimeTaskStep,
             verification = "a visible Explorer window was found",
         });
     }
@@ -3439,7 +3457,18 @@ public partial class MainWindow : Window
             return JsonSerializer.Serialize(new { ok = false, error = "A coordinate-mapped image from an active session is required before physical input." });
         if (!TryReadToolString(call.Arguments, "action", out var action))
             return JsonSerializer.Serialize(new { ok = false, error = "A desktop action is required." });
-        if (!access.AllowsCurrentPhysicalExecutorAction(action))
+        var executorPreference = TryReadToolString(call.Arguments, "executor_preference", out var suppliedExecutorPreference) &&
+                                 suppliedExecutorPreference is "automatic" or "background" or "physical"
+            ? suppliedExecutorPreference
+            : "automatic";
+        var allowsPhysicalExecutor =
+            !string.Equals(executorPreference, "background", StringComparison.Ordinal) &&
+            access.AllowsCurrentPhysicalExecutorAction(action);
+        var allowsAccessibleInteraction =
+            !string.Equals(executorPreference, "physical", StringComparison.Ordinal) &&
+            access.CanInteractWithVirtualCursor &&
+            action is "click" or "double_click";
+        if (!allowsPhysicalExecutor && !allowsAccessibleInteraction)
         {
             if (action is "type_text" or "key")
                 return JsonSerializer.Serialize(new { ok = false, error = "Keyboard interaction is not permitted by the current policy and control lease." });
@@ -3452,6 +3481,65 @@ public partial class MainWindow : Window
             return JsonSerializer.Serialize(new { ok = false, error = "Physical cursor interaction is not permitted by the current policy and control lease." });
         }
 
+        var targetName = TryReadToolString(call.Arguments, "target_name", out var suppliedTargetName) && suppliedTargetName.Length <= 160
+            ? suppliedTargetName
+            : null;
+        var targetRole = TryReadToolString(call.Arguments, "target_role", out var suppliedTargetRole) && suppliedTargetRole.Length <= 60
+            ? suppliedTargetRole
+            : null;
+        var containerName = TryReadToolString(call.Arguments, "container_name", out var suppliedContainerName) && suppliedContainerName.Length <= 160
+            ? suppliedContainerName
+            : null;
+        var targetType = TryReadToolString(call.Arguments, "target_type", out var suppliedTargetType)
+            ? suppliedTargetType
+            : null;
+        var expectedChange = TryReadToolString(call.Arguments, "expected_change", out var suppliedExpectedChange) && suppliedExpectedChange.Length <= 240
+            ? suppliedExpectedChange
+            : null;
+        var sourceSnapshotId = TryReadToolString(call.Arguments, "source_snapshot_id", out var suppliedSnapshotId) && suppliedSnapshotId.Length <= 100
+            ? suppliedSnapshotId
+            : null;
+        var runtimeTaskId = TryReadToolString(call.Arguments, "runtime_task_id", out var suppliedTaskId) ? suppliedTaskId : null;
+        int? runtimeTaskStep = TryReadToolCoordinate(call.Arguments, "runtime_task_step", out var suppliedTaskStep) ? suppliedTaskStep : null;
+        if (!string.IsNullOrWhiteSpace(sourceSnapshotId) &&
+            !string.Equals(sourceSnapshotId, vision.DesktopSnapshotId, StringComparison.Ordinal))
+        {
+            return JsonSerializer.Serialize(new
+            {
+                ok = false,
+                error = "The requested UI snapshot is stale. ASHA must acquire the foreground state again before acting.",
+            });
+        }
+
+        DesktopStateSnapshot? preActionSnapshot = null;
+        if (!string.IsNullOrWhiteSpace(vision.DesktopSnapshotSignature))
+        {
+            preActionSnapshot = _desktopStateReader.CaptureForeground();
+            if (preActionSnapshot is null ||
+                !string.Equals(
+                    preActionSnapshot.Signature,
+                    vision.DesktopSnapshotSignature,
+                    StringComparison.Ordinal))
+            {
+                return JsonSerializer.Serialize(new
+                {
+                    ok = false,
+                    error = "The foreground UI changed after ASHA observed it. No input was sent; ASHA must inspect the current state before retrying.",
+                    observed_snapshot_id = vision.DesktopSnapshotId,
+                    current_snapshot_id = preActionSnapshot?.Id,
+                });
+            }
+        }
+
+        GroundedDesktopTarget? groundedTarget = null;
+        int? proposedImageX = null;
+        int? proposedImageY = null;
+        int? proposedDesktopX = null;
+        int? proposedDesktopY = null;
+        int? suppliedCoordinateX = null;
+        int? suppliedCoordinateY = null;
+        var coordinateSource = "not_applicable";
+        var grounding = "not_applicable";
         DesktopAction input;
         string visibleLabel;
         switch (action)
@@ -3460,8 +3548,74 @@ public partial class MainWindow : Window
             case "click":
             case "double_click":
             case "right_click":
-                if (!TryReadVisiblePoint(call.Arguments, "x", "y", vision, out var x, out var y))
-                    return JsonSerializer.Serialize(new { ok = false, error = "The requested target must be inside the supplied desktop image." });
+                int imageX;
+                int imageY;
+                int x;
+                int y;
+                if (TryReadImagePoint(call.Arguments, "x", "y", out var rawX, out var rawY))
+                {
+                    if (!vision.TryNormalizeToolPoint(
+                            rawX,
+                            rawY,
+                            out imageX,
+                            out imageY,
+                            out x,
+                            out y,
+                            out coordinateSource))
+                        return JsonSerializer.Serialize(new { ok = false, error = "The requested target must be inside the supplied desktop image." });
+                    suppliedCoordinateX = rawX;
+                    suppliedCoordinateY = rawY;
+                }
+                else if (!string.IsNullOrWhiteSpace(targetName))
+                {
+                    imageX = vision.ImageWidth / 2;
+                    imageY = vision.ImageHeight / 2;
+                    if (!vision.TryMapImagePoint(imageX, imageY, out x, out y))
+                        return JsonSerializer.Serialize(new { ok = false, error = "The supplied desktop view could not provide a semantic target hint." });
+                    coordinateSource = "semantic_target_with_view_center_hint";
+                }
+                else
+                {
+                    return JsonSerializer.Serialize(new { ok = false, error = "The requested action needs either a semantic target name or a point inside the supplied image." });
+                }
+                proposedImageX = imageX;
+                proposedImageY = imageY;
+                proposedDesktopX = x;
+                proposedDesktopY = y;
+                if (!string.IsNullOrWhiteSpace(targetName))
+                {
+                    groundedTarget = await DesktopTargetGrounder.ResolveAsync(
+                        vision,
+                        targetName,
+                        targetRole,
+                        containerName,
+                        imageX,
+                        imageY,
+                        cancellationToken);
+                    if (groundedTarget is null)
+                    {
+                        return JsonSerializer.Serialize(new
+                        {
+                            ok = false,
+                            error = $"ASHA could not independently find the target named {targetName} through Windows accessibility information or local OCR, so no pointer input was sent.",
+                        });
+                    }
+                    x = groundedTarget.CenterX;
+                    y = groundedTarget.CenterY;
+                    grounding = groundedTarget.Source;
+                }
+                else if (!string.Equals(targetType, "non_text_visual", StringComparison.Ordinal))
+                {
+                    return JsonSerializer.Serialize(new
+                    {
+                        ok = false,
+                        error = "A text-bearing pointer target requires its exact visible or accessible name. For a genuinely unlabeled target, identify it explicitly as non_text_visual.",
+                    });
+                }
+                else
+                {
+                    grounding = "model_coordinates_explicit_non_text_visual";
+                }
                 input = new DesktopAction(action, x, y);
                 visibleLabel = action switch
                 {
@@ -3477,6 +3631,7 @@ public partial class MainWindow : Window
                     return JsonSerializer.Serialize(new { ok = false, error = "Both ends of an ASHA drag must be inside the supplied desktop image." });
                 input = new DesktopAction(action, startX, startY, endX, endY);
                 visibleLabel = "ASHA drags";
+                grounding = "model_coordinates_drag";
                 break;
             case "scroll":
                 if (!TryReadToolCoordinate(call.Arguments, "delta", out var delta) || delta is < -1200 or > 1200 || delta == 0)
@@ -3491,6 +3646,7 @@ public partial class MainWindow : Window
                 }
                 input = new DesktopAction(action, scrollX, scrollY, Delta: delta);
                 visibleLabel = "ASHA scrolls";
+                grounding = scrollX.HasValue ? "model_coordinates_scroll_target" : "current_pointer";
                 break;
             case "type_text":
                 if (!TryReadToolString(call.Arguments, "text", out var text) || text.Length > 280)
@@ -3499,6 +3655,7 @@ public partial class MainWindow : Window
                     return JsonSerializer.Serialize(new { ok = false, error = "ASHA never types credentials, secrets, or recovery codes." });
                 input = new DesktopAction(action, Text: text);
                 visibleLabel = "ASHA types";
+                grounding = "focused_control";
                 break;
             case "key":
                 if (!TryReadToolString(call.Arguments, "key", out var key) ||
@@ -3506,6 +3663,7 @@ public partial class MainWindow : Window
                     return JsonSerializer.Serialize(new { ok = false, error = "Only the approved navigation keys are available." });
                 input = new DesktopAction(action, Key: key);
                 visibleLabel = $"ASHA presses {key}";
+                grounding = "focused_control";
                 break;
             default:
                 return JsonSerializer.Serialize(new { ok = false, error = "That physical desktop action is not available." });
@@ -3532,16 +3690,77 @@ public partial class MainWindow : Window
             exposedSurface = new SurfaceTarget(focused.ProcessName, focused.Title, focused.WindowClass, focused.X, focused.Y, focused.Width, focused.Height);
         }
 
-        await ShowTransientControlCueAsync(input, visibleLabel);
-        await Task.Delay(180, cancellationToken);
-        await DesktopControlExecutor.ExecuteAsync(input, cancellationToken);
-        await Task.Delay(180, cancellationToken);
+        var executedWithAccessibility = false;
+        string? accessibilityPattern = null;
+        if (allowsAccessibleInteraction &&
+            action is "click" or "double_click" &&
+            !string.IsNullOrWhiteSpace(targetName) &&
+            proposedImageX.HasValue &&
+            proposedImageY.HasValue)
+        {
+            executedWithAccessibility = DesktopTargetGrounder.TryExecuteAccessibleAction(
+                vision,
+                targetName,
+                targetRole,
+                containerName,
+                proposedImageX.Value,
+                proposedImageY.Value,
+                action,
+                out var accessibleTarget,
+                out accessibilityPattern);
+            if (executedWithAccessibility && accessibleTarget is not null)
+            {
+                groundedTarget = accessibleTarget;
+                input = input with { X = accessibleTarget.CenterX, Y = accessibleTarget.CenterY };
+                grounding = "windows_ui_automation";
+            }
+        }
+
+        if (!executedWithAccessibility && !allowsPhysicalExecutor)
+        {
+            return JsonSerializer.Serialize(new
+            {
+                ok = false,
+                error = "The permitted background interaction could not invoke or select this accessible control, and physical-cursor fallback is disabled.",
+            });
+        }
+        if (!executedWithAccessibility &&
+            allowsAccessibleInteraction &&
+            access.MustAskBeforePhysicalFallback)
+        {
+            return JsonSerializer.Serialize(new
+            {
+                ok = false,
+                error = "Background interaction could not operate this control. Physical-cursor fallback requires a separate confirmation.",
+            });
+        }
+
+        var actionId = $"desktop-action-{Guid.NewGuid():N}";
+        var transientCueId = await ShowTransientControlCueAsync(input, visibleLabel);
+        try
+        {
+            await Task.Delay(180, cancellationToken);
+            if (!executedWithAccessibility)
+                await DesktopControlExecutor.ExecuteAsync(input, cancellationToken);
+            await Task.Delay(220, cancellationToken);
+        }
+        finally
+        {
+            await ClearTransientControlCueAsync(transientCueId);
+            await Task.Delay(90, CancellationToken.None);
+        }
 
         SurfaceTarget? resultingSurface = null;
-        if (GetCursorPos(out var pointer)) resultingSurface = ResolveTopmostSurface(pointer);
+        if (executedWithAccessibility && input.X.HasValue && input.Y.HasValue)
+            resultingSurface = ResolveTopmostSurface(new NativePoint { X = input.X.Value, Y = input.Y.Value });
+        else if (GetCursorPos(out var pointer))
+            resultingSurface = ResolveTopmostSurface(pointer);
+        var executorName = executedWithAccessibility ? $"ui_automation:{accessibilityPattern}" : "physical_cursor";
         await RecordActiveSessionEventAsync(
             "control.input_sent",
-            $"ASHA sent one visible physical {action.Replace('_', ' ')} input after the person enabled computer control.",
+            executedWithAccessibility
+                ? $"ASHA used the visible control's Windows UI Automation {accessibilityPattern} pattern after the person enabled background interaction."
+                : $"ASHA sent one visible physical {action.Replace('_', ' ')} input after the person enabled computer control.",
             "model",
             "computer_control",
             new
@@ -3555,20 +3774,88 @@ public partial class MainWindow : Window
                 y = input.Y,
                 endX = input.EndX,
                 endY = input.EndY,
-            });
-        Log($"{visibleLabel}: physical input sent.");
+            },
+            content: JsonSerializer.Serialize(new
+            {
+                actionId,
+                taskId = runtimeTaskId,
+                taskStep = runtimeTaskStep,
+                action,
+                targetName,
+                targetRole,
+                containerName,
+                targetType,
+                expectedChange,
+                executorPreference,
+                grounding,
+                coordinateSource,
+                sourceEvidence = vision.Name,
+                sourceSnapshotId = vision.DesktopSnapshotId,
+                sourceSnapshotSignature = vision.DesktopSnapshotSignature,
+                preActionSnapshotId = preActionSnapshot?.Id,
+                proposedImagePoint = proposedImageX.HasValue ? new { x = proposedImageX, y = proposedImageY } : null,
+                proposedDesktopPoint = proposedDesktopX.HasValue ? new { x = proposedDesktopX, y = proposedDesktopY } : null,
+                suppliedPoint = suppliedCoordinateX.HasValue ? new { x = suppliedCoordinateX, y = suppliedCoordinateY } : null,
+                groundedBounds = groundedTarget is null
+                    ? null
+                    : new
+                    {
+                        groundedTarget.X,
+                        groundedTarget.Y,
+                        groundedTarget.Width,
+                        groundedTarget.Height,
+                        groundedTarget.Name,
+                        groundedTarget.Role,
+                        groundedTarget.Source,
+                    },
+                deliveredPoint = input.X.HasValue ? new { x = input.X, y = input.Y } : null,
+                topLayer = exposedSurface?.DisplayName,
+                executor = executorName,
+                physicalInputSent = !executedWithAccessibility,
+                accessibleInteractionSent = executedWithAccessibility,
+                verification = "pending_post_action_evidence",
+            }, JsonOptions));
+        Log($"{visibleLabel}: {executorName} input sent; grounding: {grounding}; action id: {actionId}.");
         StatusText.Text = $"{visibleLabel}. ASHA is checking the visible result.";
         return JsonSerializer.Serialize(new
         {
             ok = true,
             action,
+            action_id = actionId,
+            task_id = runtimeTaskId,
+            task_step = runtimeTaskStep,
+            target_name = targetName,
+            target_role = targetRole,
+            container_name = containerName,
+            expected_change = expectedChange,
+            executor_preference = executorPreference,
+            source_snapshot_id = vision.DesktopSnapshotId,
+            source_snapshot_signature = vision.DesktopSnapshotSignature,
+            pre_action_snapshot_id = preActionSnapshot?.Id,
+            grounding,
+            coordinate_source = coordinateSource,
+            grounded_bounds = groundedTarget is null
+                ? null
+                : new
+                {
+                    x = groundedTarget.X,
+                    y = groundedTarget.Y,
+                    width = groundedTarget.Width,
+                    height = groundedTarget.Height,
+                    name = groundedTarget.Name,
+                    role = groundedTarget.Role,
+                },
             top_layer = exposedSurface is null ? null : new { app = exposedSurface.ProcessName, window = exposedSurface.DisplayName },
-            input = "physical desktop input was sent visibly",
-            verification = "a fresh post-action view is required before claiming the intended result",
+            input_sent = true,
+            executor = executorName,
+            input = executedWithAccessibility
+                ? "Windows UI Automation operated the grounded control without moving the person's physical cursor"
+                : "physical desktop input was sent visibly to the grounded target",
+            verification = "pending; a fresh overlay-free post-action view is required before claiming the intended result",
         });
     }
 
-    private async Task ShowTransientControlCueAsync(DesktopAction action, string label)
+    private async Task<string> ShowTransientControlCueAsync(DesktopAction action, string label)
     {
         var x = action.X ?? GetSystemMetrics(SmXVirtualScreen) + 42;
         var y = action.Y ?? GetSystemMetrics(SmYVirtualScreen) + 42;
@@ -3583,6 +3870,19 @@ public partial class MainWindow : Window
             await Task.Delay(1_400);
             try { StartAshaWithoutWaiting("clear", id); } catch { }
         });
+        return id;
+    }
+
+    private async Task ClearTransientControlCueAsync(string id)
+    {
+        try
+        {
+            await RunAshaAsync("clear", id);
+        }
+        catch (Exception error)
+        {
+            Log($"Could not clear the temporary control cue before verification: {error.Message}");
+        }
     }
 
     private static bool TryReadVisiblePoint(JsonElement arguments, string xName, string yName, VisionAttachment vision, out int x, out int y)

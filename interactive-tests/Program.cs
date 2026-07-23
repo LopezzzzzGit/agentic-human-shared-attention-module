@@ -8,6 +8,31 @@ if (args is ["--activate", var requestedApplication])
     return 0;
 }
 
+if (args is ["--ocr", var imagePath, var requestedText, var rawX, var rawY] &&
+    int.TryParse(rawX, out var hintX) &&
+    int.TryParse(rawY, out var hintY))
+{
+    var match = await LocalOcrGrounder.FindNearestAsync(
+        await File.ReadAllBytesAsync(imagePath),
+        requestedText,
+        hintX,
+        hintY,
+        CancellationToken.None);
+    Console.WriteLine(match is null
+        ? "No OCR match."
+        : $"OCR match: x={match.Value.X}, y={match.Value.Y}, width={match.Value.Width}, height={match.Value.Height}");
+    return match is null ? 1 : 0;
+}
+
+if (args is ["--ocr-dump", var dumpImagePath])
+{
+    var lines = await LocalOcrGrounder.RecognizeLinesForTestingAsync(
+        await File.ReadAllBytesAsync(dumpImagePath),
+        CancellationToken.None);
+    foreach (var line in lines) Console.WriteLine(line);
+    return 0;
+}
+
 var cases = new[]
 {
     new IntentCase("Can you remove that last mark please?", true, "latest"),
@@ -54,12 +79,13 @@ foreach (var test in cases)
 }
 
 var semanticApplicationRoutingPassed =
-    AshaVoiceSession.InitialToolNamesForTesting("Open my inbox.", allowComputerControl: true).Contains("asha_request_view") &&
-    AshaVoiceSession.InitialToolNamesForTesting("Open my inbox.", allowComputerControl: true).Contains("asha_open_application") &&
+    AshaVoiceSession.InitialToolNamesForTesting("Open my inbox.", allowComputerControl: true)
+        .SequenceEqual(["asha_choose_capability"]) &&
     AshaVoiceSession.ModelRoutedGroundedToolNamesForTesting("Open my inbox.", allowComputerControl: true).Contains("asha_desktop_action") &&
     AshaVoiceSession.ModelRoutedGroundedToolNamesForTesting("Open my inbox.", allowComputerControl: true).Contains("asha_request_detail") &&
+    !AshaVoiceSession.ModelRoutedGroundedToolNamesForTesting("Open my inbox.", allowComputerControl: true).Contains("asha_open_application") &&
     ApplicationLauncher.ValidateName("Inbox") == "Inbox";
-Console.WriteLine($"{(semanticApplicationRoutingPassed ? "PASS" : "FAIL")} | app    | natural open requests reach the model without runtime noun extraction");
+Console.WriteLine($"{(semanticApplicationRoutingPassed ? "PASS" : "FAIL")} | app    | natural open requests negotiate a capability without runtime noun extraction");
 if (!semanticApplicationRoutingPassed) failed++;
 
 var identityCases = new[]
@@ -82,6 +108,7 @@ var claimCases = new[]
 {
     new ClaimCase("I've brought LM Studio to the front.", true),
     new ClaimCase("I have activated Outlook.", true),
+    new ClaimCase("I sent the click to open the most recent iServ email.", true),
     new ClaimCase("I can bring LM Studio to the front if you enable control.", false),
 };
 
@@ -102,6 +129,8 @@ var perceptionCases = new[]
     new PerceptionCase("Look right here.", true, ActivePerceptionGoal.Observe, VisionRequestScope.PointerArea, false),
     new PerceptionCase("Where is the application window?", true, ActivePerceptionGoal.Locate, VisionRequestScope.EntireDesktop, false),
     new PerceptionCase("Did that window open?", true, ActivePerceptionGoal.Verify, VisionRequestScope.ForegroundWindow, false),
+    new PerceptionCase("Open the Inbox for that account.", true, ActivePerceptionGoal.Act, VisionRequestScope.ForegroundWindow, true),
+    new PerceptionCase("What emails are visible in my inbox?", true, ActivePerceptionGoal.Observe, VisionRequestScope.ForegroundWindow, true),
     new PerceptionCase("Schau bitte unten rechts auf den Bildschirm.", true, ActivePerceptionGoal.Observe, VisionRequestScope.LowerRightScreen, false),
     new PerceptionCase("Open LM Studio for me.", false, ActivePerceptionGoal.None, VisionRequestScope.ForegroundWindow, false),
     new PerceptionCase("Tell me a short joke.", false, ActivePerceptionGoal.None, VisionRequestScope.ForegroundWindow, false),
@@ -118,12 +147,20 @@ foreach (var test in perceptionCases)
     if (!passed) failed++;
 }
 
-const int reliabilityCaseCount = 11;
+const int reliabilityCaseCount = 16;
 var initialApplicationTools = AshaVoiceSession.InitialToolNamesForTesting(
     "Could you bring up my email program?",
     allowComputerControl: true);
-var modelPrimaryApplicationPassed = initialApplicationTools.Contains("asha_open_application");
-Console.WriteLine($"{(modelPrimaryApplicationPassed ? "PASS" : "FAIL")} | tools  | natural application requests reach the model with the application tool");
+var applicationCapabilityTools = AshaVoiceSession.CapabilityToolNamesForTesting(
+    "application_control",
+    hasGroundedVision: false,
+    allowApplicationControl: true,
+    allowDesktopAction: true);
+var modelPrimaryApplicationPassed =
+    initialApplicationTools.SequenceEqual(["asha_choose_capability"]) &&
+    applicationCapabilityTools.Contains("asha_open_application") &&
+    !applicationCapabilityTools.Contains("asha_desktop_action");
+Console.WriteLine($"{(modelPrimaryApplicationPassed ? "PASS" : "FAIL")} | tools  | natural application requests disclose only the selected tool family");
 if (!modelPrimaryApplicationPassed) failed++;
 
 var visualQuestionTools = AshaVoiceSession.GroundedToolNamesForTesting("Can you see Outlook open?", allowComputerControl: true);
@@ -173,6 +210,159 @@ var ocrGroundingPassed =
     LocalOcrGrounder.BestContiguousMatchLengthForTesting("pete.albrecht@gmx.net account", "pete.albrecht@gmx.net") == 1;
 Console.WriteLine($"{(ocrGroundingPassed ? "PASS" : "FAIL")} | ocr    | descriptive labels retain a verifiable visible-text anchor");
 if (!ocrGroundingPassed) failed++;
+
+var semanticTargetGroundingPassed =
+    DesktopTargetGrounder.BestNameMatchScoreForTesting(
+        "pete.albrecht@gmx.net account",
+        "pete.albrecht@gmx.net") >= 90 &&
+    DesktopTargetGrounder.BestNameMatchScoreForTesting(
+        "Inbox folder",
+        "Inbox 1772 unread") > 0 &&
+    DesktopTargetGrounder.BestNameMatchScoreForTesting(
+        "pete.albrecht@gmx.net",
+        "Junk Email") == 0;
+Console.WriteLine($"{(semanticTargetGroundingPassed ? "PASS" : "FAIL")} | target | accessibility and OCR labels are matched semantically without application-specific rules");
+if (!semanticTargetGroundingPassed) failed++;
+
+var strictRoleGroundingPassed =
+    DesktopTargetGrounder.RoleMatchesForTesting("list_item", "treeitem") &&
+    DesktopTargetGrounder.RoleMatchesForTesting("account", "treeitem") &&
+    !DesktopTargetGrounder.RoleMatchesForTesting("list_item", "group");
+Console.WriteLine($"{(strictRoleGroundingPassed ? "PASS" : "FAIL")} | target | requested semantic roles reject same-named headings and groups");
+if (!strictRoleGroundingPassed) failed++;
+
+var snapshot = new DesktopStateSnapshot(
+    "desktop-state-test",
+    7,
+    DateTime.UtcNow,
+    "olk",
+    "Inbox – pete.albrecht@gmx.net – Outlook",
+    42,
+    [
+        new DesktopStateElement(
+            1,
+            "Inbox",
+            "treeitem",
+            "pete.albrecht@gmx.net",
+            100,
+            200,
+            140,
+            30,
+            true,
+            false,
+            true,
+            null,
+            ["select"]),
+    ],
+    18,
+    false);
+var snapshotContext = snapshot.ToModelContext();
+var snapshotPassed =
+    snapshotContext.Contains("desktop-state-test", StringComparison.Ordinal) &&
+    snapshotContext.Contains("parent=\"pete.albrecht@gmx.net\"", StringComparison.Ordinal) &&
+    snapshotContext.Contains("selected", StringComparison.Ordinal) &&
+    snapshotContext.Contains("actions=select", StringComparison.Ordinal);
+Console.WriteLine($"{(snapshotPassed ? "PASS" : "FAIL")} | state  | versioned foreground snapshots retain semantic ancestry and state");
+if (!snapshotPassed) failed++;
+
+var genericCoordinateSnapshot = new DesktopStateSnapshot(
+    "desktop-state-coordinate-test",
+    8,
+    DateTime.UtcNow,
+    "mail-client",
+    "Mailbox",
+    77,
+    [
+        new DesktopStateElement(
+            1,
+            "account@example.test",
+            "treeitem",
+            "Navigation",
+            958,
+            584,
+            374,
+            36,
+            true,
+            false,
+            false,
+            "collapsed",
+            ["expand"]),
+    ],
+    1,
+    false);
+var coordinateMap = new DesktopImageCoordinateMap(893, 24, 1710, 1527, 806, 720);
+var imageRelativeContext = genericCoordinateSnapshot.ToModelContext(
+    "open account@example.test",
+    3_200,
+    coordinateMap);
+var coordinateContextPassed =
+    imageRelativeContext.Contains("image_bounds=", StringComparison.Ordinal) &&
+    !imageRelativeContext.Contains("desktop_bounds=", StringComparison.Ordinal) &&
+    !imageRelativeContext.Contains("bounds=958,584", StringComparison.Ordinal);
+Console.WriteLine($"{(coordinateContextPassed ? "PASS" : "FAIL")} | coords | provider UI context exposes image-relative bounds only");
+if (!coordinateContextPassed) failed++;
+
+var compatibilityVision = new VisionAttachment(
+    "coordinate-test.png",
+    [],
+    893,
+    24,
+    1710,
+    1527,
+    806,
+    720);
+var desktopCoordinateCompatibilityPassed =
+    compatibilityVision.TryNormalizeToolPoint(
+        958,
+        584,
+        out var normalizedImageX,
+        out var normalizedImageY,
+        out var normalizedDesktopX,
+        out var normalizedDesktopY,
+        out var coordinateSource) &&
+    normalizedImageX is >= 30 and <= 32 &&
+    normalizedImageY is >= 263 and <= 265 &&
+    normalizedDesktopX is >= 957 and <= 960 &&
+    normalizedDesktopY is >= 582 and <= 586 &&
+    coordinateSource == "desktop_pixels_normalized_for_compatibility";
+Console.WriteLine($"{(desktopCoordinateCompatibilityPassed ? "PASS" : "FAIL")} | coords | legacy desktop points normalize safely into supplied-image pixels");
+if (!desktopCoordinateCompatibilityPassed) failed++;
+
+var stagedPromptContractPassed =
+    !AshaVoiceSession.StaticPromptContainsToolNameForTesting() &&
+    !compatibilityVision.CoordinateInstruction.Contains("asha_", StringComparison.Ordinal) &&
+    AshaVoiceSession.InitialToolChoiceForTesting("Click the named button.") == "required:asha_choose_capability" &&
+    AshaVoiceSession.CapabilityPhaseToolChoiceForTesting("desktop_interaction", hasGroundedVision: false) == "required:asha_request_view";
+Console.WriteLine($"{(stagedPromptContractPassed ? "PASS" : "FAIL")} | tools  | staged prompts hide future tools and require the current phase");
+if (!stagedPromptContractPassed) failed++;
+
+var multiStepInitialTools = AshaVoiceSession.GroundedInitialToolNamesForTesting(
+    "Open Outlook and then open the Inbox for my account.",
+    allowApplicationControl: true,
+    allowDesktopAction: true);
+var multiStepInitialToolsPassed =
+    multiStepInitialTools.SequenceEqual(["asha_choose_capability"]) &&
+    AshaVoiceSession.CapabilityToolNamesForTesting(
+        "desktop_interaction",
+        hasGroundedVision: true,
+        allowApplicationControl: true,
+        allowDesktopAction: true).Contains("asha_desktop_action");
+Console.WriteLine($"{(multiStepInitialToolsPassed ? "PASS" : "FAIL")} | tools  | a grounded multi-step request negotiates before loading its action schema");
+if (!multiStepInitialToolsPassed) failed++;
+
+var progressiveDisclosurePassed =
+    AshaVoiceSession.InitialToolSchemaCharactersForTesting("Please help with my desktop.", allowComputerControl: true) <
+    AshaVoiceSession.LegacyBroadToolSchemaCharactersForTesting() / 3;
+Console.WriteLine($"{(progressiveDisclosurePassed ? "PASS" : "FAIL")} | budget | initial capability schema is less than one third of the legacy broad bundle");
+if (!progressiveDisclosurePassed) failed++;
+
+var boundedTaskToolsPassed =
+    AshaVoiceSession.IsDesktopTaskProgressToolForTesting("asha_open_application") &&
+    AshaVoiceSession.IsDesktopTaskProgressToolForTesting("asha_open_folder") &&
+    AshaVoiceSession.IsDesktopTaskProgressToolForTesting("asha_desktop_action") &&
+    !AshaVoiceSession.IsDesktopTaskProgressToolForTesting("asha_mark");
+Console.WriteLine($"{(boundedTaskToolsPassed ? "PASS" : "FAIL")} | task   | only state-changing desktop tools advance the bounded task loop");
+if (!boundedTaskToolsPassed) failed++;
 
 var intervalCoordinatePassed = MainWindow.TryReadToolCoordinateForTesting("{\"x\":[120,140]}", "x", out var intervalCoordinate) &&
                                intervalCoordinate == 130;
@@ -296,8 +486,19 @@ var pointerOnlyTools = AshaVoiceSession.InitialToolNamesForCapabilitiesForTestin
     allowApplicationControl: false,
     allowDesktopAction: true);
 var separatedToolPermissionsPassed =
-    applicationOnlyTools.Contains("asha_open_application") &&
+    applicationOnlyTools.SequenceEqual(["asha_choose_capability"]) &&
+    pointerOnlyTools.Contains("asha_request_view") &&
     !pointerOnlyTools.Contains("asha_open_application") &&
+    AshaVoiceSession.CapabilityToolNamesForTesting(
+        "application_control",
+        hasGroundedVision: false,
+        allowApplicationControl: true,
+        allowDesktopAction: false).Contains("asha_open_application") &&
+    AshaVoiceSession.CapabilityToolNamesForTesting(
+        "application_control",
+        hasGroundedVision: false,
+        allowApplicationControl: false,
+        allowDesktopAction: true).Count == 0 &&
     !AshaVoiceSession.GroundedToolNamesForTesting("Click the calendar.", allowComputerControl: false).Contains("asha_desktop_action");
 Console.WriteLine($"{(separatedToolPermissionsPassed ? "PASS" : "FAIL")} | tools  | application permission does not leak physical-input tools");
 if (!separatedToolPermissionsPassed) failed++;

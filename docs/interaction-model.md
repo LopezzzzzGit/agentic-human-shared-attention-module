@@ -34,16 +34,18 @@ The human can use those primitives to teach. The model can use them in an
 ordinary conversation, a guided tutorial, a clarification question, or before
 an intended action.
 
-## Visual pointer is not physical control
+## Visual pointer and computer control
 
 The default agent pointer is a **virtual attention cursor**: a click-through
 overlay drawn above the desktop. It can point, glide, highlight, and disappear,
 but it never owns, moves, or clicks the person's physical mouse.
 
-Physical computer control is a separate capability. Before an agent clicks,
-types, or drags with the real input devices, it must make an explicit,
-human-readable request and receive scoped approval. A visual cue can be shown
-first to make that request understandable.
+ASHA may also use a background-capable virtual interaction cursor or, under a
+separate permission, the person's physical cursor. Action delivery, cursor
+visibility, global capability policy, and the active session lease remain
+separate decisions. The complete proposed settings, confirmation-card, CUA
+routing, and emergency-stop design is in
+[computer-control and conversational permission design](design-notes/001-computer-control-and-permissions.md).
 
 ## Real-time architecture
 

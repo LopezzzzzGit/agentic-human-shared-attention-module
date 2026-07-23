@@ -13,6 +13,7 @@
             <Grid.RowDefinitions>
                 <RowDefinition Height="Auto" />
                 <RowDefinition Height="*" />
+                <RowDefinition Height="Auto" />
                 <RowDefinition Height="16" />
             </Grid.RowDefinitions>
             <Border Grid.Row="0" Padding="0,0,0,10" MouseLeftButtonDown="Header_MouseLeftButtonDown">
@@ -44,7 +45,20 @@
                     </DataTemplate>
                 </ListBox.ItemTemplate>
             </ListBox>
-            <primitives:Thumb Grid.Row="2" Cursor="SizeNWSE" DragDelta="ResizeThumb_DragDelta" ToolTip="Drag to resize">
+            <Border Grid.Row="2" Margin="0,7,0,0" Padding="8,5" CornerRadius="14" Background="#FFFFFFFF" BorderBrush="#B7D9F5" BorderThickness="1">
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+                    <TextBox x:Name="ComposerTextBox" MinHeight="30" MaxHeight="92" Padding="4,4" BorderThickness="0" Background="Transparent"
+                             VerticalContentAlignment="Center" VerticalScrollBarVisibility="Auto" TextWrapping="Wrap" AcceptsReturn="True"
+                             MaxLength="4000" KeyDown="Composer_KeyDown" ToolTip="Type to ASHA. Enter sends; Shift+Enter starts a new line." />
+                    <Button x:Name="SendButton" Grid.Column="1" Margin="7,0,0,0" Padding="11,4" VerticalAlignment="Bottom"
+                            Click="Send_Click" ToolTip="Send typed message">Send</Button>
+                </Grid>
+            </Border>
+            <primitives:Thumb Grid.Row="3" Cursor="SizeNWSE" DragDelta="ResizeThumb_DragDelta" ToolTip="Drag to resize">
                 <primitives:Thumb.Template>
                     <ControlTemplate TargetType="primitives:Thumb">
                         <Border Padding="0,7,0,0">

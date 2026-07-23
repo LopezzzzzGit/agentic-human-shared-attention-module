@@ -14,6 +14,14 @@ internal readonly record struct OcrTextMatch(int X, int Y, int Width, int Height
 /// </summary>
 internal static class LocalOcrGrounder
 {
+    private static readonly HashSet<string> DescriptiveTokens = new(StringComparer.Ordinal)
+    {
+        "a", "an", "the", "for", "in", "inside", "on", "at", "of",
+        "folder", "account", "button", "item", "row", "control", "application", "app", "outlook",
+        "der", "die", "das", "den", "dem", "ein", "eine", "einer", "einen", "im", "in", "auf", "von", "für", "fuer",
+        "ordner", "konto", "schaltfläche", "schaltflaeche", "element", "zeile", "anwendung",
+    };
+
     public static async Task<OcrTextMatch?> FindNearestAsync(
         byte[] png,
         string requestedText,
@@ -21,7 +29,7 @@ internal static class LocalOcrGrounder
         int hintY,
         CancellationToken cancellationToken)
     {
-        var query = Tokenize(requestedText);
+        var query = SignificantTokens(requestedText);
         if (png.Length == 0 || query.Length == 0) return null;
 
         cancellationToken.ThrowIfCancellationRequested();
@@ -36,24 +44,14 @@ internal static class LocalOcrGrounder
 
         OcrTextMatch? nearest = null;
         double nearestDistance = double.MaxValue;
+        var bestTokenLength = 0;
         foreach (var line in result.Lines)
         {
             var words = line.Words.ToArray();
             var normalized = words.Select(word => NormalizeToken(word.Text)).ToArray();
-            for (var start = 0; start + query.Length <= normalized.Length; start++)
+            foreach (var span in MatchingSpans(normalized, query))
             {
-                var matches = true;
-                for (var offset = 0; offset < query.Length; offset++)
-                {
-                    if (!string.Equals(normalized[start + offset], query[offset], StringComparison.Ordinal))
-                    {
-                        matches = false;
-                        break;
-                    }
-                }
-                if (!matches) continue;
-
-                var selected = words.Skip(start).Take(query.Length).Select(word => word.BoundingRect).ToArray();
+                var selected = words.Skip(span.Start).Take(span.Length).Select(word => word.BoundingRect).ToArray();
                 var left = selected.Min(rectangle => rectangle.X);
                 var top = selected.Min(rectangle => rectangle.Y);
                 var right = selected.Max(rectangle => rectangle.X + rectangle.Width);
@@ -66,12 +64,50 @@ internal static class LocalOcrGrounder
                 var centerX = candidate.X + (candidate.Width / 2d);
                 var centerY = candidate.Y + (candidate.Height / 2d);
                 var distance = Math.Pow(centerX - hintX, 2) + Math.Pow(centerY - hintY, 2);
-                if (distance >= nearestDistance) continue;
+                if (span.Length < bestTokenLength ||
+                    (span.Length == bestTokenLength && distance >= nearestDistance)) continue;
                 nearest = candidate;
+                bestTokenLength = span.Length;
                 nearestDistance = distance;
             }
         }
         return nearest;
+    }
+
+    internal static int BestContiguousMatchLengthForTesting(string requestedText, string recognizedLine)
+    {
+        var query = SignificantTokens(requestedText);
+        var recognized = Tokenize(recognizedLine);
+        return MatchingSpans(recognized, query).Select(span => span.Length).DefaultIfEmpty(0).Max();
+    }
+
+    private static IEnumerable<TokenSpan> MatchingSpans(IReadOnlyList<string> recognized, IReadOnlyList<string> query)
+    {
+        for (var length = query.Count; length >= 1; length--)
+        {
+            for (var queryStart = 0; queryStart + length <= query.Count; queryStart++)
+            {
+                for (var recognizedStart = 0; recognizedStart + length <= recognized.Count; recognizedStart++)
+                {
+                    var matches = true;
+                    for (var offset = 0; offset < length; offset++)
+                    {
+                        if (string.Equals(recognized[recognizedStart + offset], query[queryStart + offset], StringComparison.Ordinal))
+                            continue;
+                        matches = false;
+                        break;
+                    }
+                    if (matches) yield return new TokenSpan(recognizedStart, length);
+                }
+            }
+        }
+    }
+
+    private static string[] SignificantTokens(string text)
+    {
+        var tokens = Tokenize(text);
+        var significant = tokens.Where(token => !DescriptiveTokens.Contains(token)).ToArray();
+        return significant.Length > 0 ? significant : tokens;
     }
 
     private static string[] Tokenize(string text) => text
@@ -82,4 +118,6 @@ internal static class LocalOcrGrounder
 
     private static string NormalizeToken(string text) =>
         new(text.Where(char.IsLetterOrDigit).Select(char.ToLowerInvariant).ToArray());
+
+    private readonly record struct TokenSpan(int Start, int Length);
 }

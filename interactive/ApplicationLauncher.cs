@@ -14,6 +14,10 @@ namespace AshaLive;
 internal static partial class ApplicationLauncher
 {
     private const int SwRestore = 9;
+    private const uint SwpNoSize = 0x0001;
+    private const uint SwpNoMove = 0x0002;
+    private const uint SwpShowWindow = 0x0040;
+    private static readonly IntPtr HwndTop = IntPtr.Zero;
     private static readonly TimeSpan LaunchTimeout = TimeSpan.FromSeconds(18);
     private static readonly TimeSpan ActivationTimeout = TimeSpan.FromSeconds(2);
     private static readonly object CatalogGate = new();
@@ -21,6 +25,9 @@ internal static partial class ApplicationLauncher
 
     public static async Task<ApplicationLaunchResult> OpenAsync(string requestedName, CancellationToken cancellationToken)
     {
+        // The model supplies the semantic application display name. This
+        // boundary validates it but never rewrites ordinary language into an
+        // application guess (for example, "open my inbox" into "inbox").
         var name = ValidateName(requestedName);
         var applications = await ReadCatalogAsync(cancellationToken).ConfigureAwait(false);
         var match = Resolve(applications, name);
@@ -274,8 +281,7 @@ internal static partial class ApplicationLauncher
         while (DateTime.UtcNow < deadline)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            _ = ShowWindowAsync(window, SwRestore);
-            _ = SetForegroundWindow(window);
+            TryActivateWindow(window);
             await Task.Delay(90, cancellationToken).ConfigureAwait(false);
 
             var foreground = GetForegroundWindow();
@@ -290,6 +296,39 @@ internal static partial class ApplicationLauncher
         throw new InvalidOperationException($"Windows did not bring {application.Name} to the foreground, so ASHA has not claimed that it did.");
     }
 
+    /// <summary>
+    /// SetForegroundWindow alone is routinely rejected when ASHA's voice turn
+    /// completes on a worker thread while another application owns the input
+    /// queue. Temporarily joining the relevant queues lets Windows treat this
+    /// as the same visible user-initiated activation; all joins are detached
+    /// immediately, even when an individual Win32 call fails.
+    /// </summary>
+    private static void TryActivateWindow(IntPtr window)
+    {
+        var currentThread = GetCurrentThreadId();
+        var foreground = GetForegroundWindow();
+        var foregroundThread = foreground == IntPtr.Zero ? 0 : GetWindowThreadProcessId(foreground, out _);
+        var targetThread = GetWindowThreadProcessId(window, out _);
+        var attachedForeground = foregroundThread != 0 && foregroundThread != currentThread &&
+                                 AttachThreadInput(currentThread, foregroundThread, true);
+        var attachedTarget = targetThread != 0 && targetThread != currentThread && targetThread != foregroundThread &&
+                             AttachThreadInput(currentThread, targetThread, true);
+        try
+        {
+            _ = ShowWindowAsync(window, SwRestore);
+            _ = BringWindowToTop(window);
+            _ = SetWindowPos(window, HwndTop, 0, 0, 0, 0, SwpNoMove | SwpNoSize | SwpShowWindow);
+            _ = SetForegroundWindow(window);
+            _ = SetActiveWindow(window);
+            _ = SetFocus(window);
+        }
+        finally
+        {
+            if (attachedTarget) _ = AttachThreadInput(currentThread, targetThread, false);
+            if (attachedForeground) _ = AttachThreadInput(currentThread, foregroundThread, false);
+        }
+    }
+
     private static string Normalize(string value) => Regex.Replace(value.ToLowerInvariant(), @"[^\p{L}\p{N}]+", " ").Trim();
 
     [GeneratedRegex(@"^[\p{L}\p{N}][\p{L}\p{N}\s.&()'_+\-]{0,79}$", RegexOptions.CultureInvariant)]
@@ -297,6 +336,12 @@ internal static partial class ApplicationLauncher
 
     [DllImport("user32.dll")] private static extern bool SetForegroundWindow(IntPtr window);
     [DllImport("user32.dll")] private static extern bool ShowWindowAsync(IntPtr window, int command);
+    [DllImport("user32.dll")] private static extern bool BringWindowToTop(IntPtr window);
+    [DllImport("user32.dll")] private static extern IntPtr SetActiveWindow(IntPtr window);
+    [DllImport("user32.dll")] private static extern IntPtr SetFocus(IntPtr window);
+    [DllImport("user32.dll")] private static extern bool SetWindowPos(IntPtr window, IntPtr insertAfter, int x, int y, int width, int height, uint flags);
+    [DllImport("user32.dll")] private static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool attach);
+    [DllImport("kernel32.dll")] private static extern uint GetCurrentThreadId();
     [DllImport("user32.dll")] private static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
 

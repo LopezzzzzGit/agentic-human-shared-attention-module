@@ -16,6 +16,25 @@ delivery order are maintained in [ROADMAP.md](ROADMAP.md). The short
 competition setup and test sequence is in
 [docs/hackathon-demonstrator.md](docs/hackathon-demonstrator.md).
 
+## Essential development documents
+
+Anyone developing ASHA should read these documents as one maintained set:
+
+1. [SPEC.md](SPEC.md) — the original module contracts and measured driver
+   foundation.
+2. [Interaction model](docs/interaction-model.md) — ASHA's human-facing
+   product and interaction principles.
+3. [Product roadmap](ROADMAP.md) — lifecycle, memory architecture, delivery
+   order, and near-term acceptance criteria.
+4. [Design-note register](docs/design-notes/README.md) — permanent, numbered
+   proposals and implementation decisions.
+5. [Harness contract](docs/harness-contract.md) — the model-neutral boundary
+   between ASHA and external agent runtimes.
+
+Numbered design notes are actionable unless their status explicitly says
+otherwise. Their identifiers are permanent: implemented, rejected, deferred,
+or superseded notes remain in the register and are never renumbered or reused.
+
 ## Mark engine
 
 With `cua-driver` installed, run the live overlay demo:

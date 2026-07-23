@@ -15,10 +15,6 @@ rem Build output for the current cloud-and-glass voice orb.
 set "ASHA_EXE=interactive\bin\ASHA\asha-live.exe"
 set "ASHA_OVERLAY=overlay\bin\Release\net8.0-windows\asha-overlay.exe"
 
-rem Never start a second orb. Quit the running ASHA first when installing a new build.
-tasklist /FI "IMAGENAME eq asha-live.exe" 2>nul | find /I "asha-live.exe" >nul
-if not errorlevel 1 exit /b 0
-
 if not exist "%ASHA_EXE%" goto build_asha
 for /f "usebackq delims=" %%B in (`powershell -NoProfile -Command "$exe=Get-Item -LiteralPath '%ASHA_EXE%'; $newer=Get-ChildItem -LiteralPath 'interactive' -Recurse -File | Where-Object { $_.FullName -notmatch '\\(?:bin|obj)\\' -and $_.Extension -in '.cs','.xaml','.csproj' -and $_.LastWriteTime -gt $exe.LastWriteTime }; if($newer){'yes'}else{'no'}"`) do set "ASHA_REBUILD=%%B"
 if /I "%ASHA_REBUILD%"=="yes" goto build_asha
@@ -37,6 +33,8 @@ dotnet build overlay\AshaOverlay.csproj --configuration Release
 if errorlevel 1 goto build_failed
 
 :start_asha
+rem ASHA is single-instance. Starting again signals an existing hidden orb to
+rem restore itself from the system tray instead of silently doing nothing.
 start "ASHA" "%ASHA_EXE%"
 exit /b 0
 

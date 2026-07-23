@@ -411,7 +411,31 @@ public partial class MainWindow : Window
     {
         var window = new ConversationWindow(_conversationMessages) { Topmost = Topmost };
         window.Hidden += () => Dispatcher.BeginInvoke(() => OpenChatButton.Visibility = Visibility.Visible);
+        window.MessageSubmitted += SubmitTypedTurnAsync;
         return window;
+    }
+
+    private async void AttachedSend_Click(object sender, RoutedEventArgs e) => await SubmitAttachedComposerAsync();
+
+    private async void AttachedComposer_KeyDown(object sender, KeyEventArgs e)
+    {
+        if (e.Key != Key.Enter || Keyboard.Modifiers.HasFlag(ModifierKeys.Shift)) return;
+        e.Handled = true;
+        await SubmitAttachedComposerAsync();
+    }
+
+    private async Task SubmitAttachedComposerAsync()
+    {
+        var text = AttachedComposerTextBox.Text;
+        if (await SubmitTypedTurnAsync(text)) AttachedComposerTextBox.Clear();
+        AttachedComposerTextBox.Focus();
+    }
+
+    private void SetComposerBusy(bool busy)
+    {
+        AttachedComposerTextBox.IsEnabled = !busy;
+        AttachedSendButton.IsEnabled = !busy;
+        _conversationWindow?.SetComposerEnabled(!busy);
     }
 
     private void AttachedChatResizeThumb_DragDelta(object sender, DragDeltaEventArgs e)
@@ -1408,10 +1432,150 @@ public partial class MainWindow : Window
         if (wasActive) AshaEarcons.ConversationEnded();
     }
 
+    private async Task<bool> SubmitTypedTurnAsync(string? rawText)
+    {
+        var text = NormalizeTypedInput(rawText);
+        if (text.Length == 0) return false;
+        if (_voiceTurnInFlight)
+        {
+            StatusText.Text = "ASHA is finishing the current turn. Your typed message is still in the composer.";
+            return false;
+        }
+
+        var resumeListening = _conversationActive;
+        var assistantReplyStored = false;
+        var turnStage = "storing_typed_turn";
+        _voiceTurnInFlight = true;
+        SetComposerBusy(true);
+        _voiceTurnCancellation = new CancellationTokenSource();
+
+        try
+        {
+            // A live microphone and a typed turn must never race into the same
+            // conversation state. Pause and discard the unfinished audio, then
+            // resume listening after the typed reply when talk mode was active.
+            if (_voiceCapturing)
+            {
+                _voiceCapturing = false;
+                _heardSpeech = false;
+                _speechCandidateFrames = 0;
+                _conversationBoundaryTimer.Stop();
+                try { _ = await _microphone.StopAsync(); }
+                catch (Exception error) { Log($"Microphone pause for typed turn: {error.Message}"); }
+            }
+
+            OrbSurface.SetPresenceState(OrbPresenceState.Thinking);
+            OrbSurface.SetAudioEnergy(0.12);
+            StatusText.Text = "Thinking about your typed message…";
+            await AddConversationAsync("You", text);
+            await MaybeNameActiveSessionAsync(text);
+
+            turnStage = "requesting_model_or_tool_result";
+            var reply = await _voiceSession.RespondToTranscriptAsync(
+                text,
+                ResolveVisionForTranscriptAsync,
+                ExecuteVisualToolAsync,
+                _controlSessionActive,
+                !string.IsNullOrWhiteSpace(_activeSessionId) &&
+                    _preferences.Vision != VisionPreference.Off &&
+                    _preferences.AllowRemoteVision &&
+                    _voiceSession.SupportsVision,
+                _liveAwarenessContext,
+                _voiceTurnCancellation.Token);
+
+            turnStage = "storing_asha_reply";
+            await AddConversationAsync("ASHA", reply);
+            assistantReplyStored = true;
+            if (!string.IsNullOrWhiteSpace(_activeSessionId))
+                _ = RefreshSessionMemoryAsync(_activeSessionId, forceCompression: false);
+
+            if (resumeListening)
+            {
+                OrbSurface.SetPresenceState(OrbPresenceState.Speaking);
+                StatusText.Text = "ASHA is speaking…";
+                turnStage = "playing_speech";
+                await _voiceSession.SpeakAsync(reply, _voiceTurnCancellation.Token);
+            }
+            else
+            {
+                StatusText.Text = "ASHA replied in the conversation.";
+            }
+            return true;
+        }
+        catch (AllGroqKeysRateLimitedException error)
+        {
+            var retryText = error.RetryAtUtc is { } retryAt
+                ? $" Please try again after {retryAt.ToLocalTime():HH:mm}."
+                : " Please try again in a little while.";
+            var reply = $"All of my available connections are temporarily busy.{retryText}";
+            StatusText.Text = reply;
+            await AddConversationAsync("ASHA", reply);
+            assistantReplyStored = true;
+            await RecordTypedTurnFailureAsync(turnStage, error, text);
+            return true;
+        }
+        catch (OperationCanceledException error)
+        {
+            if (_reallyQuitting) return true;
+            await RecordTypedTurnFailureAsync(turnStage, error, text);
+            if (!assistantReplyStored)
+            {
+                const string reply = "Your typed message is saved, but that answer was interrupted before it finished.";
+                await AddConversationAsync("ASHA", reply);
+                StatusText.Text = reply;
+            }
+            return true;
+        }
+        catch (Exception error)
+        {
+            await RecordTypedTurnFailureAsync(turnStage, error, text);
+            Log($"Typed turn failed during {turnStage}: {SanitizeTurnDiagnostic(error.Message)}");
+            if (!assistantReplyStored)
+            {
+                const string reply = "I have your typed message, but I couldn't finish the answer. I didn't perform any unverified desktop action.";
+                await AddConversationAsync("ASHA", reply);
+                StatusText.Text = reply;
+            }
+            return true;
+        }
+        finally
+        {
+            OrbSurface.SetAudioEnergy(0);
+            OrbSurface.SetPresenceState(OrbPresenceState.Idle);
+            _voiceTurnCancellation?.Dispose();
+            _voiceTurnCancellation = null;
+            _voiceTurnInFlight = false;
+            SetComposerBusy(false);
+            if (resumeListening && _conversationActive && !_reallyQuitting && _voiceSession.IsGroqConfigured)
+                _ = ResumeFreeConversationAsync();
+        }
+    }
+
+    internal static string NormalizeTypedInput(string? text) =>
+        string.IsNullOrWhiteSpace(text) ? string.Empty : text.Trim();
+
+    private Task RecordTypedTurnFailureAsync(string stage, Exception error, string text) =>
+        RecordActiveSessionEventAsync(
+            "conversation.turn_failed",
+            "ASHA retained a failed typed turn instead of silently dropping it.",
+            "system",
+            "diagnose_typed_turn",
+            target: new { app = "ASHA", label = stage, control = "typed_turn" },
+            content: string.Join(
+                Environment.NewLine,
+                $"stage: {stage}",
+                $"error type: {error.GetType().Name}",
+                $"diagnostic: {SanitizeTurnDiagnostic(error.Message)}",
+                $"typed message retained: {text.Length > 0}",
+                "desktop action performed: not claimed"));
+
     private async Task CompleteVoiceTurnAsync()
     {
         if (!_voiceCapturing || _voiceTurnInFlight) return;
         var preserveFinalStatus = false;
+        var turnStage = "capturing_audio";
+        string? transcript = null;
+        var assistantReplyStored = false;
         _voiceCapturing = false;
         _voiceTurnInFlight = true;
         _conversationBoundaryTimer.Stop();
@@ -1430,7 +1594,8 @@ public partial class MainWindow : Window
             OrbSurface.SetPresenceState(OrbPresenceState.Thinking);
             OrbSurface.SetAudioEnergy(0.16);
             StatusText.Text = "Thinking…";
-            var transcript = await _voiceSession.TranscribeTurnAsync(wav, _voiceTurnCancellation.Token);
+            turnStage = "transcribing_speech";
+            transcript = await _voiceSession.TranscribeTurnAsync(wav, _voiceTurnCancellation.Token);
             if (string.IsNullOrWhiteSpace(transcript))
             {
                 StatusText.Text = "I did not catch that. I am still listening—please try again.";
@@ -1440,9 +1605,11 @@ public partial class MainWindow : Window
             // Persist and show what the person said before any visual or model
             // follow-up. If a provider call later fails, the spoken turn is
             // still visible, reviewable, and part of the full session log.
+            turnStage = "storing_human_turn";
             await AddConversationAsync("You", transcript);
             await MaybeNameActiveSessionAsync(transcript);
 
+            turnStage = "requesting_model_or_tool_result";
             var reply = await _voiceSession.RespondToTranscriptAsync(
                 transcript,
                 ResolveVisionForTranscriptAsync,
@@ -1454,12 +1621,15 @@ public partial class MainWindow : Window
                     _voiceSession.SupportsVision,
                 _liveAwarenessContext,
                 _voiceTurnCancellation.Token);
+            turnStage = "storing_asha_reply";
             await AddConversationAsync("ASHA", reply);
+            assistantReplyStored = true;
             if (!string.IsNullOrWhiteSpace(_activeSessionId))
                 _ = RefreshSessionMemoryAsync(_activeSessionId, forceCompression: false);
 
             OrbSurface.SetPresenceState(OrbPresenceState.Speaking);
             StatusText.Text = "ASHA is speaking…";
+            turnStage = "playing_speech";
 
             // Continuous visual awareness gets one bounded opportunity while
             // ASHA is already speaking. It is cancelled as soon as speech
@@ -1481,6 +1651,7 @@ public partial class MainWindow : Window
         {
             preserveFinalStatus = true;
             _conversationActive = false;
+            await RecordVoiceTurnFailureAsync(turnStage, error, transcript);
             var retryText = error.RetryAtUtc is { } retryAt
                 ? $" Please try again after {retryAt.ToLocalTime():HH:mm}."
                 : " Please try again in a little while.";
@@ -1489,6 +1660,7 @@ public partial class MainWindow : Window
             AwarenessStatusText.Text = "Automatic visual updates are paused while all configured model connections cool down.";
             Log($"All {_voiceSession.GroqKeyCount} configured Groq keys are rate-limited; ASHA returned to a calm idle state.");
             await AddConversationAsync("ASHA", reply);
+            assistantReplyStored = true;
             try
             {
                 OrbSurface.SetPresenceState(OrbPresenceState.Speaking);
@@ -1503,10 +1675,12 @@ public partial class MainWindow : Window
         {
             preserveFinalStatus = true;
             _conversationActive = false;
+            await RecordVoiceTurnFailureAsync(turnStage, error, transcript);
             const string reply = "I cannot reach my model connections right now. Your words are saved, and you can try again shortly.";
             StatusText.Text = reply;
             Log($"Groq key-ring network error: {error.Message}");
             await AddConversationAsync("ASHA", reply);
+            assistantReplyStored = true;
             try
             {
                 OrbSurface.SetPresenceState(OrbPresenceState.Speaking);
@@ -1517,15 +1691,20 @@ public partial class MainWindow : Window
                 Log($"Could not speak the connection notice: {speechError.Message}");
             }
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException error)
         {
-            // The app is closing or the current turn was deliberately cancelled.
+            // Closing ASHA or tapping its centre deliberately cancels a turn.
+            // Any other cancellation is a failed turn and must never disappear.
+            if (_conversationActive && !_reallyQuitting)
+            {
+                preserveFinalStatus = true;
+                await HandleVoiceTurnFailureAsync(turnStage, error, transcript, assistantReplyStored);
+            }
         }
         catch (Exception error)
         {
             preserveFinalStatus = true;
-            StatusText.Text = ShortReason(error);
-            Log($"Voice turn error: {error.Message}");
+            await HandleVoiceTurnFailureAsync(turnStage, error, transcript, assistantReplyStored);
         }
         finally
         {
@@ -1547,6 +1726,68 @@ public partial class MainWindow : Window
                      !StatusText.Text.Contains("unavailable", StringComparison.OrdinalIgnoreCase))
                 StatusText.Text = _voiceSession.IsGroqConfigured ? "Tap the orb to start listening." : "Configure Groq, then restart ASHA.";
         }
+    }
+
+    private async Task HandleVoiceTurnFailureAsync(
+        string stage,
+        Exception error,
+        string? transcript,
+        bool assistantReplyStored)
+    {
+        await RecordVoiceTurnFailureAsync(stage, error, transcript);
+        Log($"Voice turn failed during {stage}: {SanitizeTurnDiagnostic(error.Message)}");
+
+        if (assistantReplyStored)
+        {
+            StatusText.Text = "My answer is in the conversation, but I could not play it aloud.";
+            return;
+        }
+
+        const string reply = "I heard you, but I couldn't finish that answer. I didn't perform any desktop action. Please try once more.";
+        StatusText.Text = reply;
+        await AddConversationAsync("ASHA", reply);
+        try
+        {
+            using var speechTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+            OrbSurface.SetPresenceState(OrbPresenceState.Speaking);
+            await _voiceSession.SpeakAsync(reply, speechTimeout.Token);
+        }
+        catch (Exception speechError)
+        {
+            Log($"Could not speak the failed-turn notice: {SanitizeTurnDiagnostic(speechError.Message)}");
+        }
+    }
+
+    private async Task RecordVoiceTurnFailureAsync(string stage, Exception error, string? transcript)
+    {
+        var diagnostic = SanitizeTurnDiagnostic(error.Message);
+        var diagnosticContent = string.Join(
+            Environment.NewLine,
+            $"stage: {stage}",
+            $"error type: {error.GetType().Name}",
+            $"diagnostic: {diagnostic}",
+            $"transcript retained: {!string.IsNullOrWhiteSpace(transcript)}",
+            "desktop action performed: false");
+        await RecordActiveSessionEventAsync(
+            "voice.turn_failed",
+            "ASHA retained a failed conversational turn instead of silently dropping it.",
+            "system",
+            "diagnose_voice_turn",
+            target: new
+            {
+                app = "ASHA",
+                label = stage,
+                control = "voice_turn",
+            },
+            content: diagnosticContent);
+    }
+
+    internal static string SanitizeTurnDiagnostic(string? message)
+    {
+        var value = string.IsNullOrWhiteSpace(message) ? "No diagnostic detail was available." : message.Trim();
+        value = Regex.Replace(value, @"\bgsk_[A-Za-z0-9_-]+\b", "gsk_[redacted]", RegexOptions.CultureInvariant);
+        value = Regex.Replace(value, @"(?i)\bBearer\s+[A-Za-z0-9._~-]+", "Bearer [redacted]", RegexOptions.CultureInvariant);
+        return value.Length <= 500 ? value : value[..500] + "…";
     }
 
     private async Task RefreshPendingLiveAwarenessDuringReplyAsync(CancellationToken cancellationToken)
@@ -2606,13 +2847,13 @@ public partial class MainWindow : Window
         };
     }
 
-    private static VisionRequestScope ResolveVisionScope(string transcript, VisionRequestScope requested, AwarenessScene? scene)
+    internal static VisionRequestScope ResolveVisionScope(string transcript, VisionRequestScope requested, AwarenessScene? scene)
     {
         if (string.IsNullOrWhiteSpace(transcript)) return requested;
         var text = transcript.Trim();
         var explicitlyPointerBound = Regex.IsMatch(
             text,
-            @"\b(mouse|cursor|pointer|mouse\s+pointer|maus|mauszeiger|cursor|zeiger)\b|\b(where\s+i(?:'m|\s+am)\s+(?:looking|pointing))\b|\b(here|hier|this\s+(?:spot|area)|diese\s+stelle)\b",
+            @"\b(?:under|near|around|beside|at)\s+(?:my|the)\s+(?:mouse|cursor|pointer)\b|\bwhere\s+i(?:'m|\s+am)\s+(?:looking|pointing)\b|\b(?:right\s+)?here\b|\bthis\s+(?:spot|area)\b|\b(?:unter|neben|bei|um)\s+(?:meine[rnm]?|der|die|dem)\s*(?:maus|mauszeiger|cursor|zeiger)\b|\b(?:genau\s+)?hier\b|\bdiese\s+stelle\b",
             RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
         if (explicitlyPointerBound) return VisionRequestScope.PointerArea;
 
@@ -2748,39 +2989,64 @@ public partial class MainWindow : Window
             return JsonSerializer.Serialize(new { ok = false, error = "An active session and coordinate-mapped visual evidence are required." });
         if (!TryReadToolString(call.Arguments, "kind", out var kind) || !new[] { "dot", "circle", "box", "arrow", "label" }.Contains(kind, StringComparer.Ordinal))
             return JsonSerializer.Serialize(new { ok = false, error = "Choose dot, circle, box, arrow, or label." });
-        if (!TryReadToolCoordinate(call.Arguments, "x", out var imageX) || !TryReadToolCoordinate(call.Arguments, "y", out var imageY))
+        var hasBundledBox = TryReadBundledImageBox(call.Arguments, "x", "y", out var bundledLeft, out var bundledTop, out var bundledRight, out var bundledBottom);
+        int imageX;
+        int imageY;
+        if (hasBundledBox && kind is "box" or "arrow")
+        {
+            imageX = bundledLeft;
+            imageY = bundledTop;
+        }
+        else if (!TryReadImagePoint(call.Arguments, "x", "y", out imageX, out imageY))
             return JsonSerializer.Serialize(new { ok = false, error = "Visual guidance requires a point inside the supplied image." });
 
         var label = TryReadToolString(call.Arguments, "label", out var suppliedLabel) && suppliedLabel.Length <= 80 ? suppliedLabel : null;
+        var visibleText = TryReadToolString(call.Arguments, "visible_text", out var suppliedVisibleText) && suppliedVisibleText.Length <= 120
+            ? suppliedVisibleText
+            : label;
         var requiresTextGrounding = TryReadToolString(call.Arguments, "target_type", out var targetType) &&
                                     string.Equals(targetType, "text", StringComparison.Ordinal);
         int? imageWidth = null;
         int? imageHeight = null;
         if (kind == "box")
         {
-            if (!TryReadToolDimension(call.Arguments, "w", 2, vision.ImageWidth, out imageWidth) ||
-                !TryReadToolDimension(call.Arguments, "h", 2, vision.ImageHeight, out imageHeight) ||
+            var hasExplicitSize = TryReadToolDimension(call.Arguments, "w", 2, vision.ImageWidth, out imageWidth) &&
+                                  TryReadToolDimension(call.Arguments, "h", 2, vision.ImageHeight, out imageHeight);
+            if (!hasExplicitSize && hasBundledBox)
+            {
+                imageWidth = Math.Abs(bundledRight - bundledLeft);
+                imageHeight = Math.Abs(bundledBottom - bundledTop);
+                imageX = Math.Min(bundledLeft, bundledRight);
+                imageY = Math.Min(bundledTop, bundledBottom);
+            }
+            if (imageWidth is null or < 2 || imageHeight is null or < 2 ||
                 imageX + imageWidth > vision.ImageWidth || imageY + imageHeight > vision.ImageHeight)
                 return JsonSerializer.Serialize(new { ok = false, error = "A box must fit inside the supplied image." });
         }
         else if (kind == "arrow")
         {
-            if (!TryReadToolSignedDimension(call.Arguments, "w", -vision.ImageWidth, vision.ImageWidth, out imageWidth) ||
-                !TryReadToolSignedDimension(call.Arguments, "h", -vision.ImageHeight, vision.ImageHeight, out imageHeight) ||
+            var hasExplicitVector = TryReadToolSignedDimension(call.Arguments, "w", -vision.ImageWidth, vision.ImageWidth, out imageWidth) &&
+                                    TryReadToolSignedDimension(call.Arguments, "h", -vision.ImageHeight, vision.ImageHeight, out imageHeight);
+            if (!hasExplicitVector && hasBundledBox)
+            {
+                imageWidth = bundledRight - bundledLeft;
+                imageHeight = bundledBottom - bundledTop;
+            }
+            if (imageWidth is null || imageHeight is null ||
                 (imageWidth == 0 && imageHeight == 0) ||
                 !vision.TryMapImagePoint(imageX + imageWidth!.Value, imageY + imageHeight!.Value, out _, out _))
                 return JsonSerializer.Serialize(new { ok = false, error = "An arrow and its tip must fit inside the supplied image." });
         }
 
         var grounding = "model_coordinates";
-        if (kind == "box" && !string.IsNullOrWhiteSpace(label))
+        if (kind == "box" && !string.IsNullOrWhiteSpace(visibleText))
         {
             OcrTextMatch? match = null;
             try
             {
                 match = await LocalOcrGrounder.FindNearestAsync(
                     vision.Bytes,
-                    label,
+                    visibleText,
                     imageX + (imageWidth!.Value / 2),
                     imageY + (imageHeight!.Value / 2),
                     cancellationToken);
@@ -2805,7 +3071,7 @@ public partial class MainWindow : Window
                 return JsonSerializer.Serialize(new
                 {
                     ok = false,
-                    error = $"ASHA could not verify the visible text {label} in the selected view, so no mark was shown.",
+                    error = $"ASHA could not verify the visible text {visibleText} in the selected view, so no mark was shown.",
                 });
         }
 
@@ -3047,6 +3313,13 @@ public partial class MainWindow : Window
             exposedSurface = ResolveTopmostSurface(new NativePoint { X = input.X.Value, Y = input.Y.Value });
             if (exposedSurface is null)
                 return JsonSerializer.Serialize(new { ok = false, error = "Windows could not verify a visible top-layer surface at that target." });
+            if (TryReadToolString(call.Arguments, "expected_app", out var expectedApp) &&
+                !SurfaceMatchesExpectedApplication(expectedApp, exposedSurface))
+                return JsonSerializer.Serialize(new
+                {
+                    ok = false,
+                    error = $"The target is no longer exposed in {expectedApp}; {exposedSurface.DisplayName} is currently on top there.",
+                });
         }
         else if (action is "type_text" or "key" && _awarenessCoordinator.Current?.Foreground is { } focused)
         {
@@ -3112,9 +3385,77 @@ public partial class MainWindow : Window
     {
         x = 0;
         y = 0;
-        return TryReadToolCoordinate(arguments, xName, out var imageX) &&
-               TryReadToolCoordinate(arguments, yName, out var imageY) &&
+        return TryReadImagePoint(arguments, xName, yName, out var imageX, out var imageY) &&
                vision.TryMapImagePoint(imageX, imageY, out x, out y);
+    }
+
+    private static bool TryReadImagePoint(JsonElement arguments, string xName, string yName, out int imageX, out int imageY)
+    {
+        imageX = 0;
+        imageY = 0;
+        if (arguments.TryGetProperty(xName, out var bundled) && bundled.ValueKind == JsonValueKind.Array)
+        {
+            if (!TryReadNumberArray(bundled, out var coordinates) || coordinates.Length is not (2 or 4)) return false;
+            var hasY = arguments.TryGetProperty(yName, out var rawY);
+            if (hasY && rawY.ValueKind == JsonValueKind.Array &&
+                TryReadNumberArray(rawY, out var duplicated) &&
+                duplicated.SequenceEqual(coordinates))
+            {
+                hasY = false;
+            }
+            if (!hasY)
+            {
+                if (coordinates.Length == 2)
+                {
+                    imageX = (int)Math.Round(coordinates[0]);
+                    imageY = (int)Math.Round(coordinates[1]);
+                }
+                else
+                {
+                    imageX = (int)Math.Round((coordinates[0] + coordinates[2]) / 2d);
+                    imageY = (int)Math.Round((coordinates[1] + coordinates[3]) / 2d);
+                }
+                return true;
+            }
+        }
+
+        return TryReadToolCoordinate(arguments, xName, out imageX) &&
+               TryReadToolCoordinate(arguments, yName, out imageY);
+    }
+
+    private static bool TryReadBundledImageBox(JsonElement arguments, string xName, string yName, out int left, out int top, out int right, out int bottom)
+    {
+        left = top = right = bottom = 0;
+        if (!arguments.TryGetProperty(xName, out var bundled) ||
+            bundled.ValueKind != JsonValueKind.Array ||
+            !TryReadNumberArray(bundled, out var coordinates) ||
+            coordinates.Length != 4) return false;
+        if (arguments.TryGetProperty(yName, out var rawY))
+        {
+            if (rawY.ValueKind != JsonValueKind.Array ||
+                !TryReadNumberArray(rawY, out var duplicated) ||
+                !duplicated.SequenceEqual(coordinates)) return false;
+        }
+        left = (int)Math.Round(coordinates[0]);
+        top = (int)Math.Round(coordinates[1]);
+        right = (int)Math.Round(coordinates[2]);
+        bottom = (int)Math.Round(coordinates[3]);
+        return true;
+    }
+
+    private static bool TryReadNumberArray(JsonElement raw, out double[] values)
+    {
+        values = [];
+        if (raw.ValueKind != JsonValueKind.Array) return false;
+        var elements = raw.EnumerateArray().ToArray();
+        values = new double[elements.Length];
+        for (var index = 0; index < elements.Length; index++)
+        {
+            if (elements[index].ValueKind != JsonValueKind.Number ||
+                !elements[index].TryGetDouble(out values[index]) ||
+                !double.IsFinite(values[index])) return false;
+        }
+        return true;
     }
 
     private static string? ExpectedAppFromWindowLabel(string? label)
@@ -3168,9 +3509,36 @@ public partial class MainWindow : Window
     private static bool TryReadToolCoordinate(JsonElement arguments, string name, out int value)
     {
         value = 0;
-        if (!arguments.TryGetProperty(name, out var raw) || raw.ValueKind != JsonValueKind.Number || !raw.TryGetDouble(out var number) || !double.IsFinite(number)) return false;
-        value = (int)Math.Round(number);
+        if (!arguments.TryGetProperty(name, out var raw)) return false;
+        if (raw.ValueKind == JsonValueKind.Number && raw.TryGetDouble(out var number) && double.IsFinite(number))
+        {
+            value = (int)Math.Round(number);
+            return true;
+        }
+        if (raw.ValueKind != JsonValueKind.Array) return false;
+        var interval = raw.EnumerateArray().ToArray();
+        if (interval.Length is < 1 or > 2) return false;
+        var values = new double[interval.Length];
+        for (var index = 0; index < interval.Length; index++)
+        {
+            if (interval[index].ValueKind != JsonValueKind.Number ||
+                !interval[index].TryGetDouble(out values[index]) ||
+                !double.IsFinite(values[index])) return false;
+        }
+        value = (int)Math.Round(values.Average());
         return true;
+    }
+
+    internal static bool TryReadToolCoordinateForTesting(string json, string name, out int value)
+    {
+        using var document = JsonDocument.Parse(json);
+        return TryReadToolCoordinate(document.RootElement, name, out value);
+    }
+
+    internal static bool TryReadImagePointForTesting(string json, string xName, string yName, out int x, out int y)
+    {
+        using var document = JsonDocument.Parse(json);
+        return TryReadImagePoint(document.RootElement, xName, yName, out x, out y);
     }
 
     private static bool TryReadToolDimension(JsonElement arguments, string name, int minimum, int maximum, out int? value)
@@ -3364,6 +3732,8 @@ public partial class MainWindow : Window
         if (string.IsNullOrWhiteSpace(text)) return;
         var message = new ConversationMessage(DateTime.Now, speaker, text);
         _conversationMessages.Add(message);
+        AttachedChatList.ScrollIntoView(message);
+        _conversationWindow?.ScrollToLatest();
         Log($"{speaker}: {text}");
         var sessionId = _activeSessionId;
         if (!string.IsNullOrWhiteSpace(sessionId))

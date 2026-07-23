@@ -343,6 +343,7 @@
                             <Grid.RowDefinitions>
                                 <RowDefinition Height="Auto" />
                                 <RowDefinition Height="*" />
+                                <RowDefinition Height="Auto" />
                                 <RowDefinition Height="15" />
                             </Grid.RowDefinitions>
                             <Grid Grid.Row="0">
@@ -375,7 +376,20 @@
                                     </DataTemplate>
                                 </ListBox.ItemTemplate>
                             </ListBox>
-                            <primitives:Thumb Grid.Row="2" Cursor="SizeNS" DragDelta="AttachedChatResizeThumb_DragDelta" ToolTip="Drag to resize chat">
+                            <Border Grid.Row="2" Margin="0,7,0,0" Padding="8,5" CornerRadius="13" Background="#FFFFFFFF" BorderBrush="#B7D9F5" BorderThickness="1">
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+                                    <TextBox x:Name="AttachedComposerTextBox" MinHeight="28" MaxHeight="76" Padding="4,4" BorderThickness="0" Background="Transparent"
+                                             VerticalContentAlignment="Center" VerticalScrollBarVisibility="Auto" TextWrapping="Wrap" AcceptsReturn="True"
+                                             MaxLength="4000" KeyDown="AttachedComposer_KeyDown" ToolTip="Type to ASHA. Enter sends; Shift+Enter starts a new line." />
+                                    <Button x:Name="AttachedSendButton" Grid.Column="1" Margin="7,0,0,0" Padding="11,4" VerticalAlignment="Bottom"
+                                            Click="AttachedSend_Click" ToolTip="Send typed message">Send</Button>
+                                </Grid>
+                            </Border>
+                            <primitives:Thumb Grid.Row="3" Cursor="SizeNS" DragDelta="AttachedChatResizeThumb_DragDelta" ToolTip="Drag to resize chat">
                                 <primitives:Thumb.Template>
                                     <ControlTemplate TargetType="primitives:Thumb">
                                         <Border Padding="0,6,0,0">

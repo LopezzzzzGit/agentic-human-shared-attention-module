@@ -1,0 +1,20 @@
+{
+  "name": "agentic-human-shared-attention",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A shared visual language for computer-use agents and humans.",
+  "bin": {
+    "asha": "./bin/asha.mjs"
+  },
+  "engines": {
+    "node": ">=22.6.0"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.ts",
+    "demo:marks": "node demo/marks-demo.ts",
+    "build:recorder": "dotnet build teach-recorder/TeachRecorder.csproj --configuration Release",
+    "build:overlay": "dotnet build overlay/AshaOverlay.csproj --configuration Release",
+    "build:live": "npm run build:overlay && dotnet build interactive/AshaLive.csproj --configuration Release"
+  }
+}

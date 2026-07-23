@@ -1,0 +1,457 @@
+<Window x:Class="AshaLive.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:primitives="clr-namespace:System.Windows.Controls.Primitives;assembly=PresentationFramework"
+        xmlns:local="clr-namespace:AshaLive"
+        Title="ASHA" Width="270" Height="270" MinWidth="270" MinHeight="270"
+        WindowStyle="None" ResizeMode="NoResize" AllowsTransparency="True" Background="Transparent"
+        ShowInTaskbar="True" Topmost="True" WindowStartupLocation="CenterScreen"
+        Loaded="Window_Loaded" Closing="Window_Closing">
+    <Window.Resources>
+        <Style TargetType="Button">
+            <Setter Property="Padding" Value="11,7" />
+            <Setter Property="Background" Value="#F8FBFFFF" />
+            <Setter Property="BorderBrush" Value="#5B8ED9" />
+            <Setter Property="Foreground" Value="#163969" />
+            <Setter Property="FontWeight" Value="SemiBold" />
+            <Setter Property="Cursor" Value="Hand" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="Surface" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}"
+                                BorderThickness="1" CornerRadius="12" Padding="{TemplateBinding Padding}">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center" />
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="Surface" Property="Background" Value="#DDEEFF" />
+                            </Trigger>
+                            <Trigger Property="IsPressed" Value="True">
+                                <Setter TargetName="Surface" Property="Background" Value="#C9E2FF" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+        <Style x:Key="HeaderIconButton" TargetType="Button">
+            <Setter Property="Width" Value="32" />
+            <Setter Property="Height" Value="32" />
+            <Setter Property="Padding" Value="4" />
+            <Setter Property="Background" Value="Transparent" />
+            <Setter Property="BorderBrush" Value="Transparent" />
+            <Setter Property="Foreground" Value="#1F5797" />
+            <Setter Property="FontWeight" Value="SemiBold" />
+            <Setter Property="Cursor" Value="Hand" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="Surface" Background="{TemplateBinding Background}" CornerRadius="16" Padding="{TemplateBinding Padding}">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center" />
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="Surface" Property="Background" Value="#D7EBFB" />
+                            </Trigger>
+                            <Trigger Property="IsPressed" Value="True">
+                                <Setter TargetName="Surface" Property="Background" Value="#BEDDF7" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+        <Style x:Key="ProfileChoiceButton" TargetType="Button" BasedOn="{StaticResource {x:Type Button}}">
+            <Setter Property="HorizontalContentAlignment" Value="Left" />
+            <Setter Property="Margin" Value="0,7,0,0" />
+            <Setter Property="Padding" Value="10,8" />
+        </Style>
+    </Window.Resources>
+
+    <Grid Width="270" Height="270">
+        <local:AshaOrbSurface x:Name="OrbSurface" Width="244" Height="244" HorizontalAlignment="Center" VerticalAlignment="Center"
+                              MouseLeftButtonDown="Orb_MouseLeftButtonDown"
+                              MouseLeftButtonUp="Orb_MouseLeftButtonUp"
+                              MouseMove="Orb_MouseMove"
+                              MouseRightButtonDown="Orb_MouseRightButtonDown" />
+
+        <Popup x:Name="ControlsPopup" Placement="AbsolutePoint"
+               AllowsTransparency="True" StaysOpen="True" PopupAnimation="Fade"
+               Opened="ControlsPopup_Opened">
+            <Border Width="346" Padding="18" CornerRadius="24" Background="#ECF9FEFF" BorderBrush="#B7D9F5" BorderThickness="1"
+                    PreviewMouseDown="ControlsPopup_ContentMouseDown">
+                <Border.Effect>
+                    <DropShadowEffect BlurRadius="28" ShadowDepth="8" Opacity="0.23" Color="#173E70" />
+                </Border.Effect>
+                <Grid>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                    </Grid.RowDefinitions>
+
+                    <Grid Grid.Row="0">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+                        <Border x:Name="ControlsDragHandle" Grid.Column="0" Background="Transparent" Cursor="SizeAll"
+                                MouseLeftButtonDown="ControlsHeader_MouseLeftButtonDown"
+                                MouseMove="ControlsHeader_MouseMove"
+                                MouseLeftButtonUp="ControlsHeader_MouseLeftButtonUp">
+                            <StackPanel>
+                                <TextBlock FontSize="18" FontWeight="SemiBold" Foreground="#12355E">ASHA</TextBlock>
+                                <TextBlock Margin="0,2,0,0" FontSize="12" Foreground="#58708B">shared attention</TextBlock>
+                            </StackPanel>
+                        </Border>
+                        <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Top" Margin="0,-3,0,0">
+                            <Button Style="{StaticResource HeaderIconButton}" Margin="0,0,3,0" Click="Profile_Click" ToolTip="Profile">◉</Button>
+                            <Button Style="{StaticResource HeaderIconButton}" Margin="0,0,3,0" Click="Sessions_Click" ToolTip="Sessions">▤</Button>
+                            <Button Style="{StaticResource HeaderIconButton}" Margin="0,0,3,0" Click="Settings_Click" ToolTip="Global settings">⚙</Button>
+                            <Button Style="{StaticResource HeaderIconButton}" Margin="0,0,3,0" Click="HideControls_Click" ToolTip="Hide this menu; keep the orb available">—</Button>
+                            <Button Style="{StaticResource HeaderIconButton}" Click="Quit_Click" ToolTip="Quit ASHA">⏻</Button>
+                        </StackPanel>
+                    </Grid>
+
+                    <Border Grid.Row="1" Height="142" Margin="0,16,0,0" Padding="12" CornerRadius="15" Background="#DFF2FF" BorderBrush="#C2E0F3" BorderThickness="1">
+                        <StackPanel>
+                            <TextBlock FontWeight="SemiBold" Foreground="#214E7D">Live voice</TextBlock>
+                            <ScrollViewer Height="34" Margin="0,3,0,0" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+                                <TextBlock x:Name="StatusText" FontSize="12" TextWrapping="Wrap" Foreground="#4B6683" />
+                            </ScrollViewer>
+                            <ScrollViewer Height="27" Margin="0,7,0,0" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+                                <TextBlock x:Name="CurrentSessionText" FontSize="10" TextWrapping="Wrap" Foreground="#295A8D"
+                                           Text="Session: none — the next conversation starts one" />
+                            </ScrollViewer>
+                            <TextBlock Margin="0,10,0,0" FontSize="11" Foreground="#62788D" TextWrapping="Wrap">Tap once to talk · ASHA detects pauses · centre ends</TextBlock>
+                        </StackPanel>
+                    </Border>
+
+                    <Border x:Name="ProfilePanel" Grid.Row="2" Margin="0,13,0,0" Padding="12" CornerRadius="15" Background="#F6FBFFFF" BorderBrush="#C9DFF2" BorderThickness="1" Visibility="Collapsed">
+                        <StackPanel>
+                            <TextBlock FontWeight="SemiBold" Foreground="#214E7D">Profile and control</TextBlock>
+                            <TextBlock Margin="0,4,0,0" FontSize="12" Foreground="#526A84" TextWrapping="Wrap"
+                                       Text="Choose what ASHA may do when you ask. This never grants hidden desktop control." />
+                            <Button x:Name="ObserveProfileButton" Style="{StaticResource ProfileChoiceButton}" Tag="Observe" Click="ProfileChoice_Click">
+                                <StackPanel>
+                                    <TextBlock FontWeight="SemiBold">Observe</TextBlock>
+                                    <TextBlock FontSize="11" FontWeight="Normal" Text="Conversation, virtual pointer, dots, boxes, arrows, and questions only." />
+                                </StackPanel>
+                            </Button>
+                            <Button x:Name="TeachProfileButton" Style="{StaticResource ProfileChoiceButton}" Tag="Teach" Click="ProfileChoice_Click">
+                                <StackPanel>
+                                    <TextBlock FontWeight="SemiBold">Teach ASHA</TextBlock>
+                                    <TextBlock FontSize="11" FontWeight="Normal" Text="Your demonstrations become private, reusable procedures after review." />
+                                </StackPanel>
+                            </Button>
+                            <Button x:Name="AssistProfileButton" Style="{StaticResource ProfileChoiceButton}" Tag="Assist" Click="ProfileChoice_Click">
+                                <StackPanel>
+                                    <TextBlock FontWeight="SemiBold">Assist</TextBlock>
+                                    <TextBlock FontSize="11" FontWeight="Normal" Text="ASHA may propose a learned procedure; a visible control lease is still required to act." />
+                                </StackPanel>
+                            </Button>
+                            <TextBlock x:Name="ProfileStatusText" Margin="0,10,0,0" FontSize="11" Foreground="#62788D" TextWrapping="Wrap" />
+                            <Border Margin="0,11,0,0" Padding="10" CornerRadius="12" Background="#EEF8FF" BorderBrush="#C9DFF2" BorderThickness="1">
+                                <StackPanel>
+                                    <TextBlock FontWeight="SemiBold" Foreground="#214E7D">Shared-attention session</TextBlock>
+                                    <TextBlock Margin="0,3,0,0" FontSize="11" Foreground="#526A84" TextWrapping="Wrap"
+                                               Text="Conversation alone stays casual. Start a session when you want ASHA to keep the chat, cues, and teaching events together locally for review." />
+                                    <StackPanel Orientation="Horizontal" Margin="0,9,0,0">
+                                        <Button x:Name="SessionButton" Padding="9,5" Click="Session_Click">Start session</Button>
+                                        <Button Margin="8,0,0,0" Padding="9,5" Click="Sessions_Click">Open sessions</Button>
+                                    </StackPanel>
+                                    <TextBlock x:Name="SessionStatusText" Margin="0,8,0,0" FontSize="11" Foreground="#62788D" TextWrapping="Wrap"
+                                               Text="No durable session is active." />
+                                </StackPanel>
+                            </Border>
+                            <Border Margin="0,11,0,0" Padding="10" CornerRadius="12" Background="#EAF6FFFF" BorderBrush="#C9DFF2" BorderThickness="1">
+                                <StackPanel>
+                                    <TextBlock FontWeight="SemiBold" Foreground="#214E7D">Mechanical teaching</TextBlock>
+                                    <TextBlock Margin="0,3,0,0" FontSize="11" Foreground="#526A84" TextWrapping="Wrap"
+                                               Text="Start teaching records your demonstration. Use dots, circles, boxes, or arrows to point out meaningful places; they become timeline anchors. F8 is only a keyboard pointing fallback, F9 returns to demonstration, and Esc stops. Password fields are redacted." />
+                                    <StackPanel Orientation="Horizontal" Margin="0,9,0,0">
+                                        <Button x:Name="StartTeachingButton" Padding="9,5" Click="StartTeaching_Click">Start teaching</Button>
+                                        <Button x:Name="ReviewTeachingButton" Padding="9,5" Margin="8,0,0,0" Click="ReviewTeaching_Click" IsEnabled="False">Review timeline</Button>
+                                        <Button x:Name="CompileTeachingButton" Padding="9,5" Margin="8,0,0,0" Click="CompileTeaching_Click" IsEnabled="False">Create reviewed draft</Button>
+                                    </StackPanel>
+                                    <TextBlock x:Name="TeachingStatusText" Margin="0,8,0,0" FontSize="11" Foreground="#62788D" TextWrapping="Wrap"
+                                               Text="No teaching recording yet." />
+                                </StackPanel>
+                            </Border>
+                            <Border Margin="0,11,0,0" Padding="10" CornerRadius="12" Background="#F2F0FFFF" BorderBrush="#D5CEF9" BorderThickness="1">
+                                <StackPanel>
+                                <TextBlock FontWeight="SemiBold" Foreground="#3B347D">Computer control</TextBlock>
+                                <TextBlock Margin="0,3,0,0" FontSize="11" Foreground="#5E5A7F" TextWrapping="Wrap"
+                                               Text="Starts a temporary control lease for the capabilities you have allowed in Settings. Ending the lease leaves those global limits unchanged." />
+                                    <Button x:Name="ControlSessionButton" Margin="0,9,0,0" Padding="9,5" HorizontalAlignment="Left" Click="ControlSession_Click">Enable computer control</Button>
+                                    <TextBlock x:Name="ControlSessionStatusText" Margin="0,8,0,0" FontSize="11" Foreground="#5E5A7F" TextWrapping="Wrap"
+                                               Text="Computer control is disabled." />
+                                </StackPanel>
+                            </Border>
+                        </StackPanel>
+                    </Border>
+
+                    <StackPanel x:Name="SettingsPanel" Grid.Row="3" Margin="0,13,0,0" Visibility="Collapsed">
+                        <TextBlock FontWeight="SemiBold" Foreground="#214E7D">Global settings</TextBlock>
+                        <TextBlock Margin="0,4,0,0" FontSize="12" Foreground="#526A84" TextWrapping="Wrap"
+                                   Text="Microphone, speakers, local speech services, hotkeys, privacy, and shared-attention diagnostics." />
+
+                        <Border Margin="0,12,0,0" Padding="12" CornerRadius="15" Background="#F6FBFFFF" BorderBrush="#C9DFF2" BorderThickness="1">
+                            <StackPanel>
+                                <TextBlock FontWeight="SemiBold" Foreground="#214E7D">Desktop awareness</TextBlock>
+                                <TextBlock Margin="0,4,0,0" FontSize="11" Foreground="#62788D" TextWrapping="Wrap"
+                                           Text="During an intentional session, ASHA keeps small local samples in memory. Images leave this computer only through the separate permissions below." />
+                                <ComboBox x:Name="VisionModeBox" Margin="0,9,0,0" SelectionChanged="VisionModeBox_SelectionChanged">
+                                    <ComboBoxItem Tag="Off" Content="Off — no desktop frames" />
+                                    <ComboBoxItem Tag="OnChange" Content="Session awareness — low-resource local samples" />
+                                    <ComboBoxItem Tag="Live" Content="Live — fast local awareness" />
+                                </ComboBox>
+                                <Button Margin="0,9,0,0" Padding="9,5" HorizontalAlignment="Left" Click="CaptureVisionEvidence_Click">Let ASHA look once</Button>
+                                <CheckBox x:Name="RemoteVisionCheckBox" Margin="0,9,0,0" Checked="RemoteVisionChanged" Unchecked="RemoteVisionChanged"
+                                          Content="Allow ASHA to request and send one current view when needed" />
+                                <TextBlock Margin="0,3,0,0" FontSize="10" Foreground="#71869B" TextWrapping="Wrap"
+                                           Text="This is off by default. During an active session, ASHA may request one fresh view for a visual question. It never sends a desktop video or images with ordinary chat." />
+                                <CheckBox x:Name="LiveProviderAwarenessCheckBox" Margin="0,9,0,0" Checked="LiveProviderAwarenessChanged" Unchecked="LiveProviderAwarenessChanged"
+                                          Content="Allow changed frames when a conversation needs them" />
+                                <TextBlock Margin="0,3,0,0" FontSize="10" Foreground="#71869B" TextWrapping="Wrap"
+                                           Text="Fast samples stay local. A changed frame may leave this computer only when the current conversation, grounding, or verification needs visual evidence; idle pixel changes are never uploaded." />
+                                <Border Height="92" Margin="0,10,0,0" Padding="9" CornerRadius="11" Background="#E8F6FF" BorderBrush="#C7E2F4" BorderThickness="1">
+                                    <Grid>
+                                        <Grid.RowDefinitions>
+                                            <RowDefinition Height="Auto" />
+                                            <RowDefinition Height="*" />
+                                        </Grid.RowDefinitions>
+                                        <TextBlock FontSize="11" FontWeight="SemiBold" Foreground="#214E7D">Current visual context</TextBlock>
+                                        <ScrollViewer Grid.Row="1" Margin="0,5,0,0" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+                                            <TextBlock x:Name="AwarenessStatusText" FontSize="10" Foreground="#496C8C" TextWrapping="Wrap"
+                                                       Text="Local awareness is idle until you start a session." />
+                                        </ScrollViewer>
+                                    </Grid>
+                                </Border>
+                            </StackPanel>
+                        </Border>
+
+                        <Border Margin="0,12,0,0" Padding="12" CornerRadius="15" Background="#F8F6FFFF" BorderBrush="#D5CEF9" BorderThickness="1">
+                            <StackPanel>
+                                <TextBlock FontWeight="SemiBold" Foreground="#3B347D">Computer control</TextBlock>
+                                <TextBlock Margin="0,4,0,0" FontSize="11" Foreground="#5E5A7F" TextWrapping="Wrap"
+                                           Text="These global settings are maximum permissions, not permanent control. ASHA can act only while you also start a visible control session." />
+
+                                <TextBlock Margin="0,12,0,0" FontSize="11" FontWeight="SemiBold" Foreground="#3B347D">Applications and folders</TextBlock>
+                                <CheckBox x:Name="ApplicationFolderControlCheckBox" Margin="0,6,0,0"
+                                          Checked="ComputerControlPolicyChanged" Unchecked="ComputerControlPolicyChanged"
+                                          Content="Allow opening installed applications and ordinary folders" />
+
+                                <TextBlock Margin="0,12,0,0" FontSize="11" FontWeight="SemiBold" Foreground="#3B347D">Keyboard</TextBlock>
+                                <CheckBox x:Name="KeyboardControlCheckBox" Margin="0,6,0,0"
+                                          Checked="ComputerControlPolicyChanged" Unchecked="ComputerControlPolicyChanged"
+                                          Content="Allow approved keyboard interaction" />
+
+                                <TextBlock Margin="0,12,0,0" FontSize="11" FontWeight="SemiBold" Foreground="#3B347D">Mouse and cursor</TextBlock>
+                                <CheckBox x:Name="VirtualCursorCheckBox" Margin="0,6,0,0"
+                                          Checked="ComputerControlPolicyChanged" Unchecked="ComputerControlPolicyChanged"
+                                          Content="Enable virtual cursor" />
+                                <StackPanel x:Name="VirtualCursorOptionsPanel" Margin="20,5,0,0">
+                                    <TextBlock FontSize="10" Foreground="#6B6787">Behaviour</TextBlock>
+                                    <RadioButton x:Name="VirtualCursorInteractRadio" Margin="0,5,0,0" GroupName="VirtualCursorBehaviour"
+                                                 Checked="ComputerControlPolicyChanged"
+                                                 Content="Interact with controls" />
+                                    <RadioButton x:Name="VirtualCursorDemonstrateRadio" Margin="0,5,0,0" GroupName="VirtualCursorBehaviour"
+                                                 Checked="ComputerControlPolicyChanged"
+                                                 Content="Demonstrate only" />
+                                    <CheckBox x:Name="VirtualCursorVisibleCheckBox" Margin="0,6,0,0"
+                                              Checked="ComputerControlPolicyChanged" Unchecked="ComputerControlPolicyChanged"
+                                              Content="Show the virtual cursor while it works" />
+                                </StackPanel>
+                                <CheckBox x:Name="PhysicalCursorCheckBox" Margin="0,10,0,0"
+                                          Checked="ComputerControlPolicyChanged" Unchecked="ComputerControlPolicyChanged"
+                                          Content="Allow ASHA to use my physical cursor" />
+                                <CheckBox x:Name="PhysicalFallbackCheckBox" Margin="20,6,0,0"
+                                          Checked="ComputerControlPolicyChanged" Unchecked="ComputerControlPolicyChanged"
+                                          Content="Ask before falling back from virtual to physical input" />
+
+                                <CheckBox x:Name="ControlPresenceCheckBox" Margin="0,12,0,0" Checked="ControlPresenceChanged" Unchecked="ControlPresenceChanged"
+                                          Content="Show the blue-violet desktop-control presence when ASHA is acting" />
+                                <TextBlock x:Name="ComputerControlPolicyStatusText" Margin="0,8,0,0" FontSize="10" Foreground="#6B6787" TextWrapping="Wrap"
+                                           Text="All computer-control capabilities are off by default." />
+                            </StackPanel>
+                        </Border>
+
+                        <Border Margin="0,12,0,0" Padding="12" CornerRadius="15" Background="#F6FBFFFF" BorderBrush="#C9DFF2" BorderThickness="1">
+                            <StackPanel>
+                                <TextBlock FontWeight="SemiBold" Foreground="#214E7D">AI provider</TextBlock>
+                                <TextBlock x:Name="ProviderStatusText" Margin="0,4,0,0" FontSize="12" TextWrapping="Wrap" Foreground="#526A84" />
+                                <StackPanel Orientation="Horizontal" Margin="0,10,0,0">
+                                    <Button Padding="9,5" Click="ConfigureGroq_Click">Configure Groq keys</Button>
+                                    <TextBlock Margin="10,0,0,0" VerticalAlignment="Center" FontSize="11" Foreground="#62788D">Keys stay outside the project folder.</TextBlock>
+                                </StackPanel>
+                            </StackPanel>
+                        </Border>
+
+                        <StackPanel Orientation="Horizontal" Margin="0,11,0,0">
+                            <Button Click="ClearAll_Click">Clear all visual cues</Button>
+                            <TextBlock Margin="12,0,0,0" VerticalAlignment="Center" FontSize="11" Foreground="#62788D">Ctrl+Alt+M places or draws the selected cue</TextBlock>
+                        </StackPanel>
+
+                        <StackPanel Orientation="Horizontal" Margin="0,11,0,0">
+                            <Button Click="HideToTray_Click">Hide ASHA to tray</Button>
+                            <TextBlock Margin="12,0,0,0" VerticalAlignment="Center" FontSize="11" Foreground="#62788D">Hides the orb too; restore it from ASHA's tray icon.</TextBlock>
+                        </StackPanel>
+
+                        <Expander Margin="0,16,0,0" Header="Diagnostics and visual cues" Foreground="#2E69AE">
+                        <StackPanel Margin="0,12,0,0">
+                            <TextBlock TextWrapping="Wrap" FontSize="12" Foreground="#526A84" Margin="0,0,0,10">
+                                Choose a cue and use Place at pointer for an exact numeric cue. With box or arrow selected, Ctrl+Alt+M or Draw selected arms a real press-drag-release gesture. An arrow starts where you press and points where you release. Repeat the shortcut or press Escape to cancel.
+                            </TextBlock>
+                            <Grid Margin="0,0,0,9">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="46" />
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="28" />
+                                    <ColumnDefinition Width="64" />
+                                </Grid.ColumnDefinitions>
+                                <Grid.RowDefinitions>
+                                    <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="Auto" />
+                                </Grid.RowDefinitions>
+                                <TextBlock Grid.Row="0" Grid.Column="0" VerticalAlignment="Center">Cue</TextBlock>
+                                <ComboBox x:Name="KindBox" Grid.Row="0" Grid.Column="1" Margin="0,0,7,8" SelectedIndex="0" SelectionChanged="KindBox_SelectionChanged">
+                                    <ComboBoxItem Content="dot" />
+                                    <ComboBoxItem Content="circle" />
+                                    <ComboBoxItem Content="box" />
+                                    <ComboBoxItem Content="arrow" />
+                                    <ComboBoxItem Content="label" />
+                                </ComboBox>
+                                <TextBlock Grid.Row="0" Grid.Column="2" VerticalAlignment="Center" TextAlignment="Center">W</TextBlock>
+                                <TextBox x:Name="WidthBox" Grid.Row="0" Grid.Column="3" Text="220" Margin="0,0,0,8" ToolTip="Width; for an arrow this is its horizontal distance" />
+                                <TextBlock Grid.Row="1" Grid.Column="0" VerticalAlignment="Center">Label</TextBlock>
+                                <TextBox x:Name="LabelBox" Grid.Row="1" Grid.Column="1" Margin="0,0,7,8"
+                                         GotKeyboardFocus="LabelBox_GotKeyboardFocus"
+                                         TextChanged="LabelBox_TextChanged"
+                                         KeyDown="LabelBox_KeyDown"
+                                         PreviewLostKeyboardFocus="LabelBox_PreviewLostKeyboardFocus" />
+                                <TextBlock Grid.Row="1" Grid.Column="2" VerticalAlignment="Center" TextAlignment="Center">H</TextBlock>
+                                <TextBox x:Name="HeightBox" Grid.Row="1" Grid.Column="3" Text="100" Margin="0,0,0,8" ToolTip="Height; for an arrow this is its vertical distance" />
+                                <TextBlock Grid.Row="2" Grid.Column="0" VerticalAlignment="Center">X</TextBlock>
+                                <TextBox x:Name="XBox" Grid.Row="2" Grid.Column="1" Margin="0,0,7,8" ToolTip="Desktop x position" />
+                                <TextBlock Grid.Row="2" Grid.Column="2" VerticalAlignment="Center" TextAlignment="Center">Y</TextBlock>
+                                <TextBox x:Name="YBox" Grid.Row="2" Grid.Column="3" Margin="0,0,0,8" ToolTip="Desktop y position" />
+                                <TextBlock Grid.Row="3" Grid.Column="0" VerticalAlignment="Center">Colour</TextBlock>
+                                <TextBox x:Name="ColorBox" Grid.Row="3" Grid.Column="1" Grid.ColumnSpan="3" Text="#4C8DFF" ToolTip="Hex colour, for example #4C8DFF" />
+                            </Grid>
+                            <Grid Margin="0,0,0,10">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="8" />
+                                    <ColumnDefinition Width="*" />
+                                </Grid.ColumnDefinitions>
+                                <Grid.RowDefinitions>
+                                    <RowDefinition Height="34" />
+                                    <RowDefinition Height="7" />
+                                    <RowDefinition Height="34" />
+                                    <RowDefinition Height="7" />
+                                    <RowDefinition Height="34" />
+                                </Grid.RowDefinitions>
+                                <Button Grid.Row="0" Grid.Column="0" HorizontalContentAlignment="Center" Click="PlaceCueAtPointer_Click">Place at pointer</Button>
+                                <Button x:Name="DrawCueButton" Grid.Row="0" Grid.Column="2" HorizontalContentAlignment="Center" Click="DrawCue_Click" IsEnabled="False">Draw selected</Button>
+                                <Button Grid.Row="2" Grid.Column="0" HorizontalContentAlignment="Center" Click="ApplyCueChanges_Click">Apply changes</Button>
+                                <Button x:Name="EditCuesButton" Grid.Row="2" Grid.Column="2" HorizontalContentAlignment="Center" Click="EditCues_Click">Edit cues</Button>
+                                <Button Grid.Row="4" Grid.Column="0" Grid.ColumnSpan="3" HorizontalContentAlignment="Center" Click="ClearSelected_Click">Clear selected</Button>
+                            </Grid>
+                            <Grid Height="112">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="8" />
+                                    <ColumnDefinition Width="*" />
+                                </Grid.ColumnDefinitions>
+                                <GroupBox Grid.Column="0" Header="Active cues">
+                                    <ListBox x:Name="MarkList" DisplayMemberPath="Display" FontSize="11" SelectionChanged="MarkList_SelectionChanged" />
+                                </GroupBox>
+                                <GroupBox Grid.Column="2" Header="Activity">
+                                    <TextBox x:Name="LogBox" IsReadOnly="True" TextWrapping="Wrap" VerticalScrollBarVisibility="Auto" FontSize="11" />
+                                </GroupBox>
+                            </Grid>
+                        </StackPanel>
+                        </Expander>
+                    </StackPanel>
+
+                    <Border x:Name="AttachedChatPanel" Grid.Row="4" Margin="0,14,0,0" Height="248" Padding="12" CornerRadius="16"
+                            Background="#F7FBFFFF" BorderBrush="#C9DFF2" BorderThickness="1" Visibility="Collapsed">
+                        <Grid>
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="*" />
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="15" />
+                            </Grid.RowDefinitions>
+                            <Grid Grid.Row="0">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="Auto" />
+                                </Grid.ColumnDefinitions>
+                                <StackPanel>
+                                    <TextBlock FontWeight="SemiBold" Foreground="#214E7D">Conversation</TextBlock>
+                                    <TextBlock Margin="0,2,0,0" FontSize="11" Foreground="#62788D">Voice transcript and ASHA replies</TextBlock>
+                                </StackPanel>
+                                <StackPanel Grid.Column="1" Orientation="Horizontal">
+                                    <Button Padding="8,4" Margin="0,0,5,0" Click="DetachChat_Click" ToolTip="Detach chat">↗</Button>
+                                    <Button Padding="8,4" Click="CloseAttachedChat_Click" ToolTip="Hide chat">×</Button>
+                                </StackPanel>
+                            </Grid>
+                            <ListBox x:Name="AttachedChatList" Grid.Row="1" Margin="0,10,0,0" BorderThickness="0" Background="Transparent"
+                                     ScrollViewer.VerticalScrollBarVisibility="Auto" ScrollViewer.HorizontalScrollBarVisibility="Disabled">
+                                <ListBox.ItemTemplate>
+                                    <DataTemplate>
+                                        <Border Margin="0,0,0,7" Padding="9,7" CornerRadius="11" Background="#EAF4FFFF">
+                                            <StackPanel>
+                                                <DockPanel>
+                                                    <TextBlock DockPanel.Dock="Left" FontSize="11" FontWeight="SemiBold" Foreground="#295A8D" Text="{Binding Speaker}" />
+                                                    <TextBlock DockPanel.Dock="Right" FontSize="10" Foreground="#71869B" Text="{Binding Timestamp, StringFormat={}{0:HH:mm}}" />
+                                                </DockPanel>
+                                                <TextBlock Margin="0,3,0,0" FontSize="12" Foreground="#234261" TextWrapping="Wrap" Text="{Binding Text}" />
+                                            </StackPanel>
+                                        </Border>
+                                    </DataTemplate>
+                                </ListBox.ItemTemplate>
+                            </ListBox>
+                            <Border Grid.Row="2" Margin="0,7,0,0" Padding="8,5" CornerRadius="13" Background="#FFFFFFFF" BorderBrush="#B7D9F5" BorderThickness="1">
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+                                    <TextBox x:Name="AttachedComposerTextBox" MinHeight="28" MaxHeight="76" Padding="4,4" BorderThickness="0" Background="Transparent"
+                                             VerticalContentAlignment="Center" VerticalScrollBarVisibility="Auto" TextWrapping="Wrap" AcceptsReturn="True"
+                                             MaxLength="4000" KeyDown="AttachedComposer_KeyDown" ToolTip="Type to ASHA. Enter sends; Shift+Enter starts a new line." />
+                                    <Button x:Name="AttachedSendButton" Grid.Column="1" Margin="7,0,0,0" Padding="11,4" VerticalAlignment="Bottom"
+                                            Click="AttachedSend_Click" ToolTip="Send typed message">Send</Button>
+                                </Grid>
+                            </Border>
+                            <primitives:Thumb Grid.Row="3" Cursor="SizeNS" DragDelta="AttachedChatResizeThumb_DragDelta" ToolTip="Drag to resize chat">
+                                <primitives:Thumb.Template>
+                                    <ControlTemplate TargetType="primitives:Thumb">
+                                        <Border Padding="0,6,0,0">
+                                            <Border Width="42" Height="3" HorizontalAlignment="Center" CornerRadius="2" Background="#B7CCE1" />
+                                        </Border>
+                                    </ControlTemplate>
+                                </primitives:Thumb.Template>
+                            </primitives:Thumb>
+                        </Grid>
+                    </Border>
+
+                    <Button x:Name="OpenChatButton" Grid.Row="5" Margin="0,14,0,0" Padding="16,6" HorizontalAlignment="Center"
+                            Click="OpenChat_Click" ToolTip="Show ASHA conversation">Chat</Button>
+
+                    <TextBlock Grid.Row="6" Margin="0,15,0,0" FontSize="11" Foreground="#6A8198" TextWrapping="Wrap"
+                               Text="Drag the ASHA heading to move this panel. Double-click or right-click the orb to close it. The — button hides only this menu." />
+                </Grid>
+            </Border>
+        </Popup>
+    </Grid>
+</Window>

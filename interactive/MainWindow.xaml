@@ -186,7 +186,7 @@
                                 <StackPanel>
                                 <TextBlock FontWeight="SemiBold" Foreground="#3B347D">Computer control</TextBlock>
                                 <TextBlock Margin="0,3,0,0" FontSize="11" Foreground="#5E5A7F" TextWrapping="Wrap"
-                                               Text="Starts an explicit, visible control session. ASHA can use its physical mouse and keyboard only for a direct request you make while this session is enabled." />
+                                               Text="Starts a temporary control lease for the capabilities you have allowed in Settings. Ending the lease leaves those global limits unchanged." />
                                     <Button x:Name="ControlSessionButton" Margin="0,9,0,0" Padding="9,5" HorizontalAlignment="Left" Click="ControlSession_Click">Enable computer control</Button>
                                     <TextBlock x:Name="ControlSessionStatusText" Margin="0,8,0,0" FontSize="11" Foreground="#5E5A7F" TextWrapping="Wrap"
                                                Text="Computer control is disabled." />
@@ -232,8 +232,52 @@
                                         </ScrollViewer>
                                     </Grid>
                                 </Border>
-                                <CheckBox x:Name="ControlPresenceCheckBox" Margin="0,9,0,0" Checked="ControlPresenceChanged" Unchecked="ControlPresenceChanged"
+                            </StackPanel>
+                        </Border>
+
+                        <Border Margin="0,12,0,0" Padding="12" CornerRadius="15" Background="#F8F6FFFF" BorderBrush="#D5CEF9" BorderThickness="1">
+                            <StackPanel>
+                                <TextBlock FontWeight="SemiBold" Foreground="#3B347D">Computer control</TextBlock>
+                                <TextBlock Margin="0,4,0,0" FontSize="11" Foreground="#5E5A7F" TextWrapping="Wrap"
+                                           Text="These global settings are maximum permissions, not permanent control. ASHA can act only while you also start a visible control session." />
+
+                                <TextBlock Margin="0,12,0,0" FontSize="11" FontWeight="SemiBold" Foreground="#3B347D">Applications and folders</TextBlock>
+                                <CheckBox x:Name="ApplicationFolderControlCheckBox" Margin="0,6,0,0"
+                                          Checked="ComputerControlPolicyChanged" Unchecked="ComputerControlPolicyChanged"
+                                          Content="Allow opening installed applications and ordinary folders" />
+
+                                <TextBlock Margin="0,12,0,0" FontSize="11" FontWeight="SemiBold" Foreground="#3B347D">Keyboard</TextBlock>
+                                <CheckBox x:Name="KeyboardControlCheckBox" Margin="0,6,0,0"
+                                          Checked="ComputerControlPolicyChanged" Unchecked="ComputerControlPolicyChanged"
+                                          Content="Allow approved keyboard interaction" />
+
+                                <TextBlock Margin="0,12,0,0" FontSize="11" FontWeight="SemiBold" Foreground="#3B347D">Mouse and cursor</TextBlock>
+                                <CheckBox x:Name="VirtualCursorCheckBox" Margin="0,6,0,0"
+                                          Checked="ComputerControlPolicyChanged" Unchecked="ComputerControlPolicyChanged"
+                                          Content="Enable virtual cursor" />
+                                <StackPanel x:Name="VirtualCursorOptionsPanel" Margin="20,5,0,0">
+                                    <TextBlock FontSize="10" Foreground="#6B6787">Behaviour</TextBlock>
+                                    <RadioButton x:Name="VirtualCursorInteractRadio" Margin="0,5,0,0" GroupName="VirtualCursorBehaviour"
+                                                 Checked="ComputerControlPolicyChanged"
+                                                 Content="Interact with controls" />
+                                    <RadioButton x:Name="VirtualCursorDemonstrateRadio" Margin="0,5,0,0" GroupName="VirtualCursorBehaviour"
+                                                 Checked="ComputerControlPolicyChanged"
+                                                 Content="Demonstrate only" />
+                                    <CheckBox x:Name="VirtualCursorVisibleCheckBox" Margin="0,6,0,0"
+                                              Checked="ComputerControlPolicyChanged" Unchecked="ComputerControlPolicyChanged"
+                                              Content="Show the virtual cursor while it works" />
+                                </StackPanel>
+                                <CheckBox x:Name="PhysicalCursorCheckBox" Margin="0,10,0,0"
+                                          Checked="ComputerControlPolicyChanged" Unchecked="ComputerControlPolicyChanged"
+                                          Content="Allow ASHA to use my physical cursor" />
+                                <CheckBox x:Name="PhysicalFallbackCheckBox" Margin="20,6,0,0"
+                                          Checked="ComputerControlPolicyChanged" Unchecked="ComputerControlPolicyChanged"
+                                          Content="Ask before falling back from virtual to physical input" />
+
+                                <CheckBox x:Name="ControlPresenceCheckBox" Margin="0,12,0,0" Checked="ControlPresenceChanged" Unchecked="ControlPresenceChanged"
                                           Content="Show the blue-violet desktop-control presence when ASHA is acting" />
+                                <TextBlock x:Name="ComputerControlPolicyStatusText" Margin="0,8,0,0" FontSize="10" Foreground="#6B6787" TextWrapping="Wrap"
+                                           Text="All computer-control capabilities are off by default." />
                             </StackPanel>
                         </Border>
 

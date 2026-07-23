@@ -95,7 +95,8 @@ public partial class MainWindow : Window
     private DateTime _lastSpeechAtUtc;
     private bool _reallyQuitting;
     private bool _shownTrayHint;
-    private bool _controlSessionActive;
+    private bool _applyingPreferences;
+    private ComputerControlLease? _controlLease;
     private Process? _teachRecorder;
     private string? _latestRecordingPath;
     private string? _latestCuratedRecordingPath;
@@ -538,6 +539,9 @@ public partial class MainWindow : Window
         var endingId = _activeSessionId;
         try
         {
+            if (_controlLease is not null)
+                await StopControlLeaseAsync(
+                    "The active computer-control lease ended with its shared-attention session.");
             await RefreshSessionMemoryAsync(endingId, forceCompression: true);
             await RecordActiveSessionEventAsync("session.ended", "The person ended this shared-attention session.");
             await _sessionWriteGate.WaitAsync();
@@ -899,20 +903,26 @@ public partial class MainWindow : Window
     {
         try
         {
-            if (_controlSessionActive)
+            if (_controlLease is not null)
             {
-                await RunAshaAsync("clear", ControlPresenceMarkId);
-                _controlSessionActive = false;
-                ControlSessionButton.Content = "Enable computer control";
-                ControlSessionStatusText.Text = "Computer control is disabled.";
-                StatusText.Text = _voiceSession.IsGroqConfigured ? "Tap the orb to start listening." : "Configure Groq, then restart ASHA.";
-                Log("Computer control session ended.");
+                await StopControlLeaseAsync("The person stopped the computer-control session.");
                 return;
             }
 
-            if (string.IsNullOrWhiteSpace(_activeSessionId))
+            if (!ComputerControlLease.TryStart(
+                    _preferences.ComputerControl,
+                    _activeSessionId,
+                    out var lease,
+                    out var reason) ||
+                lease is null)
             {
-                ControlSessionStatusText.Text = "Start a shared-attention session first, so every action is retained locally.";
+                ControlSessionStatusText.Text = reason;
+                if (_preferences.ComputerControl.AllowedCapabilities == ComputerControlCapability.None)
+                {
+                    SettingsPanel.Visibility = Visibility.Visible;
+                    ProfilePanel.Visibility = Visibility.Collapsed;
+                    ComputerControlPolicyStatusText.Text = "Choose what ASHA may use, then start the temporary control session again.";
+                }
                 return;
             }
 
@@ -920,32 +930,75 @@ public partial class MainWindow : Window
             _preferences.Save();
             ApplyPreferencesToUi();
             if (_preferences.ShowControlPresence)
-            {
-                await RunAshaAsync("clear", ControlPresenceMarkId);
-                var virtualLeft = GetSystemMetrics(SmXVirtualScreen);
-                var virtualTop = GetSystemMetrics(SmYVirtualScreen);
-                var virtualWidth = GetSystemMetrics(SmCxVirtualScreen);
-                var virtualHeight = GetSystemMetrics(SmCyVirtualScreen);
-                var frame = new MarkRequest(
-                    ControlPresenceMarkId, "frame", virtualLeft, virtualTop, virtualWidth, virtualHeight,
-                    "ASHA is using your desktop", "#766CFF");
-                await RunAshaAsync("mark", JsonSerializer.Serialize(frame, JsonOptions));
-            }
+                await ShowControlPresenceFrameAsync();
 
-            _controlSessionActive = true;
-            ControlSessionButton.Content = "Stop computer control";
-            ControlSessionStatusText.Text = _preferences.ShowControlPresence
-                ? "Enabled: ASHA can use visible physical input for a direct request you make. The blue-violet frame means this session is active."
-                : "Enabled: ASHA can use visible physical input for a direct request you make. The desktop frame is hidden by your setting.";
+            _controlLease = lease;
+            UpdateControlLeaseUi();
             StatusText.Text = "ASHA computer control is enabled for this session.";
-            Log("Computer control enabled; every ASHA action remains visible and is written to the session.");
-            await RecordTeachingLifecycleAsync("control.session_started", "The person explicitly enabled a visible, human-facing computer-control session.");
+            var access = CurrentControlAccess();
+            Log($"Computer-control lease started: {access.DescribeForPerson()}");
+            await RecordActiveSessionEventAsync(
+                "control.lease_started",
+                "The person explicitly started a temporary, human-facing computer-control lease.",
+                "human",
+                "computer_control",
+                new
+                {
+                    app = "desktop",
+                    label = "ASHA computer control",
+                    control = "lease",
+                    leaseId = lease.Id,
+                    capabilities = access.EffectiveCapabilities.ToString(),
+                });
         }
         catch (Exception error)
         {
             ControlSessionStatusText.Text = ShortReason(error);
             Log($"Desktop-control session error: {error.Message}");
         }
+    }
+
+    private ComputerControlAccess CurrentControlAccess() =>
+        new(_preferences.ComputerControl, _controlLease, _activeSessionId);
+
+    private async Task StopControlLeaseAsync(string reason, bool recordEvent = true)
+    {
+        var lease = _controlLease;
+        if (lease is null) return;
+        _controlLease = null;
+
+        try { await RunAshaAsync("clear", ControlPresenceMarkId); }
+        catch (Exception error) { Log($"Could not clear the computer-control presence frame: {error.Message}"); }
+
+        UpdateControlLeaseUi();
+        StatusText.Text = _voiceSession.IsGroqConfigured ? "Tap the orb to start listening." : "Configure Groq, then restart ASHA.";
+        Log("Computer-control lease ended.");
+        if (recordEvent)
+        {
+            await RecordActiveSessionEventAsync(
+                "control.lease_ended",
+                reason,
+                "human",
+                "computer_control",
+                new
+                {
+                    app = "desktop",
+                    label = "ASHA computer control",
+                    control = "lease",
+                    leaseId = lease.Id,
+                });
+        }
+    }
+
+    private void UpdateControlLeaseUi()
+    {
+        var access = CurrentControlAccess();
+        ControlSessionButton.Content = _controlLease is null ? "Enable computer control" : "Stop computer control";
+        ControlSessionStatusText.Text = access.IsLeaseActive
+            ? $"{access.DescribeForPerson()} {(_preferences.ShowControlPresence ? "The blue-violet frame shows that control is active." : "The desktop presence frame is hidden by your setting.")}"
+            : _controlLease is null
+                ? "Computer control is disabled."
+                : "The active lease no longer contains an allowed capability. Stop it or enable a new lease from the current policy.";
     }
 
     private void VisionModeBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
@@ -1154,11 +1207,76 @@ public partial class MainWindow : Window
         Log("One selected desktop view is armed for ASHA's next spoken turn.");
     }
 
-    private void ControlPresenceChanged(object sender, RoutedEventArgs e)
+    private async void ComputerControlPolicyChanged(object sender, RoutedEventArgs e)
     {
-        if (!IsLoaded) return;
+        if (!IsLoaded || _applyingPreferences) return;
+
+        var policy = _preferences.ComputerControl;
+        policy.AllowApplicationAndFolderOpening = ApplicationFolderControlCheckBox.IsChecked == true;
+        policy.AllowKeyboardInteraction = KeyboardControlCheckBox.IsChecked == true;
+        policy.EnableVirtualCursor = VirtualCursorCheckBox.IsChecked == true;
+        policy.VirtualCursorBehaviour = VirtualCursorDemonstrateRadio.IsChecked == true
+            ? VirtualCursorBehaviour.DemonstrateOnly
+            : VirtualCursorBehaviour.Interact;
+        policy.ShowVirtualCursor = VirtualCursorVisibleCheckBox.IsChecked == true;
+        policy.AllowPhysicalCursor = PhysicalCursorCheckBox.IsChecked == true;
+        policy.AskBeforePhysicalFallback = PhysicalFallbackCheckBox.IsChecked == true;
+        policy.Normalize();
+        _preferences.Save();
+        ApplyPreferencesToUi();
+
+        if (_controlLease is not null && !CurrentControlAccess().IsLeaseActive)
+        {
+            await StopControlLeaseAsync(
+                "The person revoked the final capability covered by the active computer-control lease.");
+        }
+        else
+        {
+            UpdateControlLeaseUi();
+        }
+
+        var newlyAllowedOutsideLease = _controlLease is not null
+            ? policy.AllowedCapabilities & ~_controlLease.GrantedCapabilities
+            : ComputerControlCapability.None;
+        ComputerControlPolicyStatusText.Text = newlyAllowedOutsideLease != ComputerControlCapability.None
+            ? "Saved. Newly allowed capabilities will become active only after you stop and restart the control session."
+            : DescribeComputerControlPolicy(policy);
+        Log($"Computer-control policy changed: {policy.AllowedCapabilities}.");
+        await RecordActiveSessionEventAsync(
+            "control.policy_changed",
+            "The person changed ASHA's persistent computer-control limits directly in Settings.",
+            "human",
+            "computer_control_policy",
+            new
+            {
+                app = "asha",
+                label = "Computer control settings",
+                control = "policy",
+                allowed = policy.AllowedCapabilities.ToString(),
+            });
+    }
+
+    private async void ControlPresenceChanged(object sender, RoutedEventArgs e)
+    {
+        if (!IsLoaded || _applyingPreferences) return;
         _preferences.ShowControlPresence = ControlPresenceCheckBox.IsChecked == true;
         _preferences.Save();
+        if (_controlLease is not null)
+        {
+            try
+            {
+                if (_preferences.ShowControlPresence)
+                    await ShowControlPresenceFrameAsync();
+                else
+                    await RunAshaAsync("clear", ControlPresenceMarkId);
+                UpdateControlLeaseUi();
+            }
+            catch (Exception error)
+            {
+                ControlSessionStatusText.Text = $"The control lease is still active, but its presence frame could not be updated: {ShortReason(error)}";
+                Log($"Control-presence update error: {error.Message}");
+            }
+        }
         Log(_preferences.ShowControlPresence
             ? "Desktop-control presence will be visible during physical actions."
             : "Desktop-control presence is hidden by preference.");
@@ -1166,21 +1284,84 @@ public partial class MainWindow : Window
 
     private void ApplyPreferencesToUi()
     {
-        ObserveProfileButton.Background = _preferences.Profile == AshaProfile.Observe ? System.Windows.Media.Brushes.LightBlue : System.Windows.Media.Brushes.Transparent;
-        TeachProfileButton.Background = _preferences.Profile == AshaProfile.Teach ? System.Windows.Media.Brushes.LightBlue : System.Windows.Media.Brushes.Transparent;
-        AssistProfileButton.Background = _preferences.Profile == AshaProfile.Assist ? System.Windows.Media.Brushes.LightBlue : System.Windows.Media.Brushes.Transparent;
-        ProfileStatusText.Text = ProfileStatus(_preferences.Profile);
-        VisionModeBox.SelectedIndex = _preferences.Vision switch
+        _applyingPreferences = true;
+        try
         {
-            VisionPreference.Off => 0,
-            VisionPreference.OnChange => 1,
-            VisionPreference.Live => 2,
-            _ => 1,
-        };
-        ControlPresenceCheckBox.IsChecked = _preferences.ShowControlPresence;
-        RemoteVisionCheckBox.IsChecked = _preferences.AllowRemoteVision;
-        LiveProviderAwarenessCheckBox.IsChecked = _preferences.LiveProviderAwareness;
-        LiveProviderAwarenessCheckBox.IsEnabled = _preferences.AllowRemoteVision;
+            ObserveProfileButton.Background = _preferences.Profile == AshaProfile.Observe ? System.Windows.Media.Brushes.LightBlue : System.Windows.Media.Brushes.Transparent;
+            TeachProfileButton.Background = _preferences.Profile == AshaProfile.Teach ? System.Windows.Media.Brushes.LightBlue : System.Windows.Media.Brushes.Transparent;
+            AssistProfileButton.Background = _preferences.Profile == AshaProfile.Assist ? System.Windows.Media.Brushes.LightBlue : System.Windows.Media.Brushes.Transparent;
+            ProfileStatusText.Text = ProfileStatus(_preferences.Profile);
+            VisionModeBox.SelectedIndex = _preferences.Vision switch
+            {
+                VisionPreference.Off => 0,
+                VisionPreference.OnChange => 1,
+                VisionPreference.Live => 2,
+                _ => 1,
+            };
+            var control = _preferences.ComputerControl;
+            control.Normalize();
+            ApplicationFolderControlCheckBox.IsChecked = control.AllowApplicationAndFolderOpening;
+            KeyboardControlCheckBox.IsChecked = control.AllowKeyboardInteraction;
+            VirtualCursorCheckBox.IsChecked = control.EnableVirtualCursor;
+            VirtualCursorInteractRadio.IsChecked = control.VirtualCursorBehaviour == VirtualCursorBehaviour.Interact;
+            VirtualCursorDemonstrateRadio.IsChecked = control.VirtualCursorBehaviour == VirtualCursorBehaviour.DemonstrateOnly;
+            VirtualCursorVisibleCheckBox.IsChecked = control.ShowVirtualCursor;
+            PhysicalCursorCheckBox.IsChecked = control.AllowPhysicalCursor;
+            PhysicalFallbackCheckBox.IsChecked = control.AskBeforePhysicalFallback;
+            VirtualCursorOptionsPanel.IsEnabled = control.EnableVirtualCursor;
+            VirtualCursorVisibleCheckBox.IsEnabled =
+                control.EnableVirtualCursor &&
+                control.VirtualCursorBehaviour == VirtualCursorBehaviour.Interact;
+            PhysicalFallbackCheckBox.IsEnabled =
+                control.AllowPhysicalCursor &&
+                control.EnableVirtualCursor &&
+                control.VirtualCursorBehaviour == VirtualCursorBehaviour.Interact;
+            ControlPresenceCheckBox.IsChecked = _preferences.ShowControlPresence;
+            RemoteVisionCheckBox.IsChecked = _preferences.AllowRemoteVision;
+            LiveProviderAwarenessCheckBox.IsChecked = _preferences.LiveProviderAwareness;
+            LiveProviderAwarenessCheckBox.IsEnabled = _preferences.AllowRemoteVision;
+            ComputerControlPolicyStatusText.Text = DescribeComputerControlPolicy(control);
+        }
+        finally
+        {
+            _applyingPreferences = false;
+        }
+        UpdateControlLeaseUi();
+    }
+
+    private static string DescribeComputerControlPolicy(ComputerControlPolicy policy)
+    {
+        if (policy.AllowedCapabilities == ComputerControlCapability.None)
+            return "All computer-control capabilities are off. Settings alone never start a control session.";
+
+        var allowed = new List<string>();
+        if (policy.AllowApplicationAndFolderOpening) allowed.Add("applications and ordinary folders");
+        if (policy.AllowKeyboardInteraction) allowed.Add("approved keyboard input");
+        if (policy.EnableVirtualCursor)
+            allowed.Add(policy.VirtualCursorBehaviour == VirtualCursorBehaviour.Interact
+                ? "virtual interaction cursor"
+                : "virtual demonstration cursor");
+        if (policy.AllowPhysicalCursor) allowed.Add("physical cursor");
+        return $"Allowed globally: {string.Join(", ", allowed)}. Start a control session to activate them temporarily.";
+    }
+
+    private async Task ShowControlPresenceFrameAsync()
+    {
+        await RunAshaAsync("clear", ControlPresenceMarkId);
+        var virtualLeft = GetSystemMetrics(SmXVirtualScreen);
+        var virtualTop = GetSystemMetrics(SmYVirtualScreen);
+        var virtualWidth = GetSystemMetrics(SmCxVirtualScreen);
+        var virtualHeight = GetSystemMetrics(SmCyVirtualScreen);
+        var frame = new MarkRequest(
+            ControlPresenceMarkId,
+            "frame",
+            virtualLeft,
+            virtualTop,
+            virtualWidth,
+            virtualHeight,
+            "ASHA is using your desktop",
+            "#766CFF");
+        await RunAshaAsync("mark", JsonSerializer.Serialize(frame, JsonOptions));
     }
 
     private static string ProfileDisplayName(AshaProfile profile) => profile switch
@@ -1195,7 +1376,7 @@ public partial class MainWindow : Window
     {
         AshaProfile.Observe => "Observe is active: ASHA can speak, see only under the selected policy, and show virtual guidance. It cannot operate your input.",
         AshaProfile.Teach => "Teach ASHA is active: your completed demonstrations are kept as private learning material until you curate or share them.",
-        AshaProfile.Assist => "Assist is active: ASHA can resolve and propose learned procedures. Physical control still needs an explicit, visible control lease.",
+        AshaProfile.Assist => "Assist is active: ASHA can resolve and propose learned procedures. Every control action still needs an allowed capability and an explicit session lease.",
         _ => string.Empty,
     };
 
@@ -1475,7 +1656,7 @@ public partial class MainWindow : Window
                 text,
                 ResolveVisionForTranscriptAsync,
                 ExecuteVisualToolAsync,
-                _controlSessionActive,
+                CurrentControlAccess(),
                 !string.IsNullOrWhiteSpace(_activeSessionId) &&
                     _preferences.Vision != VisionPreference.Off &&
                     _preferences.AllowRemoteVision &&
@@ -1614,7 +1795,7 @@ public partial class MainWindow : Window
                 transcript,
                 ResolveVisionForTranscriptAsync,
                 ExecuteVisualToolAsync,
-                _controlSessionActive,
+                CurrentControlAccess(),
                 !string.IsNullOrWhiteSpace(_activeSessionId) &&
                     _preferences.Vision != VisionPreference.Off &&
                     _preferences.AllowRemoteVision &&
@@ -2263,9 +2444,10 @@ public partial class MainWindow : Window
             foreach (var mark in clearedCues)
                 await RecordCueLifecycleAsync("cue.deleted", mark, "Human cleared this visual cue with Clear all visual cues.");
             _marks.Clear();
-            _controlSessionActive = false;
-            ControlSessionButton.Content = "Enable computer control";
-            ControlSessionStatusText.Text = "Computer control is disabled.";
+            if (_controlLease is not null)
+                await StopControlLeaseAsync(
+                    "The person cleared all visual cues, including the visible computer-control presence.",
+                    recordEvent: true);
             Log($"Cleared all ASHA visual cues{(orphaned > 0 ? $" and {orphaned} stale overlay(s)" : string.Empty)}.");
             StatusText.Text = commandError is null
                 ? "All visual cues are cleared."
@@ -2560,6 +2742,8 @@ public partial class MainWindow : Window
 
     private void ClearActiveSession()
     {
+        _controlLease = null;
+        try { StartAshaWithoutWaiting("clear", ControlPresenceMarkId); } catch { }
         _screenObserver.Stop();
         _awarenessCoordinator.Stop();
         _latestVisionEvidence = null;
@@ -2577,6 +2761,7 @@ public partial class MainWindow : Window
         AwarenessStatusText.Text = "Local awareness is idle until you start a session.";
         _conversationMessages.Clear();
         _voiceSession.ResetConversationMemory();
+        UpdateControlLeaseUi();
     }
 
     private async Task LoadSessionMemoryAsync(string sessionId)
@@ -3184,8 +3369,11 @@ public partial class MainWindow : Window
 
     private async Task<string> ExecuteOpenApplicationOnUiAsync(AshaVisualToolCall call, CancellationToken cancellationToken)
     {
-        if (!_controlSessionActive)
-            return JsonSerializer.Serialize(new { ok = false, error = "Computer control is disabled. Ask the person to enable the explicit control session." });
+        var access = CurrentControlAccess();
+        if (!access.IsLeaseActive)
+            return JsonSerializer.Serialize(new { ok = false, error = "Computer control is disabled. Start an allowed control session first." });
+        if (!access.CanOpenApplicationsAndFolders)
+            return JsonSerializer.Serialize(new { ok = false, error = "Opening applications and folders is not permitted by the current policy and control lease." });
         if (string.IsNullOrWhiteSpace(_activeSessionId))
             return JsonSerializer.Serialize(new { ok = false, error = "Start a shared-attention session before opening an application." });
         if (!TryReadToolString(call.Arguments, "application", out var application))
@@ -3214,8 +3402,11 @@ public partial class MainWindow : Window
 
     private async Task<string> ExecuteOpenFolderOnUiAsync(AshaVisualToolCall call, CancellationToken cancellationToken)
     {
-        if (!_controlSessionActive)
-            return JsonSerializer.Serialize(new { ok = false, error = "Computer control is disabled. Ask the person to enable the explicit control session." });
+        var access = CurrentControlAccess();
+        if (!access.IsLeaseActive)
+            return JsonSerializer.Serialize(new { ok = false, error = "Computer control is disabled. Start an allowed control session first." });
+        if (!access.CanOpenApplicationsAndFolders)
+            return JsonSerializer.Serialize(new { ok = false, error = "Opening applications and folders is not permitted by the current policy and control lease." });
         if (string.IsNullOrWhiteSpace(_activeSessionId))
             return JsonSerializer.Serialize(new { ok = false, error = "Start a shared-attention session before opening a folder." });
         if (!TryReadToolString(call.Arguments, "folder", out var folder))
@@ -3241,12 +3432,25 @@ public partial class MainWindow : Window
 
     private async Task<string> ExecuteDesktopActionOnUiAsync(AshaVisualToolCall call, VisionAttachment vision, CancellationToken cancellationToken)
     {
-        if (!_controlSessionActive)
-            return JsonSerializer.Serialize(new { ok = false, error = "Computer control is disabled. Ask the person to enable the explicit control session." });
+        var access = CurrentControlAccess();
+        if (!access.IsLeaseActive)
+            return JsonSerializer.Serialize(new { ok = false, error = "Computer control is disabled. Start an allowed control session first." });
         if (string.IsNullOrWhiteSpace(_activeSessionId) || !vision.HasDesktopMapping)
             return JsonSerializer.Serialize(new { ok = false, error = "A coordinate-mapped image from an active session is required before physical input." });
         if (!TryReadToolString(call.Arguments, "action", out var action))
             return JsonSerializer.Serialize(new { ok = false, error = "A desktop action is required." });
+        if (!access.AllowsCurrentPhysicalExecutorAction(action))
+        {
+            if (action is "type_text" or "key")
+                return JsonSerializer.Serialize(new { ok = false, error = "Keyboard interaction is not permitted by the current policy and control lease." });
+            if (access.CanInteractWithVirtualCursor)
+                return JsonSerializer.Serialize(new
+                {
+                    ok = false,
+                    error = "Virtual interaction is permitted, but its background driver is not connected in this build. ASHA did not fall back to your physical cursor.",
+                });
+            return JsonSerializer.Serialize(new { ok = false, error = "Physical cursor interaction is not permitted by the current policy and control lease." });
+        }
 
         DesktopAction input;
         string visibleLabel;

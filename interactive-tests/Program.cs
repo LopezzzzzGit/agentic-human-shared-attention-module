@@ -215,6 +215,93 @@ var diagnosticPassed = !sanitizedDiagnostic.Contains(diagnosticSecret, StringCom
 Console.WriteLine($"{(diagnosticPassed ? "PASS" : "FAIL")} | ledger | failed-turn diagnostics redact credentials and stay bounded");
 if (!diagnosticPassed) failed++;
 
+const int controlPolicyCaseCount = 7;
+var defaultControlPolicy = new ComputerControlPolicy();
+var defaultControlPassed =
+    defaultControlPolicy.AllowedCapabilities == ComputerControlCapability.None &&
+    defaultControlPolicy.VirtualCursorBehaviour == VirtualCursorBehaviour.Interact &&
+    defaultControlPolicy.ShowVirtualCursor &&
+    defaultControlPolicy.AskBeforePhysicalFallback;
+Console.WriteLine($"{(defaultControlPassed ? "PASS" : "FAIL")} | policy | every control capability defaults off while safe child defaults are retained");
+if (!defaultControlPassed) failed++;
+
+var rejectedWithoutSession = !ComputerControlLease.TryStart(
+    new ComputerControlPolicy { AllowPhysicalCursor = true },
+    null,
+    out _,
+    out _);
+var rejectedWithoutCapability = !ComputerControlLease.TryStart(
+    new ComputerControlPolicy(),
+    "session-one",
+    out _,
+    out _);
+var rejectedLeasePassed = rejectedWithoutSession && rejectedWithoutCapability;
+Console.WriteLine($"{(rejectedLeasePassed ? "PASS" : "FAIL")} | lease  | a lease requires both a retained session and an allowed capability");
+if (!rejectedLeasePassed) failed++;
+
+var activeControlPolicy = new ComputerControlPolicy
+{
+    AllowApplicationAndFolderOpening = true,
+    EnableVirtualCursor = true,
+    VirtualCursorBehaviour = VirtualCursorBehaviour.Interact,
+    ShowVirtualCursor = false,
+    AllowPhysicalCursor = true,
+    AskBeforePhysicalFallback = true,
+};
+var started = ComputerControlLease.TryStart(activeControlPolicy, "session-one", out var activeLease, out _);
+var activeAccess = new ComputerControlAccess(activeControlPolicy, activeLease, "session-one");
+var leaseSnapshotPassed =
+    started &&
+    activeAccess.CanOpenApplicationsAndFolders &&
+    activeAccess.CanInteractWithVirtualCursor &&
+    !activeAccess.CanShowVirtualCursor &&
+    activeAccess.CanUsePhysicalCursor &&
+    activeAccess.MustAskBeforePhysicalFallback &&
+    activeAccess.AllowsCurrentPhysicalExecutorAction("click") &&
+    !activeAccess.AllowsCurrentPhysicalExecutorAction("key");
+Console.WriteLine($"{(leaseSnapshotPassed ? "PASS" : "FAIL")} | lease  | effective capabilities are the explicit policy-and-lease intersection");
+if (!leaseSnapshotPassed) failed++;
+
+activeControlPolicy.AllowKeyboardInteraction = true;
+var noSilentExpansion = !new ComputerControlAccess(activeControlPolicy, activeLease, "session-one").CanUseKeyboard;
+Console.WriteLine($"{(noSilentExpansion ? "PASS" : "FAIL")} | lease  | enabling a global capability does not silently expand an active lease");
+if (!noSilentExpansion) failed++;
+
+activeControlPolicy.AllowPhysicalCursor = false;
+var immediateRevocation =
+    !new ComputerControlAccess(activeControlPolicy, activeLease, "session-one").CanUsePhysicalCursor &&
+    !new ComputerControlAccess(activeControlPolicy, activeLease, "session-one").AllowsCurrentPhysicalExecutorAction("click") &&
+    !new ComputerControlAccess(activeControlPolicy, activeLease, "another-session").IsLeaseActive;
+Console.WriteLine($"{(immediateRevocation ? "PASS" : "FAIL")} | policy | revocation is immediate and leases cannot cross session boundaries");
+if (!immediateRevocation) failed++;
+
+var demonstratorPolicy = new ComputerControlPolicy
+{
+    EnableVirtualCursor = true,
+    VirtualCursorBehaviour = VirtualCursorBehaviour.DemonstrateOnly,
+    ShowVirtualCursor = false,
+};
+demonstratorPolicy.Normalize();
+var demonstratorPassed = demonstratorPolicy.ShowVirtualCursor &&
+                         !demonstratorPolicy.AllowedCapabilities.HasFlag(ComputerControlCapability.VirtualCursorInteraction);
+Console.WriteLine($"{(demonstratorPassed ? "PASS" : "FAIL")} | policy | demonstration mode remains visible and non-interacting");
+if (!demonstratorPassed) failed++;
+
+var applicationOnlyTools = AshaVoiceSession.InitialToolNamesForCapabilitiesForTesting(
+    "Open the calendar application.",
+    allowApplicationControl: true,
+    allowDesktopAction: false);
+var pointerOnlyTools = AshaVoiceSession.InitialToolNamesForCapabilitiesForTesting(
+    "Move the pointer to the calendar.",
+    allowApplicationControl: false,
+    allowDesktopAction: true);
+var separatedToolPermissionsPassed =
+    applicationOnlyTools.Contains("asha_open_application") &&
+    !pointerOnlyTools.Contains("asha_open_application") &&
+    !AshaVoiceSession.GroundedToolNamesForTesting("Click the calendar.", allowComputerControl: false).Contains("asha_desktop_action");
+Console.WriteLine($"{(separatedToolPermissionsPassed ? "PASS" : "FAIL")} | tools  | application permission does not leak physical-input tools");
+if (!separatedToolPermissionsPassed) failed++;
+
 if (failed > 0)
 {
     Console.Error.WriteLine($"{failed} ASHA guidance-removal intent test(s) failed.");
@@ -234,7 +321,7 @@ using (var voice = new AshaVoiceSession())
             executedScope = call.Arguments.GetProperty("scope").GetString();
             return Task.FromResult("{\"ok\":true,\"scope\":\"latest\",\"removed\":1}");
         },
-        allowComputerControl: false,
+        controlAccess: new ComputerControlAccess(new ComputerControlPolicy(), null, null),
         allowModelRequestedVision: false,
         awarenessContext: null,
         CancellationToken.None);
@@ -252,7 +339,7 @@ if (failed > 0)
     return 1;
 }
 
-Console.WriteLine($"All {cases.Length + identityCases.Length + claimCases.Length + perceptionCases.Length + reliabilityCaseCount + 3} ASHA reliability, audio, intent, perception, and application-control tests passed.");
+Console.WriteLine($"All {cases.Length + identityCases.Length + claimCases.Length + perceptionCases.Length + reliabilityCaseCount + 3 + controlPolicyCaseCount} ASHA reliability, audio, intent, perception, policy, lease, and application-control tests passed.");
 return 0;
 
 internal sealed record IntentCase(string Text, bool ShouldMatch, string Scope);

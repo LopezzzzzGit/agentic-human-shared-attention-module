@@ -105,6 +105,9 @@ The user-facing settings should be grouped under **Computer control**:
 ```text
 Computer control
 
+  Applications and folders
+    [ ] Allow opening installed applications and ordinary folders
+
   Keyboard
     [ ] Allow keyboard interaction
 
@@ -128,6 +131,7 @@ for an individual action.
 
 | Setting | Default |
 | --- | --- |
+| Application and ordinary-folder opening | Off |
 | Keyboard interaction | Off |
 | Virtual cursor | Off |
 | Virtual-cursor behaviour after enabling | Interact with controls |
@@ -150,6 +154,19 @@ visible, interactive virtual cursor.
 
 “Ghost cursor” therefore means visible but non-interacting. An interacting
 cursor with visibility disabled is a **hidden virtual cursor**, not a ghost.
+
+## Implementation status
+
+As of 2026-07-23, ASHA has the persistent capability-policy model, the
+process-local session lease, the manual settings hierarchy, off-by-default
+capabilities, lease snapshotting, immediate revocation, session-boundary
+revocation, and runtime checks around application, folder, keyboard, and
+physical-pointer execution.
+
+The virtual cursor policy is intentionally distinct from the current physical
+executor. The CUA background-action adapter, semantic conversational setting
+proposals, synchronized confirmation card, and local emergency-stop controller
+remain implementation work below.
 
 ## Scope and activation
 

@@ -155,14 +155,21 @@ voice-and-desktop architecture and the physical-control consent boundary.
 
 ### Permission-gated computer control
 
-Start a retained session and press **Enable computer control** before asking
-ASHA to act. While that visible lease is active, the voice model can:
+Computer control has two distinct gates. In **Settings → Computer control**,
+explicitly allow the maximum capabilities ASHA may use. Every capability is
+off by default. Then start a retained session and press **Enable computer
+control** to create a temporary lease. Ending the lease immediately removes
+active control without changing the global limits.
+
+Depending on the allowed policy and active lease, the voice model can:
 
 - open or activate any application returned by Windows' installed Start-app
   catalog, using its ordinary display name rather than an executable path;
 - open an existing non-system folder in Explorer without modifying it;
-- move the physical pointer, click, double-click, right-click, drag, scroll,
-  type short non-sensitive text, and press approved navigation keys;
+- move the physical pointer, click, double-click, right-click, drag, or scroll
+  only when physical-cursor use is separately allowed;
+- type short non-sensitive text and press approved navigation keys only when
+  keyboard interaction is separately allowed;
 - request a fresh pointer-area, foreground-window, entire-desktop, left-screen,
   or right-screen view independently of the person's mouse position.
 
@@ -174,6 +181,11 @@ locations. Physical pointer actions require a recent coordinate-mapped view,
 validate the currently exposed top-layer surface, remain visibly framed, and
 are written to the active session ledger. Stop the control session to remove
 the capability immediately.
+
+The virtual-cursor policy, visibility, and demonstration settings are present
+as a separate capability. Background interaction through the installed CUA
+driver is the next integration slice. Until it is connected, ASHA never
+silently substitutes the physical cursor for a permitted virtual action.
 
 Groq is the demonstrator's swappable research provider. Keys remain outside
 the repository and judges bring their own key. The provider boundary can be

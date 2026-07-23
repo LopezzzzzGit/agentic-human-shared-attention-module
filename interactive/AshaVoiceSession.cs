@@ -434,7 +434,7 @@ public sealed class AshaVoiceSession : IDisposable
         byte[] wav,
         Func<string, VisionRequest, CancellationToken, Task<VisionAttachment?>>? visionResolver,
         Func<AshaVisualToolCall, VisionAttachment?, CancellationToken, Task<string>>? visualToolExecutor,
-        bool allowComputerControl,
+        ComputerControlAccess controlAccess,
         bool allowModelRequestedVision,
         DesktopAwarenessContext? awarenessContext,
         CancellationToken cancellationToken)
@@ -447,7 +447,7 @@ public sealed class AshaVoiceSession : IDisposable
             transcript,
             visionResolver,
             visualToolExecutor,
-            allowComputerControl,
+            controlAccess,
             allowModelRequestedVision,
             awarenessContext,
             cancellationToken).ConfigureAwait(false);
@@ -461,7 +461,7 @@ public sealed class AshaVoiceSession : IDisposable
         string transcript,
         Func<string, VisionRequest, CancellationToken, Task<VisionAttachment?>>? visionResolver,
         Func<AshaVisualToolCall, VisionAttachment?, CancellationToken, Task<string>>? visualToolExecutor,
-        bool allowComputerControl,
+        ComputerControlAccess controlAccess,
         bool allowModelRequestedVision,
         DesktopAwarenessContext? awarenessContext,
         CancellationToken cancellationToken)
@@ -490,7 +490,7 @@ public sealed class AshaVoiceSession : IDisposable
                 vision,
                 visionResolver,
                 visualToolExecutor,
-                allowComputerControl,
+                controlAccess,
                 allowModelRequestedVision,
                 awarenessContext,
                 cancellationToken).ConfigureAwait(false);
@@ -639,7 +639,7 @@ public sealed class AshaVoiceSession : IDisposable
         VisionAttachment? vision,
         Func<string, VisionRequest, CancellationToken, Task<VisionAttachment?>>? visionResolver,
         Func<AshaVisualToolCall, VisionAttachment?, CancellationToken, Task<string>>? visualToolExecutor,
-        bool allowComputerControl,
+        ComputerControlAccess controlAccess,
         bool allowModelRequestedVision,
         DesktopAwarenessContext? awarenessContext,
         CancellationToken cancellationToken)
@@ -673,6 +673,8 @@ public sealed class AshaVoiceSession : IDisposable
         if (!IsGroqConfigured)
             throw new InvalidOperationException("Set ASHA_GROQ_KEYS or configure a Groq key in settings, then restart ASHA.");
 
+        var allowApplicationControl = controlAccess.CanOpenApplicationsAndFolders;
+        var allowDesktopAction = controlAccess.CanUseKeyboard || controlAccess.CanUsePhysicalCursor;
         var perceptionPlan = ActivePerceptionPlanner.Infer(userText);
         if (vision is null &&
             perceptionPlan.RequiresFreshEvidence &&
@@ -695,9 +697,7 @@ public sealed class AshaVoiceSession : IDisposable
             new
             {
                 role = "system",
-                content = allowComputerControl
-                    ? "Current runtime capability state: Computer Control is ENABLED by the person for this session. For a clear, low-risk desktop command, use the available control tool immediately and respond naturally from its result. Do not give a technical preamble or ask them to enable a permission that is already enabled."
-                    : "Current runtime capability state: Computer Control is DISABLED. If and only if the person asks for a desktop action, tell them briefly that Computer Control is off and must be enabled first. Never claim the action happened. Do not mention this state during ordinary conversation.",
+                content = controlAccess.DescribeForModel(virtualInteractionConnected: false),
             },
         };
         if (!string.IsNullOrWhiteSpace(_sessionSummary))
@@ -740,13 +740,14 @@ public sealed class AshaVoiceSession : IDisposable
         IReadOnlyList<object>? tools = SelectInitialTools(
             perceptionPlan,
             hasGroundedVision: vision is not null && vision.HasDesktopMapping && SupportsVision,
-            allowComputerControl: allowComputerControl,
+            allowApplicationControl: allowApplicationControl,
+            allowDesktopAction: allowDesktopAction,
             canRequestVision: allowModelRequestedVision && visionResolver is not null && SupportsVision,
             hasToolExecutor: visualToolExecutor is not null);
         string? reply;
         using (var first = await SendChatCompletionAsync(
                    baseUrl, model, messages, tools, cancellationToken,
-                   toolChoice: ToolChoiceForPlan(perceptionPlan, vision, allowComputerControl, tools)).ConfigureAwait(false))
+                   toolChoice: ToolChoiceForPlan(perceptionPlan, vision, allowDesktopAction, tools)).ConfigureAwait(false))
         {
             var message = first.RootElement.GetProperty("choices")[0].GetProperty("message");
             var toolCalls = ReadToolCalls(message);
@@ -758,15 +759,15 @@ public sealed class AshaVoiceSession : IDisposable
                 {
                     messages[^1] = CreateUserMessage(userText, vision);
                     tools = vision.HasDesktopMapping && visualToolExecutor is not null
-                        ? SelectGroundedToolsAfterModelView(perceptionPlan, allowComputerControl)
+                        ? SelectGroundedToolsAfterModelView(perceptionPlan, allowDesktopAction)
                         : null;
                     using var grounded = await SendChatCompletionAsync(
                         baseUrl, model, messages, tools, cancellationToken,
-                        toolChoice: ToolChoiceForPlan(perceptionPlan, vision, allowComputerControl, tools)).ConfigureAwait(false);
+                        toolChoice: ToolChoiceForPlan(perceptionPlan, vision, allowDesktopAction, tools)).ConfigureAwait(false);
                     var groundedMessage = grounded.RootElement.GetProperty("choices")[0].GetProperty("message");
                     reply = await CompleteGroundedTurnAsync(
                         messages, groundedMessage, userText, vision, visionResolver, visualToolExecutor,
-                        allowComputerControl, perceptionPlan, tools, baseUrl, model, cancellationToken, executedToolNames).ConfigureAwait(false);
+                        allowDesktopAction, perceptionPlan, tools, baseUrl, model, cancellationToken, executedToolNames).ConfigureAwait(false);
                 }
                 else
                 {
@@ -788,7 +789,7 @@ public sealed class AshaVoiceSession : IDisposable
                 reply = vision is not null
                     ? await CompleteGroundedTurnAsync(
                         messages, message, userText, vision, visionResolver, visualToolExecutor,
-                        allowComputerControl, perceptionPlan, tools, baseUrl, model, cancellationToken, executedToolNames).ConfigureAwait(false)
+                        allowDesktopAction, perceptionPlan, tools, baseUrl, model, cancellationToken, executedToolNames).ConfigureAwait(false)
                     : await CompleteVisualToolCallsAsync(
                         messages, message, vision, visualToolExecutor, tools, baseUrl, model,
                         cancellationToken, executedToolNames).ConfigureAwait(false);
@@ -840,7 +841,7 @@ public sealed class AshaVoiceSession : IDisposable
         VisionAttachment vision,
         Func<string, VisionRequest, CancellationToken, Task<VisionAttachment?>>? visionResolver,
         Func<AshaVisualToolCall, VisionAttachment?, CancellationToken, Task<string>>? visualToolExecutor,
-        bool allowComputerControl,
+        bool allowDesktopAction,
         ActivePerceptionPlan perceptionPlan,
         IReadOnlyList<object>? tools,
         string baseUrl,
@@ -892,12 +893,12 @@ public sealed class AshaVoiceSession : IDisposable
             refreshedView));
         var detailTools = SelectGroundedToolsForPlan(
             perceptionPlan with { AllowCloserLook = false },
-            allowComputerControl) ?? SelectGroundedToolsAfterModelView(
+            allowDesktopAction) ?? SelectGroundedToolsAfterModelView(
                 perceptionPlan with { AllowCloserLook = false },
-                allowComputerControl);
+                allowDesktopAction);
         using var refined = await SendChatCompletionAsync(
             baseUrl, model, messages, detailTools, cancellationToken,
-            toolChoice: ToolChoiceForPlan(perceptionPlan, refreshedView, allowComputerControl, detailTools)).ConfigureAwait(false);
+            toolChoice: ToolChoiceForPlan(perceptionPlan, refreshedView, allowDesktopAction, detailTools)).ConfigureAwait(false);
         var refinedMessage = refined.RootElement.GetProperty("choices")[0].GetProperty("message");
         return await CompleteVisualToolCallsAsync(
             messages, refinedMessage, refreshedView, visualToolExecutor, detailTools, baseUrl, model,
@@ -946,10 +947,10 @@ public sealed class AshaVoiceSession : IDisposable
 
     private static IReadOnlyList<object>? SelectGroundedToolsForPlan(
         ActivePerceptionPlan plan,
-        bool allowComputerControl) => plan.Goal switch
+        bool allowDesktopAction) => plan.Goal switch
     {
         ActivePerceptionGoal.Annotate => plan.AllowCloserLook ? VisualWithDetailToolDefinitions : VisualToolDefinitions,
-        ActivePerceptionGoal.Act when allowComputerControl => plan.AllowCloserLook
+        ActivePerceptionGoal.Act when allowDesktopAction => plan.AllowCloserLook
             ? DesktopActionWithDetailToolDefinitions
             : DesktopActionToolDefinitions,
         ActivePerceptionGoal.Observe or ActivePerceptionGoal.Locate or ActivePerceptionGoal.Verify
@@ -959,18 +960,18 @@ public sealed class AshaVoiceSession : IDisposable
 
     private static IReadOnlyList<object>? SelectGroundedToolsAfterModelView(
         ActivePerceptionPlan plan,
-        bool allowComputerControl) =>
-        SelectGroundedToolsForPlan(plan, allowComputerControl) ??
-        (allowComputerControl ? ModelRoutedGroundedToolDefinitions : VisualWithDetailToolDefinitions);
+        bool allowDesktopAction) =>
+        SelectGroundedToolsForPlan(plan, allowDesktopAction) ??
+        (allowDesktopAction ? ModelRoutedGroundedToolDefinitions : VisualWithDetailToolDefinitions);
 
     private static string ToolChoiceForPlan(
         ActivePerceptionPlan plan,
         VisionAttachment? vision,
-        bool allowComputerControl,
+        bool allowDesktopAction,
         IReadOnlyList<object>? tools) =>
         vision is { HasDesktopMapping: true } &&
         ((plan.Goal == ActivePerceptionGoal.Act &&
-          allowComputerControl &&
+          allowDesktopAction &&
           ToolNames(tools).Contains("asha_desktop_action", StringComparer.Ordinal)) ||
          (plan.Goal == ActivePerceptionGoal.Annotate &&
           ToolNames(tools).Contains("asha_mark", StringComparer.Ordinal)))
@@ -990,19 +991,19 @@ public sealed class AshaVoiceSession : IDisposable
     private static IReadOnlyList<object>? SelectInitialTools(
         ActivePerceptionPlan plan,
         bool hasGroundedVision,
-        bool allowComputerControl,
+        bool allowApplicationControl,
+        bool allowDesktopAction,
         bool canRequestVision,
         bool hasToolExecutor)
     {
         if (hasGroundedVision && hasToolExecutor)
-            return SelectGroundedToolsForPlan(plan, allowComputerControl);
-        if (allowComputerControl && hasToolExecutor)
-            return canRequestVision
-                ? ViewRequestApplicationAndGuidanceToolDefinitions
-                : ApplicationControlAndGuidanceToolDefinitions;
-        if (canRequestVision)
-            return ViewRequestAndGuidanceToolDefinitions;
-        return hasToolExecutor ? GuidanceManagementToolDefinitions : null;
+            return SelectGroundedToolsForPlan(plan, allowDesktopAction);
+
+        var selected = new List<object>();
+        if (canRequestVision) selected.AddRange(ViewRequestToolDefinitions);
+        if (allowApplicationControl && hasToolExecutor) selected.AddRange(ApplicationControlToolDefinitions);
+        if (hasToolExecutor) selected.AddRange(GuidanceManagementToolDefinitions);
+        return selected.Count > 0 ? selected : null;
     }
 
     internal static IReadOnlyList<string> GroundedToolNamesForTesting(string text, bool allowComputerControl)
@@ -1019,7 +1020,23 @@ public sealed class AshaVoiceSession : IDisposable
         var selected = SelectInitialTools(
             ActivePerceptionPlanner.Infer(text),
             hasGroundedVision: false,
-            allowComputerControl: allowComputerControl,
+            allowApplicationControl: allowComputerControl,
+            allowDesktopAction: allowComputerControl,
+            canRequestVision: true,
+            hasToolExecutor: true);
+        return ToolNames(selected);
+    }
+
+    internal static IReadOnlyList<string> InitialToolNamesForCapabilitiesForTesting(
+        string text,
+        bool allowApplicationControl,
+        bool allowDesktopAction)
+    {
+        var selected = SelectInitialTools(
+            ActivePerceptionPlanner.Infer(text),
+            hasGroundedVision: false,
+            allowApplicationControl,
+            allowDesktopAction,
             canRequestVision: true,
             hasToolExecutor: true);
         return ToolNames(selected);
@@ -1574,15 +1591,6 @@ public sealed class AshaVoiceSession : IDisposable
             },
         },
     ];
-
-    private static readonly IReadOnlyList<object> ViewRequestAndGuidanceToolDefinitions =
-        ViewRequestToolDefinitions.Concat(GuidanceManagementToolDefinitions).ToArray();
-
-    private static readonly IReadOnlyList<object> ApplicationControlAndGuidanceToolDefinitions =
-        ApplicationControlToolDefinitions.Concat(GuidanceManagementToolDefinitions).ToArray();
-
-    private static readonly IReadOnlyList<object> ViewRequestApplicationAndGuidanceToolDefinitions =
-        ViewRequestToolDefinitions.Concat(ApplicationControlToolDefinitions).Concat(GuidanceManagementToolDefinitions).ToArray();
 
     private static readonly object DesktopActionToolDefinition = new
     {

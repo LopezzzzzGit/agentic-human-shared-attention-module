@@ -22,6 +22,11 @@ public sealed class AshaPreferences
     /// </summary>
     public bool LiveProviderAwareness { get; set; }
     /// <summary>
+    /// Persistent upper bounds for computer control. Every capability is off
+    /// by default and still requires a separate process-local session lease.
+    /// </summary>
+    public ComputerControlPolicy ComputerControl { get; set; } = new();
+    /// <summary>
     /// An intentionally started session may survive an ASHA restart. Casual
     /// conversation never writes this value and therefore remains transient.
     /// </summary>
@@ -33,7 +38,10 @@ public sealed class AshaPreferences
         {
             var path = PreferencesPath();
             if (!File.Exists(path)) return new AshaPreferences();
-            return JsonSerializer.Deserialize<AshaPreferences>(File.ReadAllText(path)) ?? new AshaPreferences();
+            var preferences = JsonSerializer.Deserialize<AshaPreferences>(File.ReadAllText(path)) ?? new AshaPreferences();
+            preferences.ComputerControl ??= new ComputerControlPolicy();
+            preferences.ComputerControl.Normalize();
+            return preferences;
         }
         catch
         {

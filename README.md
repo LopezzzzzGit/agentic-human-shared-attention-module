@@ -77,6 +77,15 @@ The ledger is stored under `%LOCALAPPDATA%\asha\ledger`. A harness link is a
 reference to its own transcript/session; ASHA does not duplicate the audio or
 whole chat history.
 
+Ordinary new conversations are retained locally by default. Tapping the orb
+with no active session creates a new blank retained session; it never silently
+loads the most recent one. Use **Sessions → Continue** to load an existing
+session deliberately. Use **Temporary** for an ephemeral conversation, then
+choose **Keep this session** to promote it into retained history or **Discard**
+to remove its working conversation and temporary evidence. Hiding ASHA in the
+tray keeps the active session; fully restarting ASHA leaves retained history
+available without automatically reactivating it.
+
 ## Host integration
 
 An agentic harness can use Gemma QAT or any other local model capable
@@ -203,6 +212,15 @@ detects spoken turns through the local speech service at `127.0.0.1:9010`, asks
 the configured Groq model for a reply, and plays local TTS. Tap the orb once to
 enter free conversation; ASHA detects pauses and returns to listening after
 each reply. Tap the centre again only when you want to end the conversation.
+
+If speech recognition repeatedly misspells a name or specialist term, open
+**Settings → Speech → Teach ASHA new words…**. Save its canonical spelling,
+one or more spoken aliases, and a global, profile, project, or session scope.
+ASHA sends only a small relevant subset to the local Whisper service and
+stores the vocabulary outside the repository at
+`%LOCALAPPDATA%\asha\speech-vocabulary.json`. The raw and resolved transcript
+remain distinguishable in retained session telemetry; ASHA never learns a
+fuzzy guess without confirmation.
 
 Bring your own free Groq API key. Run `configure-groq.bat` once, paste one key
 or a comma-separated list, restart ASHA, then run `start-asha.bat`. Keys are

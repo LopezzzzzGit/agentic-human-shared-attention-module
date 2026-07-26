@@ -11,7 +11,17 @@
 
   <ItemGroup>
     <PackageReference Include="NAudio" Version="2.2.1" />
+    <ProjectReference Include="..\uia-worker\AshaUiaWorker.csproj" ReferenceOutputAssembly="false" />
   </ItemGroup>
+
+  <Target Name="BuildAndCopyUiaWorker" AfterTargets="Build" Condition="'$(DesignTimeBuild)' != 'true'">
+    <ItemGroup>
+      <_UiaWorkerArtifacts Include="$(MSBuildProjectDirectory)\..\uia-worker\bin\$(Configuration)\net8.0-windows10.0.26100.0\asha-uia-worker.*" />
+      <_UiaWorkerArtifacts Include="$(TargetDir)asha-uia-worker.*" />
+    </ItemGroup>
+    <MakeDir Directories="$(TargetDir)uia-worker" />
+    <Copy SourceFiles="@(_UiaWorkerArtifacts)" DestinationFolder="$(TargetDir)uia-worker" SkipUnchangedFiles="true" />
+  </Target>
 
   <!-- Keep WPF's Point, Brush, and TextBox unambiguous. The tray API is
        referenced explicitly with aliases in MainWindow.xaml.cs. -->

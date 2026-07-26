@@ -51,6 +51,7 @@ internal static class ActivePerceptionPlanner
             @"\b(highlight|mark|point\s+(?:out|to)|show\s+me\s+where|circle|draw\s+(?:a\s+)?(?:box|arrow)|annotate|hervorheben|markier\w*|zeig\w*\s+mir|einkreisen|umkreisen|rahmen|pfeil)\b");
         var physicalAction = Matches(value,
             @"\b(click|double[- ]click|right[- ]click|drag|scroll|move\s+(?:the\s+)?(?:mouse|pointer|cursor)|klick\w*|doppelklick\w*|rechtsklick\w*|zieh\w*|scroll\w*|beweg\w*\s+(?:die\s+)?(?:maus|zeiger))\b");
+        var windowAction = IsWindowManagementRequest(value);
         var inApplicationOpenAction = Matches(value,
             @"\b(?:open|activate|select|expand|öffn\w*|oeffn\w*|aktivier\w*|wähl\w*|waehl\w*|klapp\w*\s+auf)\b.{0,90}\b(?:account|folder|inbox|email|message|item|document|link|menu|tab|konto|ordner|posteingang|e-?mail|nachricht|element|dokument|menü|registerkarte)\b");
         physicalAction |= inApplicationOpenAction;
@@ -61,18 +62,20 @@ internal static class ActivePerceptionPlanner
         var location = Matches(value,
             @"\b(where\s+(?:is|are|did)|find|locate|which\s+(?:button|control|item|window|app)|wo\s+(?:ist|sind|finde)|find\w*|lokalisier\w*|welch\w*\s+(?:knopf|schaltfläche|element|fenster|app))\b");
         var visualObject = Matches(value,
-            @"\b(screen|desktop|monitor|display|window|app|application|program|button|tab|menu|field|label|link|icon|control|setting|option|panel|sidebar|section|text|document|image|dialog|mouse|cursor|pointer|error|message|email|inbox|sender|subject|list|bildschirm|desktop|monitor|anzeige|fenster|anwendung|programm|knopf|schaltfläche|registerkarte|menü|feld|beschriftung|symbol|einstellung|bereich|seitenleiste|text|dokument|bild|dialog|maus|zeiger|fehler|meldung|e-?mail|posteingang|absender|betreff|liste)\b");
+            @"\b(screens?|desktops?|monitors?|displays?|windows?|apps?|applications?|programs?|buttons?|tabs?|menus?|fields?|labels?|links?|icons?|controls?|settings?|options?|panels?|sidebars?|sections?|texts?|documents?|images?|pictures?|photos?|thumbnails?|dialogs?|mice|mouse|cursors?|pointers?|errors?|messages?|emails?|inboxes|senders?|subjects?|lists?|bildschirme?|desktops?|monitore?|anzeigen?|fenster|anwendungen?|programme?|knöpfe?|knoepfe?|schaltflächen?|schaltflaechen?|registerkarten?|menüs?|menues?|felder?|beschriftungen?|symbole?|einstellungen?|bereiche?|seitenleisten?|texte?|dokumente?|bilder?|fotos?|miniaturen?|dialoge?|mäuse|maeuse|maus|zeiger|fehler|meldungen?|e-?mails?|posteingänge?|posteingaenge?|absender|betreffe?|listen?)\b");
         var spatialReference = Matches(value,
             @"\b(left|right|upper|lower|top|bottom|corner|side|here|there|links|rechts|oben|unten|ecke|seite|hier|dort)\b");
+        var directVisualQuestion = Matches(value,
+            @"\b(?:what\s+(?:do|can)\s+you\s+(?:see|read)|do\s+you\s+(?:see|read)|what(?:'s|\s+is)\s+visible|was\s+(?:siehst|kannst)\s+du\s+(?:sehen|lesen)|siehst\s+du|kannst\s+du\s+(?:sehen|lesen)|was\s+ist\s+(?:sichtbar|zu\s+sehen))\b");
 
-        var requiresEvidence = annotation || physicalAction || verification || location ||
+        var requiresEvidence = annotation || physicalAction || verification || location || directVisualQuestion ||
                                (observation && (visualObject || spatialReference)) ||
                                Matches(value, @"\b(can|could|would|kannst|könntest|koenntest)\s+(?:you|du).{0,50}\b(?:see|look|read|show|find|sehen|schauen|lesen|zeigen|finden)\b");
-        if (!requiresEvidence) return ActivePerceptionPlan.None;
+        if (!requiresEvidence && !windowAction) return ActivePerceptionPlan.None;
 
         var goal = annotation
             ? ActivePerceptionGoal.Annotate
-            : physicalAction
+            : physicalAction || windowAction
                 ? ActivePerceptionGoal.Act
                 : verification
                     ? ActivePerceptionGoal.Verify
@@ -92,10 +95,16 @@ internal static class ActivePerceptionPlanner
         return new ActivePerceptionPlan(
             goal,
             scope,
-            RequiresFreshEvidence: true,
+            RequiresFreshEvidence: requiresEvidence,
             PreferTextDetail: textDetail && !broadScope,
             AllowCloserLook: broadScope || textDetail);
     }
+
+    internal static bool IsWindowManagementRequest(string? text) =>
+        !string.IsNullOrWhiteSpace(text) &&
+        Matches(
+            text,
+            @"\b(close|shut|quit|exit|minimi[sz]e|maximi[sz]e|restore|bring\b.{0,20}\b(?:forward|front)|schließ\w*|schliess\w*|beend\w*|minimier\w*|maximier\w*|wiederherstell\w*|nach\s+vorne\s+bring\w*)\b");
 
     private static VisionRequestScope InferScope(string text, ActivePerceptionGoal goal)
     {

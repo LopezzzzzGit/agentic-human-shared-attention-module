@@ -35,4 +35,8 @@ proposal, planned work, implemented design, or retained historical decision.
 | Number | Design note | Status |
 | --- | --- | --- |
 | 001 | [Computer control and conversational permissions](001-computer-control-and-permissions.md) | Planned |
-
+| 002 | [Personal speech vocabulary and grounded entity resolution](002-personal-speech-vocabulary-and-grounded-entity-resolution.md) | In progress |
+| 003 | [Protected control plane and self-target exclusion](003-protected-control-plane-and-self-target-exclusion.md) | Implemented; live acceptance pending |
+| 004 | [Trusted observation and desktop-session boundaries](004-trusted-observation-and-desktop-session-boundaries.md) | Implemented; live acceptance pending |
+| 005 | [Approval transactions and emergency stop](005-approval-transactions-and-emergency-stop.md) | Implemented; live acceptance pending |
+| 006 | [Durable and temporary session lifecycle](006-durable-and-temporary-session-lifecycle.md) | Implemented; live acceptance pending |

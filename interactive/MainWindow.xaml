@@ -125,7 +125,7 @@
                             </ScrollViewer>
                             <ScrollViewer Height="27" Margin="0,7,0,0" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
                                 <TextBlock x:Name="CurrentSessionText" FontSize="10" TextWrapping="Wrap" Foreground="#295A8D"
-                                           Text="Session: none — the next conversation starts one" />
+                                           Text="Session: none — the next conversation starts a new saved session" />
                             </ScrollViewer>
                             <TextBlock Margin="0,10,0,0" FontSize="11" Foreground="#62788D" TextWrapping="Wrap">Tap once to talk · ASHA detects pauses · centre ends</TextBlock>
                         </StackPanel>
@@ -159,13 +159,16 @@
                                 <StackPanel>
                                     <TextBlock FontWeight="SemiBold" Foreground="#214E7D">Shared-attention session</TextBlock>
                                     <TextBlock Margin="0,3,0,0" FontSize="11" Foreground="#526A84" TextWrapping="Wrap"
-                                               Text="Conversation alone stays casual. Start a session when you want ASHA to keep the chat, cues, and teaching events together locally for review." />
-                                    <StackPanel Orientation="Horizontal" Margin="0,9,0,0">
-                                        <Button x:Name="SessionButton" Padding="9,5" Click="Session_Click">Start session</Button>
-                                        <Button Margin="8,0,0,0" Padding="9,5" Click="Sessions_Click">Open sessions</Button>
-                                    </StackPanel>
+                                               Text="New conversations are retained automatically. Continue an older session explicitly, or use Temporary when you do not want it kept." />
+                                    <WrapPanel Margin="0,9,0,0">
+                                        <Button x:Name="SessionButton" Padding="9,5" Margin="0,0,7,6" Click="Session_Click">New session</Button>
+                                        <Button x:Name="TemporarySessionButton" Padding="9,5" Margin="0,0,7,6" Click="TemporarySession_Click">Temporary</Button>
+                                        <Button Padding="9,5" Margin="0,0,7,6" Click="Sessions_Click">Sessions</Button>
+                                        <Button x:Name="KeepSessionButton" Padding="9,5" Margin="0,0,7,6" Click="KeepSession_Click" Visibility="Collapsed">Keep this session</Button>
+                                        <Button x:Name="EndSessionButton" Padding="9,5" Margin="0,0,0,6" Click="EndSession_Click" Visibility="Collapsed">End session</Button>
+                                    </WrapPanel>
                                     <TextBlock x:Name="SessionStatusText" Margin="0,8,0,0" FontSize="11" Foreground="#62788D" TextWrapping="Wrap"
-                                               Text="No durable session is active." />
+                                               Text="No session is active. Tapping the orb starts a new retained session." />
                                 </StackPanel>
                             </Border>
                             <Border Margin="0,11,0,0" Padding="10" CornerRadius="12" Background="#EAF6FFFF" BorderBrush="#C9DFF2" BorderThickness="1">
@@ -187,9 +190,15 @@
                                 <TextBlock FontWeight="SemiBold" Foreground="#3B347D">Computer control</TextBlock>
                                 <TextBlock Margin="0,3,0,0" FontSize="11" Foreground="#5E5A7F" TextWrapping="Wrap"
                                                Text="Starts a temporary control lease for the capabilities you have allowed in Settings. Ending the lease leaves those global limits unchanged." />
-                                    <Button x:Name="ControlSessionButton" Margin="0,9,0,0" Padding="9,5" HorizontalAlignment="Left" Click="ControlSession_Click">Enable computer control</Button>
-                                    <TextBlock x:Name="ControlSessionStatusText" Margin="0,8,0,0" FontSize="11" Foreground="#5E5A7F" TextWrapping="Wrap"
-                                               Text="Computer control is disabled." />
+                                    <StackPanel Orientation="Horizontal" Margin="0,9,0,0">
+                                        <Button x:Name="ControlSessionButton" Padding="9,5" HorizontalAlignment="Left" Click="ControlSession_Click">Enable computer control</Button>
+                                        <Button x:Name="RestartControlSessionButton" Margin="8,0,0,0" Padding="9,5" HorizontalAlignment="Left"
+                                                Click="RestartControlSession_Click" Visibility="Collapsed">Restart computer control</Button>
+                                    </StackPanel>
+                                <TextBlock x:Name="ControlSessionStatusText" Margin="0,8,0,0" FontSize="11" Foreground="#5E5A7F" TextWrapping="Wrap"
+                                           Text="Computer control is disabled." />
+                                <TextBlock Margin="0,5,0,0" FontSize="10" Foreground="#6B6787" TextWrapping="Wrap"
+                                           Text="Emergency stop: press Ctrl+Alt+Escape at any time." />
                                 </StackPanel>
                             </Border>
                         </StackPanel>
@@ -199,6 +208,16 @@
                         <TextBlock FontWeight="SemiBold" Foreground="#214E7D">Global settings</TextBlock>
                         <TextBlock Margin="0,4,0,0" FontSize="12" Foreground="#526A84" TextWrapping="Wrap"
                                    Text="Microphone, speakers, local speech services, hotkeys, privacy, and shared-attention diagnostics." />
+
+                        <Border Margin="0,12,0,0" Padding="12" CornerRadius="15" Background="#F8F6FFFF" BorderBrush="#D5CEF9" BorderThickness="1">
+                            <StackPanel>
+                                <TextBlock FontWeight="SemiBold" Foreground="#3B347D">Speech</TextBlock>
+                                <TextBlock Margin="0,4,0,0" FontSize="11" Foreground="#5E5A7F" TextWrapping="Wrap"
+                                           Text="Teach ASHA canonical spellings and spoken aliases for names and specialist terms. Vocabulary stays local and can be scoped to a profile, project, or session." />
+                                <Button Margin="0,9,0,0" Padding="9,5" HorizontalAlignment="Left" Click="TeachWords_Click">Teach ASHA new words…</Button>
+                                <TextBlock x:Name="SpeechVocabularyStatusText" Margin="0,7,0,0" FontSize="10" Foreground="#6B6787" TextWrapping="Wrap" />
+                            </StackPanel>
+                        </Border>
 
                         <Border Margin="0,12,0,0" Padding="12" CornerRadius="15" Background="#F6FBFFFF" BorderBrush="#C9DFF2" BorderThickness="1">
                             <StackPanel>
@@ -273,6 +292,8 @@
                                 <CheckBox x:Name="PhysicalFallbackCheckBox" Margin="20,6,0,0"
                                           Checked="ComputerControlPolicyChanged" Unchecked="ComputerControlPolicyChanged"
                                           Content="Ask before falling back from virtual to physical input" />
+                                <TextBlock Margin="20,5,0,0" FontSize="10" Foreground="#6B6787" TextWrapping="Wrap"
+                                           Text="An approval is valid for one exact action only. Ctrl+Alt+Escape cancels immediately." />
 
                                 <CheckBox x:Name="ControlPresenceCheckBox" Margin="0,12,0,0" Checked="ControlPresenceChanged" Unchecked="ControlPresenceChanged"
                                           Content="Show the blue-violet desktop-control presence when ASHA is acting" />

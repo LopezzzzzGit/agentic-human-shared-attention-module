@@ -27,10 +27,16 @@ public sealed class AshaPreferences
     /// </summary>
     public ComputerControlPolicy ComputerControl { get; set; } = new();
     /// <summary>
-    /// An intentionally started session may survive an ASHA restart. Casual
-    /// conversation never writes this value and therefore remains transient.
+    /// Legacy migration field. Earlier builds silently reactivated this
+    /// session after restart. Current builds migrate it to LastSessionId and
+    /// keep the active-session choice process-local.
     /// </summary>
     public string? ActiveSessionId { get; set; }
+    /// <summary>
+    /// The most recently active retained session, used only for discovery in
+    /// the session library. It is never loaded without an explicit Continue.
+    /// </summary>
+    public string? LastSessionId { get; set; }
 
     public static AshaPreferences Load()
     {
@@ -41,6 +47,10 @@ public sealed class AshaPreferences
             var preferences = JsonSerializer.Deserialize<AshaPreferences>(File.ReadAllText(path)) ?? new AshaPreferences();
             preferences.ComputerControl ??= new ComputerControlPolicy();
             preferences.ComputerControl.Normalize();
+            if (string.IsNullOrWhiteSpace(preferences.LastSessionId) &&
+                !string.IsNullOrWhiteSpace(preferences.ActiveSessionId))
+                preferences.LastSessionId = preferences.ActiveSessionId;
+            preferences.ActiveSessionId = null;
             return preferences;
         }
         catch

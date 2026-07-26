@@ -28,6 +28,17 @@ public sealed record ModelToolPhaseMeasurement(
     IReadOnlyList<string> DisclosedTools,
     string ToolChoice);
 
+public sealed record DesktopActionVerificationMeasurement(
+    DateTime MeasuredAtUtc,
+    string? ActionId,
+    string? TaskId,
+    int? TaskStep,
+    string Action,
+    string? TargetName,
+    string Outcome,
+    string? EvidenceSnapshotId,
+    double? ChangedScore);
+
 /// <summary>
 /// Captures one short voice turn as a 16 kHz mono WAV file. This is the
 /// established microphone path used by ASHA before continuous turn-taking.
@@ -261,6 +272,10 @@ public sealed class AshaVoiceSession : IDisposable
         desktop capability. Answer ordinary conversation directly. At every
         phase, use only tools present in the current request. Never infer,
         remember, or call a tool from an earlier or later phase.
+        An unfinished desktop objective from an earlier or restored session is
+        narrative context only. Never resume it from the transcript alone.
+        The person's current turn must explicitly continue it or state a new
+        actionable goal.
 
         A foreground UI snapshot is versioned. Local element IDs and old
         coordinates expire when the state changes. Address controls by exact
@@ -277,10 +292,26 @@ public sealed class AshaVoiceSession : IDisposable
     private readonly GroqKeyRotator _groqKeys = GroqKeyRotator.LoadDefault();
     private readonly List<ChatTurn> _history = [];
     private string _sessionSummary = string.Empty;
+    private string? _pendingDesktopRequest;
+    private PendingDesktopClarification? _pendingDesktopClarification;
+    private VerifiedDesktopTarget? _lastVerifiedDesktopTarget;
     private bool _disposed;
+
+    private sealed record VerifiedDesktopTarget(
+        string Name,
+        string? Role,
+        string? Container,
+        DateTimeOffset VerifiedAtUtc);
+
+    private sealed record PendingDesktopClarification(
+        string OriginalRequest,
+        string? HeardTarget,
+        IReadOnlyList<string> Candidates,
+        DateTimeOffset RequestedAtUtc);
 
     public event Action<ModelRequestMeasurement>? ModelRequestMeasured;
     public event Action<ModelToolPhaseMeasurement>? ModelToolPhaseMeasured;
+    public event Action<DesktopActionVerificationMeasurement>? DesktopActionVerificationMeasured;
     public bool IsGroqConfigured => _groqKeys.IsConfigured;
     public int GroqKeyCount => _groqKeys.Count;
     public bool SupportsVision => ConfiguredModelSupportsVision();
@@ -305,6 +336,9 @@ public sealed class AshaVoiceSession : IDisposable
             _history.Add(new ChatTurn(role, message.Text));
         }
         _sessionSummary = summary?.Trim() ?? string.Empty;
+        _pendingDesktopRequest = null;
+        _pendingDesktopClarification = null;
+        _lastVerifiedDesktopTarget = null;
         TrimRecentHistory();
     }
 
@@ -312,6 +346,9 @@ public sealed class AshaVoiceSession : IDisposable
     {
         _history.Clear();
         _sessionSummary = string.Empty;
+        _pendingDesktopRequest = null;
+        _pendingDesktopClarification = null;
+        _lastVerifiedDesktopTarget = null;
     }
 
     public async Task<string> CompressConversationAsync(
@@ -353,7 +390,10 @@ public sealed class AshaVoiceSession : IDisposable
         DesktopAwarenessContext? awarenessContext,
         CancellationToken cancellationToken)
     {
-        var transcript = await TranscribeTurnAsync(wav, cancellationToken).ConfigureAwait(false);
+        var transcript = await TranscribeTurnAsync(
+            wav,
+            SpeechRecognitionBias.Empty,
+            cancellationToken).ConfigureAwait(false);
         if (string.IsNullOrWhiteSpace(transcript))
             return new VoiceTurnResult("", "I did not catch that. Please try again.");
 
@@ -369,7 +409,13 @@ public sealed class AshaVoiceSession : IDisposable
     }
 
     public Task<string> TranscribeTurnAsync(byte[] wav, CancellationToken cancellationToken) =>
-        TranscribeAsync(wav, cancellationToken);
+        TranscribeAsync(wav, SpeechRecognitionBias.Empty, cancellationToken);
+
+    internal Task<string> TranscribeTurnAsync(
+        byte[] wav,
+        SpeechRecognitionBias? bias,
+        CancellationToken cancellationToken) =>
+        TranscribeAsync(wav, bias ?? SpeechRecognitionBias.Empty, cancellationToken);
 
     public async Task<string> RespondToTranscriptAsync(
         string transcript,
@@ -502,12 +548,19 @@ public sealed class AshaVoiceSession : IDisposable
         return string.IsNullOrWhiteSpace(summary) ? null : Regex.Replace(summary, @"\s+", " ").Trim();
     }
 
-    private async Task<string> TranscribeAsync(byte[] wav, CancellationToken cancellationToken)
+    private async Task<string> TranscribeAsync(
+        byte[] wav,
+        SpeechRecognitionBias bias,
+        CancellationToken cancellationToken)
     {
         using var form = new MultipartFormDataContent();
         using var audio = new ByteArrayContent(wav);
         audio.Headers.ContentType = new MediaTypeHeaderValue("audio/wav");
         form.Add(audio, "file", "asha-turn.wav");
+        if (!string.IsNullOrWhiteSpace(bias.Hotwords))
+            form.Add(new StringContent(bias.Hotwords, Encoding.UTF8), "hotwords");
+        if (!string.IsNullOrWhiteSpace(bias.InitialPrompt))
+            form.Add(new StringContent(bias.InitialPrompt, Encoding.UTF8), "initial_prompt");
 
         using var response = await _http.PostAsync($"{SpeechBaseUrl}/stt", form, cancellationToken).ConfigureAwait(false);
         await EnsureSuccessAsync(response, "Local speech recognition", cancellationToken).ConfigureAwait(false);
@@ -587,12 +640,25 @@ public sealed class AshaVoiceSession : IDisposable
         if (!IsGroqConfigured)
             throw new InvalidOperationException("Set ASHA_GROQ_KEYS or configure a Groq key in settings, then restart ASHA.");
 
+        var effectiveUserText = ResolvePendingDesktopClarification(
+            _pendingDesktopClarification,
+            userText) ??
+            ResolvePendingDesktopRequest(_pendingDesktopRequest, userText);
+        if (string.Equals(effectiveUserText, userText, StringComparison.Ordinal) &&
+            !IsContinuationFollowUp(userText))
+            _pendingDesktopClarification = null;
+        effectiveUserText = AddVerifiedRepeatTargetContext(effectiveUserText, userText);
+        var continuingPendingRequest = !string.Equals(effectiveUserText, userText, StringComparison.Ordinal);
         var allowApplicationControl = controlAccess.CanOpenApplicationsAndFolders;
         var allowDesktopAction =
             controlAccess.CanUseKeyboard ||
             controlAccess.CanUsePhysicalCursor ||
             controlAccess.CanInteractWithVirtualCursor;
-        var perceptionPlan = InferPerceptionPlan(userText);
+        var perceptionPlan = InferPerceptionPlan(effectiveUserText);
+        if (perceptionPlan.Goal == ActivePerceptionGoal.Act)
+            _pendingDesktopRequest = continuingPendingRequest ? _pendingDesktopRequest : userText.Trim();
+        else if (!continuingPendingRequest)
+            _pendingDesktopRequest = null;
         if (vision is null &&
             perceptionPlan.RequiresFreshEvidence &&
             allowModelRequestedVision &&
@@ -600,7 +666,7 @@ public sealed class AshaVoiceSession : IDisposable
             SupportsVision)
         {
             vision = await visionResolver(
-                userText,
+                effectiveUserText,
                 new VisionRequest(
                     VisionRequestKind.ModelRequested,
                     perceptionPlan.Scope,
@@ -614,7 +680,7 @@ public sealed class AshaVoiceSession : IDisposable
             new
             {
                 role = "system",
-                content = controlAccess.DescribeForModel(virtualInteractionConnected: true),
+                content = controlAccess.DescribeForModel(),
             },
         };
         if (!string.IsNullOrWhiteSpace(_sessionSummary))
@@ -642,8 +708,16 @@ public sealed class AshaVoiceSession : IDisposable
                 content = FreshEvidenceInstruction(perceptionPlan.Goal),
             });
         }
+        else if (vision is null)
+        {
+            messages.Add(new
+            {
+                role = "system",
+                content = "No current desktop image is attached to this turn. You may acknowledge what the person described, but do not say that you see it, that the screen or current view shows it, or that a visual detail is confirmed. Request a current view when the answer depends on one.",
+            });
+        }
         messages.AddRange(_history.Select(turn => new { role = turn.Role, content = turn.Content }));
-        messages.Add(CreateUserMessage(userText, vision));
+        messages.Add(CreateUserMessage(effectiveUserText, vision));
 
         var baseUrl = (Environment.GetEnvironmentVariable("ASHA_GROQ_BASE_URL") ?? GroqBaseUrl).TrimEnd('/');
         var model = GroqModel();
@@ -674,7 +748,7 @@ public sealed class AshaVoiceSession : IDisposable
                     messages,
                     message,
                     capabilityRequests[0],
-                    userText,
+                    effectiveUserText,
                     vision,
                     visionResolver,
                     visualToolExecutor,
@@ -689,10 +763,10 @@ public sealed class AshaVoiceSession : IDisposable
             }
             else if (vision is null && viewRequests.Length > 0 && visionResolver is not null)
             {
-                vision = await visionResolver(userText, ReadVisionRequest(viewRequests[0]), cancellationToken).ConfigureAwait(false);
+                vision = await visionResolver(effectiveUserText, ReadVisionRequest(viewRequests[0]), cancellationToken).ConfigureAwait(false);
                 if (vision is not null)
                 {
-                    messages[^1] = CreateUserMessage(userText, vision);
+                    messages[^1] = CreateUserMessage(effectiveUserText, vision);
                     tools = vision.HasDesktopMapping && visualToolExecutor is not null
                         ? SelectGroundedToolsAfterModelView(perceptionPlan, allowDesktopAction)
                         : null;
@@ -703,7 +777,7 @@ public sealed class AshaVoiceSession : IDisposable
                         toolChoice: groundedChoice).ConfigureAwait(false);
                     var groundedMessage = grounded.RootElement.GetProperty("choices")[0].GetProperty("message");
                     reply = await CompleteGroundedTurnAsync(
-                        messages, groundedMessage, userText, vision, visionResolver, visualToolExecutor,
+                        messages, groundedMessage, effectiveUserText, vision, visionResolver, visualToolExecutor,
                         allowDesktopAction, perceptionPlan, tools, baseUrl, model, cancellationToken, executedToolNames).ConfigureAwait(false);
                 }
                 else
@@ -725,19 +799,24 @@ public sealed class AshaVoiceSession : IDisposable
             else if (toolCalls.Count > 0 && visualToolExecutor is not null)
                 reply = vision is not null
                     ? await CompleteGroundedTurnAsync(
-                        messages, message, userText, vision, visionResolver, visualToolExecutor,
+                        messages, message, effectiveUserText, vision, visionResolver, visualToolExecutor,
                         allowDesktopAction, perceptionPlan, tools, baseUrl, model, cancellationToken, executedToolNames).ConfigureAwait(false)
                     : await CompleteVisualToolCallsAsync(
                         messages, message, vision, visualToolExecutor, tools, baseUrl, model,
-                        cancellationToken, executedToolNames, visionResolver, userText, allowDesktopAction).ConfigureAwait(false);
+                        cancellationToken, executedToolNames, visionResolver, effectiveUserText, allowDesktopAction).ConfigureAwait(false);
             else
                 reply = ReadMessageContent(message);
         }
 
         if (executedToolNames.Count == 0 && ClaimsVisualActionSucceeded(reply))
             reply = "I couldn't verify that visual action, so I haven't claimed it succeeded.";
+        reply = EnforceEvidenceBoundVisualLanguage(reply, vision is not null);
         reply = NormalizeHumanFacingReply(StripReasoningMarkup(reply));
         if (string.IsNullOrWhiteSpace(reply)) reply = "I have highlighted the relevant area for you.";
+        if (perceptionPlan.Goal == ActivePerceptionGoal.Act &&
+            executedToolNames.Count > 0 &&
+            !ReplyDescribesUnfinishedAction(reply))
+            _pendingDesktopRequest = null;
 
         _history.Add(new ChatTurn("user", userText));
         _history.Add(new ChatTurn("assistant", reply));
@@ -762,10 +841,50 @@ public sealed class AshaVoiceSession : IDisposable
         CancellationToken cancellationToken,
         ISet<string> executedToolNames)
     {
-        var capability = selectionCall.Arguments.TryGetProperty("capability", out var rawCapability) &&
+        var requestedCapability = selectionCall.Arguments.TryGetProperty("capability", out var rawCapability) &&
                          rawCapability.ValueKind == JsonValueKind.String
             ? rawCapability.GetString()?.Trim() ?? string.Empty
             : string.Empty;
+        var capability = NormalizeSelectedCapability(
+            requestedCapability,
+            perceptionPlan,
+            userText,
+            allowApplicationControl,
+            allowDesktopAction);
+
+        var requiresVisualEvidence =
+            capability is "desktop_observation" or "visual_guidance" or "desktop_interaction";
+        if (vision is null &&
+            requiresVisualEvidence &&
+            allowModelRequestedVision &&
+            visionResolver is not null &&
+            SupportsVision)
+        {
+            var scope = perceptionPlan.Goal == ActivePerceptionGoal.None
+                ? VisionRequestScope.ForegroundWindow
+                : perceptionPlan.Scope;
+            vision = await visionResolver(
+                userText,
+                new VisionRequest(
+                    VisionRequestKind.ModelRequested,
+                    scope,
+                    PreferTextDetail: perceptionPlan.PreferTextDetail ||
+                                      capability == "desktop_interaction"),
+                cancellationToken).ConfigureAwait(false);
+            if (vision is not null)
+            {
+                messages.Insert(messages.Count - 1, new
+                {
+                    role = "system",
+                    content = FreshEvidenceInstruction(
+                        perceptionPlan.Goal == ActivePerceptionGoal.None
+                            ? ActivePerceptionGoal.Act
+                            : perceptionPlan.Goal),
+                });
+                messages[^1] = CreateUserMessage(userText, vision);
+            }
+        }
+
         var disclosedTools = SelectToolsForCapability(
             capability,
             vision is { HasDesktopMapping: true },
@@ -788,12 +907,15 @@ public sealed class AshaVoiceSession : IDisposable
                 {
                     ok = true,
                     selected = capability,
+                    requested = requestedCapability,
                     instruction = "The selected capability's exact tool contract is available on the next turn. Use only that contract.",
                 }),
         });
 
         if (disclosedTools is null)
         {
+            if (requiresVisualEvidence && vision is null)
+                return "I cannot access a current view under the active privacy and session settings.";
             using var unavailable = await SendChatCompletionAsync(
                 baseUrl, model, messages, null, cancellationToken).ConfigureAwait(false);
             return ReadMessageContent(unavailable.RootElement.GetProperty("choices")[0].GetProperty("message"));
@@ -901,14 +1023,120 @@ public sealed class AshaVoiceSession : IDisposable
         }
     }
 
+    private static string ResolvePendingDesktopRequest(string? pendingRequest, string currentText)
+    {
+        if (string.IsNullOrWhiteSpace(pendingRequest) || !IsContinuationFollowUp(currentText))
+            return currentText;
+        return $"{pendingRequest.Trim()}\n\nThe person now confirms: {currentText.Trim()}. Continue the unfinished request from fresh current evidence.";
+    }
+
+    private static string? ResolvePendingDesktopClarification(
+        PendingDesktopClarification? clarification,
+        string currentText)
+    {
+        if (clarification is null ||
+            DateTimeOffset.UtcNow - clarification.RequestedAtUtc > TimeSpan.FromMinutes(10) ||
+            string.IsNullOrWhiteSpace(currentText) ||
+            currentText.Length > 180)
+            return null;
+
+        var candidateScore = clarification.Candidates
+            .Select(candidate => GroundedEntityResolver.ScorePair(currentText, candidate))
+            .DefaultIfEmpty(0)
+            .Max();
+        var heardScore = string.IsNullOrWhiteSpace(clarification.HeardTarget)
+            ? 0
+            : GroundedEntityResolver.ScorePair(currentText, clarification.HeardTarget);
+        if (!IsContinuationFollowUp(currentText) &&
+            candidateScore < 0.45 &&
+            heardScore < 0.45)
+            return null;
+
+        var choices = clarification.Candidates.Count == 0
+            ? "No reliable candidate names were established."
+            : $"The runtime's visible candidates were: {string.Join("; ", clarification.Candidates)}.";
+        return $"""
+            {clarification.OriginalRequest}
+
+            The runtime previously needed clarification for the visible target "{clarification.HeardTarget}". {choices}
+            The person now answers: {currentText.Trim()}.
+            Resolve that answer against fresh current evidence and continue the original request. Do not ask the same clarification again unless the refreshed evidence is still genuinely ambiguous.
+            """;
+    }
+
+    private static bool IsContinuationFollowUp(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text) || text.Length > 90) return false;
+        var normalized = Regex.Replace(
+            text.Trim(),
+            @"^(?:(?:well|alright|all\s+right)|(?:also|na\s+gut))\b[\s,;:–—-]*",
+            string.Empty,
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        return Regex.IsMatch(
+            normalized,
+            @"^(?:(?:yes|yeah|yep|okay|ok|sure|please|go(?:\s+ahead)?|do\s+(?:it|so|that)|then[\s,]+do\s+(?:it|so|that)|continue|carry\s+on|try\s+(?:it\s+)?again|retry|again|(?:(?:inspect|look\s+at|check|refresh|reacquire)\s+(?:it|that|this|the\s+(?:screen|desktop|window|view|current\s+state))))|(?:ja|okay|ok|klar|bitte|los|mach(?:e)?\s+(?:es|das|weiter)|tu\s+(?:es|das)|dann[\s,]+mach(?:e)?\s+(?:es|das)|weiter|nochmal|erneut|versuch(?:e)?\s+(?:es\s+)?nochmal|(?:(?:prüf|pruef|schau|sieh|aktualisier)\w*\s+(?:es|das|dies|den\s+(?:bildschirm|desktop|zustand)))))[.!?…]*$",
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+    }
+
+    private string AddVerifiedRepeatTargetContext(string effectiveText, string currentText)
+    {
+        var target = _lastVerifiedDesktopTarget;
+        if (target is null ||
+            DateTimeOffset.UtcNow - target.VerifiedAtUtc > TimeSpan.FromMinutes(10) ||
+            !IsVerifiedRepeatActionRequest(currentText))
+            return effectiveText;
+
+        var name = target.Name.Length <= 240 ? target.Name : target.Name[..240];
+        var role = string.IsNullOrWhiteSpace(target.Role) ? "unknown" : target.Role;
+        var container = string.IsNullOrWhiteSpace(target.Container) ? "unknown" : target.Container;
+        return $"""
+            {effectiveText}
+
+            Runtime continuity evidence: the most recently verified desktop target was named "{name}", with role "{role}", under container "{container}". The person's repeat reference may refer to that semantic target. Reacquire it from fresh current evidence by name, role, and container. Never reuse an old element ID or coordinate.
+            """;
+    }
+
+    private static bool IsVerifiedRepeatActionRequest(string? text)
+    {
+        if (string.IsNullOrWhiteSpace(text) || text.Length > 180) return false;
+        if (Regex.IsMatch(
+                text,
+                @"\b(?:say|tell|read|speak|explain|repeat)\b.*\b(?:again|once more)\b|\b(?:sag|erzähl|lies|sprich|erklär|wiederhol)\w*\b.*\b(?:nochmal|erneut|wieder)\b",
+                RegexOptions.IgnoreCase | RegexOptions.CultureInvariant))
+            return false;
+        return Regex.IsMatch(
+            text,
+            @"\b(?:(?:click|double[- ]click|right[- ]click|open|select|choose|activate|press|try|do)\s+(?:it|that|this|the same(?: one)?)?\s*(?:once\s+more|again)|(?:again|retry)\s+(?:click|open|select|choose|activate|press|try|do)|(?:klick|doppelklick|rechtsklick|öffne|oeffne|wähle|waehle|aktiviere|drück|drueck|versuch|mach)\w*\s+(?:(?:es|das|dies|denselben|die gleiche)\s+)?(?:bitte\s+)?(?:nochmal|erneut|wieder)(?:\s+an)?|(?:nochmal|erneut)\s+(?:klick|öffne|oeffne|wähle|waehle|aktiviere|drück|drueck|versuch|mach)\w*)\b",
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+    }
+
+    private static bool ReplyDescribesUnfinishedAction(string? reply) =>
+        string.IsNullOrWhiteSpace(reply) ||
+        Regex.IsMatch(
+            reply,
+            @"\b(?:could(?:n't| not)|can(?:not|'t)|haven't|have not|not yet|unable|failed|try again|need (?:a |another |the )?(?:current|fresh|new)|couldn't verify|not verified|not complete|which one|which target|did you mean|clarif\w*|nicht|konnte|kann nicht|noch nicht|fehlgeschlagen|erneut|nochmal|welche\w*|meinst du)\b",
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+
+    private static string NormalizeSelectedCapability(
+        string requestedCapability,
+        ActivePerceptionPlan perceptionPlan,
+        string userText,
+        bool allowApplicationControl,
+        bool allowDesktopAction) =>
+        ActivePerceptionPlanner.IsWindowManagementRequest(userText) &&
+        allowApplicationControl
+            ? "window_management"
+            : string.Equals(requestedCapability, "application_control", StringComparison.Ordinal) &&
+              perceptionPlan.Goal == ActivePerceptionGoal.Act &&
+              allowDesktopAction
+                ? "desktop_interaction"
+                : requestedCapability;
+
     private ActivePerceptionPlan InferPerceptionPlan(string userText)
     {
         var plan = ActivePerceptionPlanner.Infer(userText);
         if (plan.RequiresFreshEvidence ||
-            !Regex.IsMatch(
-                userText,
-                @"\b(?:try|do|send|click|open|select)\s+(?:it\s+)?again\b|\b(?:again|retry|nochmal|erneut|versuch(?:e|en)?\s+es\s+nochmal)\b",
-                RegexOptions.IgnoreCase | RegexOptions.CultureInvariant))
+            !IsVerifiedRepeatActionRequest(userText))
             return plan;
 
         for (var index = _history.Count - 1; index >= 0; index--)
@@ -921,6 +1149,41 @@ public sealed class AshaVoiceSession : IDisposable
         }
         return plan;
     }
+
+    internal static string ResolvePendingRequestForTesting(string? pendingRequest, string currentText) =>
+        ResolvePendingDesktopRequest(pendingRequest, currentText);
+
+    internal static string? ResolveClarificationForTesting(
+        string originalRequest,
+        string? heardTarget,
+        IReadOnlyList<string> candidates,
+        string currentText) =>
+        ResolvePendingDesktopClarification(
+            new PendingDesktopClarification(
+                originalRequest,
+                heardTarget,
+                candidates,
+                DateTimeOffset.UtcNow),
+            currentText);
+
+    internal static string NormalizeSelectedCapabilityForTesting(
+        string requestedCapability,
+        string userText,
+        bool allowDesktopAction) =>
+        NormalizeSelectedCapability(
+            requestedCapability,
+            ActivePerceptionPlanner.Infer(userText),
+            userText,
+            allowApplicationControl: true,
+            allowDesktopAction);
+
+    internal static bool IsVerifiedRepeatActionRequestForTesting(string text) =>
+        IsVerifiedRepeatActionRequest(text);
+
+    internal static string? EnforceEvidenceBoundVisualLanguageForTesting(
+        string? reply,
+        bool hasCurrentVisualEvidence) =>
+        EnforceEvidenceBoundVisualLanguage(reply, hasCurrentVisualEvidence);
 
     private static object CreateUserMessage(string userText, VisionAttachment? vision)
     {
@@ -1081,7 +1344,7 @@ public sealed class AshaVoiceSession : IDisposable
         vision is { HasDesktopMapping: true } &&
         ((plan.Goal == ActivePerceptionGoal.Act &&
           allowDesktopAction &&
-          ToolNames(tools).Contains("asha_desktop_action", StringComparer.Ordinal)) ||
+          ToolNames(tools).Contains("asha_act", StringComparer.Ordinal)) ||
          (plan.Goal == ActivePerceptionGoal.Annotate &&
           ToolNames(tools).Contains("asha_mark", StringComparer.Ordinal)))
             ? "required"
@@ -1226,7 +1489,8 @@ public sealed class AshaVoiceSession : IDisposable
             (canRequestVision || allowApplicationControl || allowDesktopAction);
         if (canNegotiateCapability &&
             (plan.Goal == ActivePerceptionGoal.None ||
-             (plan.Goal == ActivePerceptionGoal.Act && allowApplicationControl)))
+             (plan.Goal == ActivePerceptionGoal.Act &&
+              (allowApplicationControl || allowDesktopAction))))
             return CapabilitySelectionToolDefinitions;
 
         if (hasGroundedVision && hasToolExecutor)
@@ -1252,12 +1516,10 @@ public sealed class AshaVoiceSession : IDisposable
         return capability switch
         {
             "desktop_observation" when hasGroundedVision => DetailAndViewToolDefinitions,
-            "desktop_observation" when canRequestVision => ViewRequestToolDefinitions,
             "visual_guidance" when hasGroundedVision => VisualWithDetailToolDefinitions,
-            "visual_guidance" when canRequestVision => ViewRequestToolDefinitions,
             "application_control" when allowApplicationControl => ApplicationControlToolDefinitions,
+            "window_management" when allowApplicationControl => WindowManagementToolDefinitions,
             "desktop_interaction" when hasGroundedVision && allowDesktopAction => DesktopActionWithDetailToolDefinitions,
-            "desktop_interaction" when canRequestVision && allowDesktopAction => ViewRequestToolDefinitions,
             "guidance_management" => GuidanceManagementToolDefinitions,
             _ => null,
         };
@@ -1314,6 +1576,52 @@ public sealed class AshaVoiceSession : IDisposable
         return ToolNames(selected);
     }
 
+    internal static IReadOnlyList<string> CapabilityActionValuesForTesting(
+        string capability,
+        bool hasGroundedVision,
+        bool allowApplicationControl,
+        bool allowDesktopAction)
+    {
+        var selected = SelectToolsForCapability(
+            capability,
+            hasGroundedVision,
+            allowApplicationControl,
+            allowDesktopAction,
+            canRequestVision: true);
+        if (selected is null) return [];
+        foreach (var tool in selected)
+        {
+            var element = JsonSerializer.SerializeToElement(tool);
+            if (!element.TryGetProperty("function", out var function) ||
+                !string.Equals(
+                    function.GetProperty("name").GetString(),
+                    "asha_act",
+                    StringComparison.Ordinal) ||
+                !function.GetProperty("parameters")
+                    .GetProperty("properties")
+                    .TryGetProperty("action", out var action) ||
+                !action.TryGetProperty("enum", out var values))
+                continue;
+            return values
+                .EnumerateArray()
+                .Select(value => value.GetString() ?? string.Empty)
+                .Where(value => value.Length > 0)
+                .ToArray();
+        }
+        return [];
+    }
+
+    internal static bool DesktopActionSchemaContainsPropertyForTesting(string propertyName)
+    {
+        if (string.IsNullOrWhiteSpace(propertyName)) return false;
+        var element = JsonSerializer.SerializeToElement(DesktopActionToolDefinition);
+        return element
+            .GetProperty("function")
+            .GetProperty("parameters")
+            .GetProperty("properties")
+            .TryGetProperty(propertyName, out _);
+    }
+
     internal static int InitialToolSchemaCharactersForTesting(string text, bool allowComputerControl)
     {
         var tools = SelectInitialTools(
@@ -1346,6 +1654,24 @@ public sealed class AshaVoiceSession : IDisposable
 
     internal static bool IsDesktopTaskProgressToolForTesting(string name) =>
         IsDesktopTaskProgressTool(name);
+
+    internal static bool ShouldRenderVerifiedRepeatLocallyForTesting(
+        string outcome,
+        string toolName,
+        string userText) =>
+        ShouldRenderVerifiedRepeatLocally(outcome, toolName, userText);
+
+    internal static string RenderToolResultForTesting(string toolName, string output)
+    {
+        using var arguments = JsonDocument.Parse("{}");
+        var call = new AshaVisualToolCall(
+            "test-call",
+            toolName,
+            arguments.RootElement.Clone());
+        return TryRenderToolResult(call, output, out var rendered)
+            ? rendered
+            : string.Empty;
+    }
 
     private static IReadOnlyList<string> ToolNames(IReadOnlyList<object>? selected)
     {
@@ -1401,8 +1727,76 @@ public sealed class AshaVoiceSession : IDisposable
                 catch (Exception error) { output = JsonSerializer.Serialize(new { ok = false, error = error.Message }); }
             }
             outputs.Add(output);
+            if (IsDesktopTaskProgressTool(toolCall.Name))
+                TrackDesktopClarification(output, userText);
             messages.Add(new { role = "tool", tool_call_id = toolCall.Id, content = output });
         }
+
+        if (toolCalls.Count == 1 &&
+            ToolResultRequiresFreshView(outputs[0]) &&
+            visionResolver is not null &&
+            !string.IsNullOrWhiteSpace(userText) &&
+            remainingDesktopSteps > 0)
+        {
+            var refreshed = await visionResolver(
+                userText,
+                new VisionRequest(
+                    VisionRequestKind.ModelRequested,
+                    VisionRequestScope.ForegroundWindow,
+                    PreferTextDetail: true),
+                cancellationToken).ConfigureAwait(false);
+            if (refreshed is not null)
+            {
+                messages.Add(new
+                {
+                    role = "system",
+                    content = "The previous desktop action was intentionally not sent because its observation was stale. A fresh, versioned current foreground view is now attached. Re-ground the original request and call exactly one appropriate action or refusal tool. Do not reuse the old coordinates and do not claim that the rejected action happened.",
+                });
+                RemovePriorVisionMessages(messages);
+                messages.Add(CreateUserMessage(
+                    $"Re-ground and continue the original request from this fresh current view: {userText}",
+                    refreshed));
+                var retryPlan = ActivePerceptionPlanner.Infer(userText);
+                var retryTools = SelectGroundedToolsAfterModelView(
+                    retryPlan with { AllowCloserLook = true },
+                    allowDesktopAction);
+                var retryChoice = ToolChoiceForPlan(
+                    retryPlan,
+                    refreshed,
+                    allowDesktopAction,
+                    retryTools);
+                ReportToolPhase("stale_state_recovery", null, retryTools, retryChoice);
+                using var retry = await SendChatCompletionAsync(
+                    baseUrl,
+                    model,
+                    messages,
+                    retryTools,
+                    cancellationToken,
+                    toolChoice: retryChoice).ConfigureAwait(false);
+                var retryMessage = retry.RootElement.GetProperty("choices")[0].GetProperty("message");
+                return await CompleteGroundedTurnAsync(
+                    messages,
+                    retryMessage,
+                    userText,
+                    refreshed,
+                    visionResolver,
+                    visualToolExecutor,
+                    allowDesktopAction,
+                    retryPlan,
+                    retryTools,
+                    baseUrl,
+                    model,
+                    cancellationToken,
+                    executedToolNames,
+                    remainingDesktopSteps - 1,
+                    desktopTaskId).ConfigureAwait(false);
+            }
+        }
+
+        if (toolCalls.Count == 1 &&
+            ToolResultIsTerminalVerified(outputs[0]) &&
+            TryRenderToolResult(toolCalls[0], outputs[0], out var terminalResult))
+            return terminalResult;
 
         if (toolCalls.Count == 1 &&
             IsDesktopTaskProgressTool(toolCalls[0].Name) &&
@@ -1419,8 +1813,15 @@ public sealed class AshaVoiceSession : IDisposable
                 cancellationToken).ConfigureAwait(false);
             if (followUp is not null)
             {
+                var verificationOutcome = ReportDesktopActionVerification(toolCalls[0], outputs[0], followUp);
+                if (ShouldRenderVerifiedRepeatLocally(
+                        verificationOutcome,
+                        toolCalls[0].Name,
+                        userText))
+                    return RenderPostActionEvidenceResult(outputs[0], followUp);
+
                 if (remainingDesktopSteps <= 0)
-                    return string.Equals(toolCalls[0].Name, "asha_desktop_action", StringComparison.Ordinal)
+                    return IsUnifiedOrLegacyDesktopActionTool(toolCalls[0].Name)
                         ? RenderPostActionEvidenceResult(outputs[0], followUp)
                         : TryRenderToolResult(toolCalls[0], outputs[0], out var exhaustedResult)
                             ? exhaustedResult
@@ -1429,7 +1830,7 @@ public sealed class AshaVoiceSession : IDisposable
                 messages.Add(new
                 {
                     role = "system",
-                    content = $"Continue the person's original desktop request as one bounded task. The runtime has completed one step and attached a fresh, versioned foreground state. Re-evaluate the remaining goal from this new state. If work remains, call exactly one appropriate tool. If the complete request is now established, answer only from current evidence. Do not narrate a click, open, selection, or other action unless a tool call in this task actually performed it. At most {remainingDesktopSteps} additional desktop step(s) remain.",
+                    content = $"Continue the person's original desktop request as one bounded task. The runtime has completed one step and attached a fresh, versioned foreground state. Re-evaluate the remaining goal from this new state. A merely selected item does not satisfy an open or activate goal; if current evidence shows the intended item selected but not opened, use an appropriate non-duplicate activation such as double-click or the approved Enter key. If work remains, call exactly one appropriate tool. If the complete request is now established, answer only from current evidence. Do not narrate a click, open, selection, or other action unless a tool call in this task actually performed it. At most {remainingDesktopSteps} additional desktop step(s) remain.",
                 });
                 RemovePriorVisionMessages(messages);
                 messages.Add(CreateUserMessage(
@@ -1440,21 +1841,26 @@ public sealed class AshaVoiceSession : IDisposable
                 var continuationTools = SelectGroundedToolsAfterModelView(
                     continuationPlan with { AllowCloserLook = true },
                     allowDesktopAction);
-                ReportToolPhase("bounded_task_continuation", null, continuationTools, "auto");
+                var continuationChoice = ToolChoiceForPlan(
+                    continuationPlan,
+                    followUp,
+                    allowDesktopAction,
+                    continuationTools);
+                ReportToolPhase("bounded_task_continuation", null, continuationTools, continuationChoice);
                 using var continuation = await SendChatCompletionAsync(
                     baseUrl,
                     model,
                     messages,
                     continuationTools,
                     cancellationToken,
-                    toolChoice: "auto").ConfigureAwait(false);
+                    toolChoice: continuationChoice).ConfigureAwait(false);
                 var continuationMessage = continuation.RootElement.GetProperty("choices")[0].GetProperty("message");
                 var continuationCalls = ReadToolCalls(continuationMessage);
                 if (continuationCalls.Count == 0)
                 {
                     var finalText = ReadMessageContent(continuationMessage);
                     if (!ClaimsVisualActionSucceeded(finalText)) return finalText;
-                    return string.Equals(toolCalls[0].Name, "asha_desktop_action", StringComparison.Ordinal)
+                    return IsUnifiedOrLegacyDesktopActionTool(toolCalls[0].Name)
                         ? RenderPostActionEvidenceResult(outputs[0], followUp)
                         : TryRenderToolResult(toolCalls[0], outputs[0], out var verifiedRuntimeResult)
                             ? verifiedRuntimeResult
@@ -1510,8 +1916,126 @@ public sealed class AshaVoiceSession : IDisposable
         return ReadMessageContent(final.RootElement.GetProperty("choices")[0].GetProperty("message"));
     }
 
+    private void TrackDesktopClarification(string output, string? currentRequest)
+    {
+        try
+        {
+            using var document = JsonDocument.Parse(output);
+            var result = document.RootElement;
+            if (result.TryGetProperty("ok", out var ok) && ok.ValueKind == JsonValueKind.True)
+            {
+                _pendingDesktopClarification = null;
+                return;
+            }
+            if (!result.TryGetProperty("requires_clarification", out var required) ||
+                required.ValueKind != JsonValueKind.True)
+                return;
+
+            var candidates = result.TryGetProperty("candidates", out var rawCandidates) &&
+                             rawCandidates.ValueKind == JsonValueKind.Array
+                ? rawCandidates.EnumerateArray()
+                    .Where(candidate => candidate.ValueKind == JsonValueKind.String)
+                    .Select(candidate => candidate.GetString()?.Trim() ?? string.Empty)
+                    .Where(candidate => candidate.Length > 0)
+                    .Distinct(StringComparer.CurrentCultureIgnoreCase)
+                    .Take(5)
+                    .ToArray()
+                : [];
+            var originalRequest = !string.IsNullOrWhiteSpace(_pendingDesktopRequest)
+                ? _pendingDesktopRequest
+                : currentRequest;
+            if (string.IsNullOrWhiteSpace(originalRequest)) return;
+            _pendingDesktopClarification = new PendingDesktopClarification(
+                originalRequest.Trim(),
+                ReadResultString(result, "heard_target"),
+                candidates,
+                DateTimeOffset.UtcNow);
+        }
+        catch (JsonException)
+        {
+            // A malformed tool result is handled by the normal result path;
+            // it must not poison clarification state.
+        }
+    }
+
     private static bool IsDesktopTaskProgressTool(string name) =>
-        name is "asha_open_application" or "asha_open_folder" or "asha_desktop_action";
+        name is "asha_act" or "asha_open_application" or "asha_open_folder" or "asha_desktop_action";
+
+    private static bool IsUnifiedOrLegacyDesktopActionTool(string name) =>
+        name is "asha_act" or "asha_desktop_action";
+
+    private static bool ShouldRenderVerifiedRepeatLocally(
+        string outcome,
+        string toolName,
+        string? userText) =>
+        string.Equals(outcome, "target_state_verified", StringComparison.Ordinal) &&
+        IsUnifiedOrLegacyDesktopActionTool(toolName) &&
+        IsVerifiedRepeatActionRequest(userText);
+
+    private string ReportDesktopActionVerification(
+        AshaVisualToolCall call,
+        string output,
+        VisionAttachment evidence)
+    {
+        try
+        {
+            using var document = JsonDocument.Parse(output);
+            var result = document.RootElement;
+            var action = ReadResultString(result, "action") ?? call.Name;
+            var targetName =
+                ReadResultString(result, "target_name") ??
+                ReadResultString(result, "application") ??
+                ReadResultString(result, "folder");
+            var containerName = ReadResultString(result, "container_name");
+            var outcome = ClassifyPostActionOutcome(evidence, targetName, containerName);
+            if (string.Equals(outcome, "target_state_verified", StringComparison.Ordinal))
+            {
+                var groundedName = targetName;
+                var groundedRole = ReadResultString(result, "target_role");
+                if (result.TryGetProperty("grounded_bounds", out var bounds) &&
+                    bounds.ValueKind == JsonValueKind.Object)
+                {
+                    groundedName = ReadResultString(bounds, "name") ?? groundedName;
+                    groundedRole = ReadResultString(bounds, "role") ?? groundedRole;
+                }
+                if (!string.IsNullOrWhiteSpace(groundedName))
+                    _lastVerifiedDesktopTarget = new VerifiedDesktopTarget(
+                        groundedName,
+                        groundedRole,
+                        containerName,
+                        DateTimeOffset.UtcNow);
+            }
+            DesktopActionVerificationMeasured?.Invoke(new DesktopActionVerificationMeasurement(
+                DateTime.UtcNow,
+                ReadResultString(result, "action_id"),
+                ReadResultString(result, "task_id"),
+                result.TryGetProperty("task_step", out var rawStep) && rawStep.TryGetInt32(out var step) ? step : null,
+                action,
+                targetName,
+                outcome,
+                evidence.DesktopSnapshotId,
+                evidence.ChangedScore));
+            return outcome;
+        }
+        catch
+        {
+            // Verification telemetry is diagnostic evidence and must never
+            // interrupt the person's active desktop task.
+            return "verification_unavailable";
+        }
+    }
+
+    private static string ClassifyPostActionOutcome(
+        VisionAttachment evidence,
+        string? targetName,
+        string? containerName)
+    {
+        if (EvidenceConfirmsTargetState(evidence.DesktopContext, targetName, containerName))
+            return "target_state_verified";
+        return evidence.ChangedScore is >= 0.0015
+            ? "visible_change_only"
+            : "no_visible_response";
+    }
 
     private static AshaVisualToolCall WithDesktopTaskMetadata(
         AshaVisualToolCall call,
@@ -1563,6 +2087,34 @@ public sealed class AshaVoiceSession : IDisposable
         }
     }
 
+    private static bool ToolResultRequiresFreshView(string output)
+    {
+        try
+        {
+            using var document = JsonDocument.Parse(output);
+            return document.RootElement.TryGetProperty("requires_fresh_view", out var value) &&
+                   value.ValueKind == JsonValueKind.True;
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+    }
+
+    private static bool ToolResultIsTerminalVerified(string output)
+    {
+        try
+        {
+            using var document = JsonDocument.Parse(output);
+            return document.RootElement.TryGetProperty("terminal_verified", out var verified) &&
+                   verified.ValueKind == JsonValueKind.True;
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+    }
+
     private static bool TryRenderToolResult(AshaVisualToolCall call, string output, out string rendered)
     {
         rendered = string.Empty;
@@ -1575,10 +2127,40 @@ public sealed class AshaVoiceSession : IDisposable
 
             if (!ok.GetBoolean())
             {
-                var error = ReadResultString(result, "error");
+                if (result.TryGetProperty("requires_clarification", out var clarificationRequired) &&
+                    clarificationRequired.ValueKind == JsonValueKind.True)
+                {
+                    var question = ReadResultString(result, "clarification_question");
+                    rendered = string.IsNullOrWhiteSpace(question)
+                        ? "I found more than one possible visible target. Which one did you mean?"
+                        : question;
+                    return true;
+                }
+                if (result.TryGetProperty("requires_confirmation", out var confirmationRequired) &&
+                    confirmationRequired.ValueKind == JsonValueKind.True)
+                {
+                    var question = ReadResultString(result, "confirmation_question");
+                    rendered = string.IsNullOrWhiteSpace(question)
+                        ? "The application needs your attention before I continue."
+                        : question;
+                    return true;
+                }
+                var error = NormalizeToolErrorForSpeech(ReadResultString(result, "error"));
+                if ((result.TryGetProperty("not_running", out var notRunning) &&
+                     notRunning.ValueKind == JsonValueKind.True) ||
+                    (result.TryGetProperty("not_installed", out var notInstalled) &&
+                     notInstalled.ValueKind == JsonValueKind.True))
+                {
+                    rendered = string.IsNullOrWhiteSpace(error)
+                        ? "I couldn't find that application in the current desktop state."
+                        : error;
+                    return true;
+                }
                 rendered = string.IsNullOrWhiteSpace(error)
                     ? "I couldn't complete that action."
-                    : $"I couldn't complete that action. {error}";
+                    : StartsInFirstPerson(error)
+                        ? error
+                        : $"I couldn't complete that action. {error}";
                 return true;
             }
 
@@ -1589,6 +2171,7 @@ public sealed class AshaVoiceSession : IDisposable
                 "asha_open_application" => RenderApplicationConfirmation(result),
                 "asha_open_folder" => "I've opened the folder for you.",
                 "asha_desktop_action" => RenderDesktopActionConfirmation(result),
+                "asha_act" => RenderUnifiedActionConfirmation(result),
                 "asha_decline_action" => RenderActionRefusal(result),
                 "asha_decline_guidance" => RenderGuidanceRefusal(result),
                 _ => string.Empty,
@@ -1600,6 +2183,25 @@ public sealed class AshaVoiceSession : IDisposable
             return false;
         }
     }
+
+    private static string? NormalizeToolErrorForSpeech(string? error)
+    {
+        if (string.IsNullOrWhiteSpace(error)) return error;
+        var normalized = error.Trim();
+        normalized = Regex.Replace(normalized, @"\bASHA could not\b", "I couldn't", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        normalized = Regex.Replace(normalized, @"\bASHA couldn't\b", "I couldn't", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        normalized = Regex.Replace(normalized, @"\bASHA did not\b", "I didn't", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        normalized = Regex.Replace(normalized, @"\bASHA does not\b", "I don't", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        normalized = Regex.Replace(normalized, @"\bASHA stopped\b", "I stopped", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        normalized = Regex.Replace(normalized, @"\bASHA must\b", "I need to", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        return normalized;
+    }
+
+    private static bool StartsInFirstPerson(string text) =>
+        Regex.IsMatch(
+            text,
+            @"^(?:I\b|I'm\b|I've\b|I'd\b|I'll\b|My\b)",
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
 
     private static string RenderMarkConfirmation(JsonElement result)
     {
@@ -1616,6 +2218,19 @@ public sealed class AshaVoiceSession : IDisposable
             ? "I've opened the application and brought it to the front."
             : $"I've opened {application} and brought it to the front.";
     }
+
+    private static string RenderUnifiedActionConfirmation(JsonElement result) =>
+        ReadResultString(result, "action") switch
+        {
+            "launch_application" => RenderApplicationConfirmation(result),
+            "open_folder" => "I've opened the folder for you.",
+            "activate_window" => $"I've brought {ReadResultString(result, "window") ?? "that window"} to the front.",
+            "close_window" => $"I've closed {ReadResultString(result, "window") ?? "that window"}.",
+            "minimize_window" => $"I've minimized {ReadResultString(result, "window") ?? "that window"}.",
+            "maximize_window" => $"I've maximized {ReadResultString(result, "window") ?? "that window"}.",
+            "restore_window" => $"I've restored {ReadResultString(result, "window") ?? "that window"}.",
+            _ => RenderDesktopActionConfirmation(result),
+        };
 
     private static string RenderClearGuidanceConfirmation(JsonElement result)
     {
@@ -1712,7 +2327,27 @@ public sealed class AshaVoiceSession : IDisposable
     private static string NormalizeEvidenceTerm(string? value) =>
         string.IsNullOrWhiteSpace(value)
             ? string.Empty
-            : new string(value.Where(char.IsLetterOrDigit).Select(char.ToLowerInvariant).ToArray());
+            : SemanticUiVocabulary.CanonicalizeText(value);
+
+    internal static string PostActionOutcomeForTesting(
+        string? desktopContext,
+        double? changedScore,
+        string? targetName,
+        string? containerName = null) =>
+        ClassifyPostActionOutcome(
+            new VisionAttachment(
+                "test.png",
+                [],
+                0,
+                0,
+                100,
+                100,
+                100,
+                100,
+                DesktopContext: desktopContext,
+                ChangedScore: changedScore),
+            targetName,
+            containerName);
 
     private static string RenderActionRefusal(JsonElement result) => ReadResultString(result, "reason") switch
     {
@@ -1793,13 +2428,15 @@ public sealed class AshaVoiceSession : IDisposable
         IReadOnlyList<object>? tools,
         CancellationToken cancellationToken,
         int maxTokens = 420,
-        object? toolChoice = null)
+        object? toolChoice = null,
+        bool allowInvalidToolRecovery = true,
+        bool isToolRecovery = false)
     {
         var payload = new Dictionary<string, object?>
         {
             ["model"] = model,
             ["messages"] = messages,
-            ["temperature"] = 0.55,
+            ["temperature"] = isToolRecovery ? 0.1 : 0.55,
             ["max_completion_tokens"] = maxTokens,
         };
         if (tools is not null)
@@ -1844,26 +2481,92 @@ public sealed class AshaVoiceSession : IDisposable
         {
             throw new TimeoutException($"The model did not return this ASHA turn within {totalBudget.TotalSeconds:0} seconds.", error);
         }
-        using (response)
+        try
         {
-            await EnsureSuccessAsync(response, "Groq", cancellationToken).ConfigureAwait(false);
-            var document = JsonDocument.Parse(
-                await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false));
-            try
+            using (response)
             {
-                ModelRequestMeasured?.Invoke(measurement with
+                await EnsureSuccessAsync(response, "Groq", cancellationToken).ConfigureAwait(false);
+                var document = JsonDocument.Parse(
+                    await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false));
+                try
                 {
-                    PromptTokens = ReadUsageToken(document.RootElement, "prompt_tokens"),
-                    CompletionTokens = ReadUsageToken(document.RootElement, "completion_tokens"),
-                });
+                    ModelRequestMeasured?.Invoke(measurement with
+                    {
+                        PromptTokens = ReadUsageToken(document.RootElement, "prompt_tokens"),
+                        CompletionTokens = ReadUsageToken(document.RootElement, "completion_tokens"),
+                    });
+                }
+                catch
+                {
+                    // Diagnostics must never break a model turn.
+                }
+                return document;
             }
-            catch
+        }
+        catch (GroqRequestException error) when (
+            allowInvalidToolRecovery &&
+            tools is not null &&
+            IsRecoverableInvalidToolFailure(error.StatusCode, error.Detail, ToolNames(tools).Count))
+        {
+            var availableNames = ToolNames(tools);
+            var recoveryMessages = new List<object>(messages)
             {
-                // Diagnostics must never break a model turn.
-            }
-            return document;
+                new
+                {
+                    role = "system",
+                    content =
+                        $"The previous response attempted a function that is not available in this phase. " +
+                        $"The only callable functions now are: {string.Join(", ", availableNames)}. " +
+                        "Use exactly one listed function name and its supplied schema. All permitted lifecycle and input operations use the stable action envelope when it is listed. Do not invent or recall another function.",
+                },
+            };
+            var recoveryChoice = RecoveryToolChoice(error.Detail, availableNames);
+            ReportToolPhase("invalid_tool_recovery", null, tools, recoveryChoice);
+            return await SendChatCompletionAsync(
+                baseUrl,
+                model,
+                recoveryMessages,
+                tools,
+                cancellationToken,
+                maxTokens,
+                recoveryChoice,
+                allowInvalidToolRecovery: false,
+                isToolRecovery: true).ConfigureAwait(false);
         }
     }
+
+    private static bool IsRecoverableInvalidToolFailure(int statusCode, string? detail, int toolCount) =>
+        statusCode == 400 &&
+        toolCount > 0 &&
+        !string.IsNullOrWhiteSpace(detail) &&
+        (detail.Contains("tool call validation failed", StringComparison.OrdinalIgnoreCase) ||
+         detail.Contains("not in request.tools", StringComparison.OrdinalIgnoreCase) ||
+         detail.Contains("not in the request tools", StringComparison.OrdinalIgnoreCase));
+
+    internal static bool InvalidToolFailureCanRecoverForTesting(int statusCode, string? detail, int toolCount) =>
+        IsRecoverableInvalidToolFailure(statusCode, detail, toolCount);
+
+    private static object RecoveryToolChoice(
+        string? detail,
+        IReadOnlyList<string> availableNames)
+    {
+        var attemptedUnavailableAshaFunction =
+            Regex.IsMatch(
+                detail ?? string.Empty,
+                @"attempted to call tool ['""]asha_[a-z_]+['""]",
+                RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        return attemptedUnavailableAshaFunction &&
+               availableNames.Contains("asha_act", StringComparer.Ordinal)
+            ? RequiredFunctionToolChoice("asha_act")
+            : availableNames.Count == 1
+                ? RequiredFunctionToolChoice(availableNames[0])
+                : "required";
+    }
+
+    internal static string RecoveryToolChoiceForTesting(
+        string? detail,
+        IReadOnlyList<string> availableNames) =>
+        DescribeToolChoice(RecoveryToolChoice(detail, availableNames));
 
     private static ModelRequestMeasurement MeasureRequest(
         string model,
@@ -2083,10 +2786,11 @@ public sealed class AshaVoiceSession : IDisposable
                             "desktop_observation",
                             "visual_guidance",
                             "application_control",
+                            "window_management",
                             "desktop_interaction",
                             "guidance_management",
                         },
-                        description = "desktop_observation reads or locates; visual_guidance shows a mark; application_control only launches/foregrounds an installed app or opens a folder; desktop_interaction operates controls inside an app; guidance_management removes ASHA guidance.",
+                        description = "desktop_observation reads or locates; visual_guidance shows a mark; application_control launches an installed app or opens a folder; window_management activates, closes, minimizes, maximizes, or restores a currently open window; desktop_interaction operates controls inside an app; guidance_management removes ASHA guidance.",
                     },
                     reason = new { type = "string", description = "One short sentence connecting the person's request to this capability." },
                 },
@@ -2168,35 +2872,46 @@ public sealed class AshaVoiceSession : IDisposable
             type = "function",
             function = new
             {
-                name = "asha_open_application",
-                description = "Open or foreground one installed application by ordinary display name. No path, command, URL, or argument.",
+                name = "asha_act",
+                description = "Perform one permitted application-catalog action. Installed candidates are discovered from this computer at runtime; never guess a product variant.",
                 parameters = new
                 {
                     type = "object",
                     additionalProperties = false,
-                    required = new[] { "application" },
+                    required = new[] { "action" },
                     properties = new
                     {
-                        application = new { type = "string", description = "Ordinary installed display name only." },
+                        action = new { type = "string", @enum = new[] { "launch_application", "open_folder" } },
+                        application = new { type = "string", description = "For launch_application: ordinary installed display name only." },
+                        folder = new { type = "string", description = "For open_folder: existing ordinary folder display name or absolute local path." },
                     },
                 },
             },
         },
+    ];
+
+    private static readonly IReadOnlyList<object> WindowManagementToolDefinitions =
+    [
         new
         {
             type = "function",
             function = new
             {
-                name = "asha_open_folder",
-                description = "Open one existing non-system folder in Explorer. No command or URL.",
+                name = "asha_act",
+                description = "Perform one permitted lifecycle action on a window that is currently open. The local runtime discovers and resolves live windows; never treat an installed-but-closed application as an open window.",
                 parameters = new
                 {
                     type = "object",
                     additionalProperties = false,
-                    required = new[] { "folder" },
+                    required = new[] { "action", "window" },
                     properties = new
                     {
-                        folder = new { type = "string", description = "Existing folder display name or normal absolute local path." },
+                        action = new
+                        {
+                            type = "string",
+                            @enum = new[] { "activate_window", "close_window", "minimize_window", "maximize_window", "restore_window" },
+                        },
+                        window = new { type = "string", description = "Human-facing name of a currently open window or its application." },
                     },
                 },
             },
@@ -2208,8 +2923,8 @@ public sealed class AshaVoiceSession : IDisposable
         type = "function",
         function = new
         {
-            name = "asha_desktop_action",
-            description = "Perform one permitted desktop input on a target grounded in the current image and UI snapshot.",
+            name = "asha_act",
+            description = "Perform one permitted desktop input on a target grounded in the current image and UI snapshot. Match the action to the person's goal and the control role: a single click may only select a list item, while an open or activate goal commonly requires invoke, double_click, or an approved Enter key followed by verification. This stable action envelope is the only input function in this phase.",
             parameters = new
             {
                 type = "object",
@@ -2251,11 +2966,6 @@ public sealed class AshaVoiceSession : IDisposable
                     {
                         type = "string",
                         description = "Short observable postcondition that would prove success.",
-                    },
-                    source_snapshot_id = new
-                    {
-                        type = "string",
-                        description = "Current supplied UI snapshot ID; stale IDs are rejected.",
                     },
                     executor_preference = new
                     {
@@ -2357,6 +3067,36 @@ public sealed class AshaVoiceSession : IDisposable
         return Regex.Replace(cleaned, @"[ \t]+", " ").Trim();
     }
 
+    private static string? EnforceEvidenceBoundVisualLanguage(
+        string? text,
+        bool hasCurrentVisualEvidence)
+    {
+        if (hasCurrentVisualEvidence || string.IsNullOrWhiteSpace(text)) return text;
+
+        var grounded = text;
+        grounded = Regex.Replace(
+            grounded,
+            @"\bI\s+(?:can\s+)?see\s+(?!what\b)(?:it|that|this)\s*(?:now)?\b",
+            "Based on what you described, that appears to be the case",
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        grounded = Regex.Replace(
+            grounded,
+            @"\bI\s+(?:can\s+)?see\s+(?=(?:the|a|an|your|those|these)\b)",
+            "From your description, it sounds like ",
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        grounded = Regex.Replace(
+            grounded,
+            @"\b(?:the\s+)?(?:current\s+)?(?:screen|desktop|view|window)\s+(?:clearly\s+)?shows\b",
+            "From your description, the current view contains",
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        grounded = Regex.Replace(
+            grounded,
+            @"\bI(?:'m|\s+am)\s+(?:now\s+)?looking\s+at\b",
+            "From your description, you are referring to",
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        return grounded;
+    }
+
     private static string ExpandCommonUnits(string text)
     {
         var units = new Dictionary<string, (string Singular, string Plural)>(StringComparer.OrdinalIgnoreCase)
@@ -2413,6 +3153,7 @@ internal sealed class GroqRequestException(int statusCode, string detail)
     : InvalidOperationException($"Groq failed ({statusCode}): {detail}")
 {
     public int StatusCode { get; } = statusCode;
+    public string Detail { get; } = detail;
 }
 
 public sealed record VoiceTurnResult(string Transcript, string Reply);
@@ -2450,13 +3191,20 @@ public sealed record VisionAttachment(
     string? DesktopContext = null,
     double? ChangedScore = null,
     string? DesktopSnapshotId = null,
-    string? DesktopSnapshotSignature = null)
+    string? DesktopSnapshotSignature = null,
+    DesktopStateSnapshot? DesktopSnapshot = null,
+    byte[]? LocalGroundingBytes = null,
+    int? LocalGroundingPixelWidth = null,
+    int? LocalGroundingPixelHeight = null)
 {
     public string DataUrl =>
         $"data:{(Name.EndsWith(".jpg", StringComparison.OrdinalIgnoreCase) || Name.EndsWith(".jpeg", StringComparison.OrdinalIgnoreCase) ? "image/jpeg" : "image/png")};base64,{Convert.ToBase64String(Bytes)}";
     public bool HasDesktopMapping => ContextX.HasValue && ContextY.HasValue && ContextWidth.GetValueOrDefault() > 0 && ContextHeight.GetValueOrDefault() > 0;
     public int ImageWidth => PixelWidth.GetValueOrDefault(ContextWidth.GetValueOrDefault());
     public int ImageHeight => PixelHeight.GetValueOrDefault(ContextHeight.GetValueOrDefault());
+    public byte[] GroundingBytes => LocalGroundingBytes is { Length: > 0 } ? LocalGroundingBytes : Bytes;
+    public int GroundingImageWidth => LocalGroundingPixelWidth.GetValueOrDefault(ImageWidth);
+    public int GroundingImageHeight => LocalGroundingPixelHeight.GetValueOrDefault(ImageHeight);
     public string CoordinateInstruction => HasDesktopMapping
         ? $"The supplied image is {ImageWidth} by {ImageHeight} pixels. For any coordinate fields in a currently available tool, use only supplied-image pixels. Never copy desktop coordinates into an image-coordinate field; ASHA maps image coordinates internally. {DesktopContext}".Trim()
         : $"The image does not include a reliable desktop coordinate map, so do not use a visual marking tool. {DesktopContext}".Trim();
@@ -2513,6 +3261,50 @@ public sealed record VisionAttachment(
 
     public int MapImageHeight(int imageHeight) =>
         (int)Math.Round(imageHeight * ContextHeight!.Value / (double)ImageHeight);
+
+    public bool TryMapImagePointToGrounding(int imageX, int imageY, out int groundingX, out int groundingY)
+    {
+        groundingX = groundingY = 0;
+        if (ImageWidth <= 0 || ImageHeight <= 0 ||
+            GroundingImageWidth <= 0 || GroundingImageHeight <= 0 ||
+            imageX < 0 || imageX > ImageWidth ||
+            imageY < 0 || imageY > ImageHeight)
+            return false;
+        groundingX = Math.Clamp(
+            (int)Math.Round(imageX * GroundingImageWidth / (double)ImageWidth),
+            0,
+            GroundingImageWidth);
+        groundingY = Math.Clamp(
+            (int)Math.Round(imageY * GroundingImageHeight / (double)ImageHeight),
+            0,
+            GroundingImageHeight);
+        return true;
+    }
+
+    public bool TryMapGroundingPointToImage(int groundingX, int groundingY, out int imageX, out int imageY)
+    {
+        imageX = imageY = 0;
+        if (ImageWidth <= 0 || ImageHeight <= 0 ||
+            GroundingImageWidth <= 0 || GroundingImageHeight <= 0 ||
+            groundingX < 0 || groundingX > GroundingImageWidth ||
+            groundingY < 0 || groundingY > GroundingImageHeight)
+            return false;
+        imageX = Math.Clamp(
+            (int)Math.Round(groundingX * ImageWidth / (double)GroundingImageWidth),
+            0,
+            ImageWidth);
+        imageY = Math.Clamp(
+            (int)Math.Round(groundingY * ImageHeight / (double)GroundingImageHeight),
+            0,
+            ImageHeight);
+        return true;
+    }
+
+    public int MapGroundingWidthToImage(int groundingWidth) =>
+        Math.Max(1, (int)Math.Round(groundingWidth * ImageWidth / (double)Math.Max(1, GroundingImageWidth)));
+
+    public int MapGroundingHeightToImage(int groundingHeight) =>
+        Math.Max(1, (int)Math.Round(groundingHeight * ImageHeight / (double)Math.Max(1, GroundingImageHeight)));
 }
 
 public sealed record AshaVisualToolCall(string Id, string Name, JsonElement Arguments);

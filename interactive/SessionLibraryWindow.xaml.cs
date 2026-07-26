@@ -8,6 +8,7 @@ public partial class SessionLibraryWindow : Window
 {
     public event Action<string>? ContinueRequested;
     public event Action? NewSessionRequested;
+    public event Action? TemporarySessionRequested;
 
     public SessionLibraryWindow(IReadOnlyList<SessionLibraryItem> sessions)
     {
@@ -32,6 +33,7 @@ public partial class SessionLibraryWindow : Window
     }
 
     private void NewSession_Click(object sender, RoutedEventArgs e) => NewSessionRequested?.Invoke();
+    private void TemporarySession_Click(object sender, RoutedEventArgs e) => TemporarySessionRequested?.Invoke();
     private void Close_Click(object sender, RoutedEventArgs e) => Close();
 }
 

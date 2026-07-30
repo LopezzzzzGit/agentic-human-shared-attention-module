@@ -37,7 +37,7 @@ internal static partial class FolderLauncher
             await Task.Delay(200, cancellationToken).ConfigureAwait(false);
         }
 
-        throw new InvalidOperationException($"Windows accepted the request for '{request}', but ASHA could not verify the Explorer window.");
+        throw new InvalidOperationException($"Windows accepted the request for '{request}', but I couldn't verify the Explorer window.");
     }
 
     internal static string ValidateRequest(string requestedFolder)
@@ -72,7 +72,7 @@ internal static partial class FolderLauncher
             .ThenBy(candidate => candidate.Path.Length)
             .ToArray();
         if (candidates.Length == 0)
-            throw new InvalidOperationException($"ASHA could not find an accessible folder named '{request}'. Use its full local path if you want that exact folder.");
+            throw new InvalidOperationException($"I couldn't find an accessible folder named '{request}'. Use its full local path if you want that exact folder.");
         if (candidates.Length > 1 && candidates[0].Name != normalized && candidates[1].Name == candidates[0].Name)
             throw new InvalidOperationException($"Several folders match '{request}'. Please say or type the full local path.");
         return candidates[0].Path;

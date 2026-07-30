@@ -1,12 +1,14 @@
 using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.IO;
+using System.Diagnostics;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Interop;
 using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Shapes;
+using System.Windows.Threading;
 
 namespace AshaOverlay;
 
@@ -39,7 +41,10 @@ internal sealed record OverlayMark(
     string? Label,
     string Color,
     bool Editable = false,
-    string? EventDirectory = null);
+    string? EventDirectory = null,
+    int? OwnerPid = null,
+    long? OwnerStartedAtUtcTicks = null,
+    string? Anchor = null);
 
 internal sealed class OverlayWindow : Window
 {
@@ -59,6 +64,7 @@ internal sealed class OverlayWindow : Window
     private NativePoint _dragOriginScreen;
     private NativePoint _dragLastScreen;
     private NativePoint _dragWindowOrigin;
+    private readonly DispatcherTimer? _ownerTimer;
 
     public OverlayWindow(OverlayMark mark)
     {
@@ -75,6 +81,17 @@ internal sealed class OverlayWindow : Window
         IsHitTestVisible = mark.Editable;
         SizeToContent = SizeToContent.WidthAndHeight;
         Content = BuildContent();
+        if (mark.OwnerPid is > 0)
+        {
+            _ownerTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(500) };
+            _ownerTimer.Tick += (_, _) =>
+            {
+                if (OwnerIsAlive(mark.OwnerPid.Value, mark.OwnerStartedAtUtcTicks)) return;
+                _ownerTimer.Stop();
+                Close();
+            };
+            _ownerTimer.Start();
+        }
         if (mark.Editable)
         {
             AddHandler(MouseLeftButtonDownEvent, new MouseButtonEventHandler(Overlay_MouseLeftButtonDown), true);
@@ -90,6 +107,22 @@ internal sealed class OverlayWindow : Window
             // its first layout pass. Correct once more when that happens.
             Dispatcher.BeginInvoke((Action)PositionAtPhysicalScreenPoint);
         };
+    }
+
+    internal static bool OwnerIsAlive(int processId, long? expectedStartedAtUtcTicks)
+    {
+        try
+        {
+            using var process = Process.GetProcessById(processId);
+            if (process.HasExited) return false;
+            return expectedStartedAtUtcTicks is null ||
+                   Math.Abs(process.StartTime.ToUniversalTime().Ticks - expectedStartedAtUtcTicks.Value) <
+                   TimeSpan.FromSeconds(1).Ticks;
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     private UIElement BuildContent()
@@ -308,6 +341,9 @@ internal sealed class OverlayWindow : Window
     /// device-independent units, so using them directly shifts marks on a
     /// scaled monitor. Move the native overlay window by the physical delta
     /// between the rendered shape centre and the requested screen point.
+    /// New bounding boxes use an explicit top-left anchor. A missing anchor
+    /// retains the historical centre convention so persisted older cues do
+    /// not move when ASHA is upgraded.
     /// </summary>
     private void PositionAtPhysicalScreenPoint()
     {
@@ -319,12 +355,16 @@ internal sealed class OverlayWindow : Window
         {
             "arrow" => _mark.X + (_mark.W ?? 160) / 2,
             "frame" => _mark.X + (_mark.W ?? 1920) / 2,
+            "box" when string.Equals(_mark.Anchor, "top_left", StringComparison.OrdinalIgnoreCase) =>
+                _mark.X + (_mark.W ?? 220) / 2,
             _ => _mark.X,
         };
         var visualCenterY = _mark.Kind switch
         {
             "arrow" => _mark.Y + (_mark.H ?? 72) / 2,
             "frame" => _mark.Y + (_mark.H ?? 1080) / 2,
+            "box" when string.Equals(_mark.Anchor, "top_left", StringComparison.OrdinalIgnoreCase) =>
+                _mark.Y + (_mark.H ?? 100) / 2,
             _ => _mark.Y,
         };
         var x = rect.Left + (int)Math.Round(visualCenterX - renderedCenter.X);

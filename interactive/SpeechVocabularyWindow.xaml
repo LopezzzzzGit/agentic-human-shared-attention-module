@@ -1,0 +1,79 @@
+<Window x:Class="AshaLive.SpeechVocabularyWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Teach ASHA new words"
+        Width="620" Height="520"
+        MinWidth="520" MinHeight="430"
+        WindowStartupLocation="CenterOwner"
+        Background="#F7FBFF"
+        FontFamily="Segoe UI">
+    <Grid Margin="18">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+
+        <StackPanel>
+            <TextBlock FontSize="20" FontWeight="SemiBold" Foreground="#163F6A">Teach ASHA new words</TextBlock>
+            <TextBlock Margin="0,5,0,0" Foreground="#58718A" TextWrapping="Wrap"
+                       Text="Add canonical spellings and only the spoken aliases you explicitly want ASHA to remember. Everything stays local." />
+        </StackPanel>
+
+        <Grid Grid.Row="1" Margin="0,16,0,0">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="0.9*" />
+                <ColumnDefinition Width="16" />
+                <ColumnDefinition Width="1.1*" />
+            </Grid.ColumnDefinitions>
+
+            <Border Padding="10" CornerRadius="12" Background="White" BorderBrush="#C8DDF0" BorderThickness="1">
+                <Grid>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="*" />
+                    </Grid.RowDefinitions>
+                    <TextBlock FontWeight="SemiBold" Foreground="#214E7D">Saved words</TextBlock>
+                    <ListBox x:Name="VocabularyList" Grid.Row="1" Margin="0,8,0,0"
+                             SelectionChanged="VocabularyList_SelectionChanged"
+                             DisplayMemberPath="Display" />
+                </Grid>
+            </Border>
+
+            <Border Grid.Column="2" Padding="12" CornerRadius="12" Background="White" BorderBrush="#C8DDF0" BorderThickness="1">
+                <StackPanel>
+                    <TextBlock FontWeight="SemiBold" Foreground="#214E7D">Canonical spelling</TextBlock>
+                    <TextBox x:Name="CanonicalTextBox" Margin="0,6,0,0" Padding="7,5" MaxLength="160" />
+
+                    <TextBlock Margin="0,13,0,0" FontWeight="SemiBold" Foreground="#214E7D">Spoken aliases</TextBlock>
+                    <TextBlock Margin="0,3,0,0" FontSize="10" Foreground="#71869B"
+                               Text="Separate alternatives with commas or new lines." />
+                    <TextBox x:Name="AliasesTextBox" Margin="0,6,0,0" Padding="7,5" Height="86"
+                             AcceptsReturn="True" TextWrapping="Wrap" VerticalScrollBarVisibility="Auto" />
+
+                    <TextBlock Margin="0,13,0,0" FontWeight="SemiBold" Foreground="#214E7D">Scope</TextBlock>
+                    <ComboBox x:Name="ScopeComboBox" Margin="0,6,0,0" SelectionChanged="ScopeComboBox_SelectionChanged">
+                        <ComboBoxItem Tag="Global" Content="Global — available in every ASHA context" />
+                        <ComboBoxItem Tag="Profile" Content="Current profile" />
+                        <ComboBoxItem Tag="Project" Content="Current project" />
+                        <ComboBoxItem Tag="Session" Content="Current session" />
+                    </ComboBox>
+                    <TextBlock x:Name="ScopeStatusText" Margin="0,5,0,0" FontSize="10" Foreground="#71869B" TextWrapping="Wrap" />
+
+                    <WrapPanel Margin="0,16,0,0">
+                        <Button Padding="11,6" Click="Save_Click">Save word</Button>
+                        <Button Margin="8,0,0,0" Padding="11,6" Click="New_Click">New</Button>
+                        <Button Margin="8,0,0,0" Padding="11,6" Click="Delete_Click">Delete</Button>
+                    </WrapPanel>
+                    <TextBlock x:Name="ResultStatusText" Margin="0,10,0,0" FontSize="11" Foreground="#496C8C" TextWrapping="Wrap" />
+                </StackPanel>
+            </Border>
+        </Grid>
+
+        <DockPanel Grid.Row="2" Margin="0,16,0,0">
+            <TextBlock VerticalAlignment="Center" FontSize="10" Foreground="#71869B"
+                       Text="ASHA never learns a new alias without your confirmation." />
+            <Button DockPanel.Dock="Right" Padding="14,6" Click="Close_Click">Close</Button>
+        </DockPanel>
+    </Grid>
+</Window>

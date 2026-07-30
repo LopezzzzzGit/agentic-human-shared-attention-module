@@ -1,13 +1,10 @@
-using System.Diagnostics;
-using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
-using System.Windows.Automation;
 
 namespace AshaLive;
 
-internal sealed record DesktopStateElement(
+public sealed record DesktopStateElement(
     int LocalId,
     string Name,
     string Role,
@@ -22,7 +19,7 @@ internal sealed record DesktopStateElement(
     string? ExpandCollapseState,
     IReadOnlyList<string> Patterns);
 
-internal sealed record DesktopImageCoordinateMap(
+public sealed record DesktopImageCoordinateMap(
     int DesktopX,
     int DesktopY,
     int DesktopWidth,
@@ -69,7 +66,7 @@ internal sealed record DesktopImageCoordinateMap(
     }
 }
 
-internal sealed record DesktopStateSnapshot(
+public sealed record DesktopStateSnapshot(
     string Id,
     long Generation,
     DateTime CapturedAtUtc,
@@ -241,161 +238,13 @@ internal sealed record DesktopStateSnapshot(
     }
 }
 
-/// <summary>
-/// Captures a bounded semantic projection of the current foreground UI. It
-/// stores no AutomationElement handles: every local ID expires with the
-/// snapshot, preventing stale element-addressed actions after a tree rebuild.
-/// </summary>
-internal sealed class DesktopStateReader
-{
-    private const int MaximumVisitedElements = 900;
-    private const int MaximumNamedElements = 90;
-    private long _generation;
-
-    public DesktopStateSnapshot? CaptureForeground()
-    {
-        try
-        {
-            var window = GetForegroundWindow();
-            if (window == IntPtr.Zero) return null;
-            var root = AutomationElement.FromHandle(window);
-            if (root is null) return null;
-
-            var processId = root.Current.ProcessId;
-            var processName = "unknown-process";
-            try { processName = Process.GetProcessById(processId).ProcessName; }
-            catch { }
-
-            var elements = new List<DesktopStateElement>(MaximumNamedElements);
-            var queue = new Queue<TraversalNode>();
-            queue.Enqueue(new TraversalNode(root, null));
-            var visited = 0;
-            var nextLocalId = 1;
-            var walker = TreeWalker.ControlViewWalker;
-
-            while (queue.Count > 0 &&
-                   visited < MaximumVisitedElements &&
-                   elements.Count < MaximumNamedElements)
-            {
-                var node = queue.Dequeue();
-                visited++;
-                AutomationElement.AutomationElementInformation current;
-                try { current = node.Element.Current; }
-                catch (ElementNotAvailableException) { continue; }
-
-                var name = current.Name?.Trim();
-                var nearestNamedParent = node.NearestNamedParent;
-                if (!string.IsNullOrWhiteSpace(name) && !current.IsOffscreen)
-                {
-                    var rectangle = current.BoundingRectangle;
-                    if (!rectangle.IsEmpty && rectangle.Width >= 2 && rectangle.Height >= 2)
-                    {
-                        var role = RoleName(current.ControlType);
-                        elements.Add(new DesktopStateElement(
-                            nextLocalId++,
-                            name,
-                            role,
-                            nearestNamedParent,
-                            (int)Math.Round(rectangle.Left),
-                            (int)Math.Round(rectangle.Top),
-                            Math.Max(2, (int)Math.Round(rectangle.Width)),
-                            Math.Max(2, (int)Math.Round(rectangle.Height)),
-                            current.IsEnabled,
-                            current.HasKeyboardFocus,
-                            ReadSelected(node.Element),
-                            ReadExpandState(node.Element),
-                            ReadPatterns(node.Element)));
-                        nearestNamedParent = name;
-                    }
-                }
-
-                AutomationElement? child;
-                try { child = walker.GetFirstChild(node.Element); }
-                catch (ElementNotAvailableException) { continue; }
-                while (child is not null)
-                {
-                    queue.Enqueue(new TraversalNode(child, nearestNamedParent));
-                    try { child = walker.GetNextSibling(child); }
-                    catch (ElementNotAvailableException) { child = null; }
-                }
-            }
-
-            var generation = Interlocked.Increment(ref _generation);
-            return new DesktopStateSnapshot(
-                $"desktop-state-{generation:D6}-{Guid.NewGuid():N}",
-                generation,
-                DateTime.UtcNow,
-                processName,
-                root.Current.Name?.Trim() ?? string.Empty,
-                processId,
-                elements,
-                visited,
-                elements.Count < 12);
-        }
-        catch (Exception error) when (
-            error is ElementNotAvailableException or InvalidOperationException or COMException)
-        {
-            return null;
-        }
-    }
-
-    private static string RoleName(ControlType? controlType)
-    {
-        var name = controlType?.ProgrammaticName ?? "ControlType.Custom";
-        const string prefix = "ControlType.";
-        return name.StartsWith(prefix, StringComparison.Ordinal)
-            ? name[prefix.Length..].ToLowerInvariant()
-            : name.ToLowerInvariant();
-    }
-
-    private static bool? ReadSelected(AutomationElement element)
-    {
-        try
-        {
-            return element.TryGetCurrentPattern(SelectionItemPattern.Pattern, out var pattern)
-                ? ((SelectionItemPattern)pattern).Current.IsSelected
-                : null;
-        }
-        catch (ElementNotAvailableException)
-        {
-            return null;
-        }
-    }
-
-    private static string? ReadExpandState(AutomationElement element)
-    {
-        try
-        {
-            return element.TryGetCurrentPattern(ExpandCollapsePattern.Pattern, out var pattern)
-                ? ((ExpandCollapsePattern)pattern).Current.ExpandCollapseState.ToString().ToLowerInvariant()
-                : null;
-        }
-        catch (ElementNotAvailableException)
-        {
-            return null;
-        }
-    }
-
-    private static IReadOnlyList<string> ReadPatterns(AutomationElement element)
-    {
-        var patterns = new List<string>(5);
-        try
-        {
-            if (element.TryGetCurrentPattern(InvokePattern.Pattern, out _)) patterns.Add("invoke");
-            if (element.TryGetCurrentPattern(SelectionItemPattern.Pattern, out _)) patterns.Add("select");
-            if (element.TryGetCurrentPattern(ExpandCollapsePattern.Pattern, out _)) patterns.Add("expand");
-            if (element.TryGetCurrentPattern(ScrollItemPattern.Pattern, out _)) patterns.Add("scroll_into_view");
-            if (element.TryGetCurrentPattern(ValuePattern.Pattern, out _)) patterns.Add("set_value");
-        }
-        catch (ElementNotAvailableException)
-        {
-            return [];
-        }
-        return patterns;
-    }
-
-    private sealed record TraversalNode(AutomationElement Element, string? NearestNamedParent);
-
-    [DllImport("user32.dll")]
-    private static extern IntPtr GetForegroundWindow();
-}
+internal sealed record DesktopAccessibleActionResult(
+    bool Executed,
+    bool Uncertain,
+    string? Pattern,
+    string? Name,
+    string? Role,
+    int X,
+    int Y,
+    int Width,
+    int Height);

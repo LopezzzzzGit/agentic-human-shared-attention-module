@@ -19,9 +19,16 @@ internal static class DesktopControlExecutor
     private const uint KeyUp = 0x0002;
     private const uint KeyUnicode = 0x0004;
 
-    public static async Task ExecuteAsync(DesktopAction action, CancellationToken cancellationToken)
+    public static async Task ExecuteAsync(
+        DesktopAction action,
+        ProtectedSurfacePolicy.DesktopActionPermit permit,
+        ProtectedSurfacePolicy protectedSurfaces,
+        Func<DesktopSurfaceIdentity?>? currentForegroundResolver,
+        CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
+        if (!protectedSurfaces.TryValidatePermit(permit, action, out var permitError))
+            throw new DesktopActionAuthorizationException(permitError);
         switch (action.Kind)
         {
             case "move":
@@ -44,19 +51,38 @@ internal static class DesktopControlExecutor
             case "drag":
                 Move(action.X!.Value, action.Y!.Value);
                 SendMouse(MouseLeftDown);
-                await Task.Delay(120, cancellationToken);
-                Move(action.EndX!.Value, action.EndY!.Value);
-                await Task.Delay(120, cancellationToken);
-                SendMouse(MouseLeftUp);
+                try
+                {
+                    await Task.Delay(120, cancellationToken);
+                    Move(action.EndX!.Value, action.EndY!.Value);
+                    await Task.Delay(120, cancellationToken);
+                }
+                finally
+                {
+                    // Emergency stop or cancellation must never leave Windows
+                    // with the physical left button logically held down.
+                    SendMouse(MouseLeftUp);
+                }
                 break;
             case "scroll":
                 if (action.X.HasValue && action.Y.HasValue) Move(action.X.Value, action.Y.Value);
                 SendMouse(MouseWheel, unchecked((uint)action.Delta!.Value));
                 break;
             case "type_text":
-                SendUnicode(action.Text!);
+                await SendUnicodeAsync(
+                    action.Text!,
+                    action,
+                    permit,
+                    protectedSurfaces,
+                    currentForegroundResolver,
+                    cancellationToken);
                 break;
             case "key":
+                ValidateFocusedSurface(
+                    action,
+                    permit,
+                    protectedSurfaces,
+                    currentForegroundResolver);
                 SendVirtualKey(action.Key!);
                 break;
             default:
@@ -80,10 +106,22 @@ internal static class DesktopControlExecutor
             throw new InvalidOperationException("Windows rejected the physical mouse input.");
     }
 
-    private static void SendUnicode(string text)
+    private static async Task SendUnicodeAsync(
+        string text,
+        DesktopAction action,
+        ProtectedSurfacePolicy.DesktopActionPermit permit,
+        ProtectedSurfacePolicy protectedSurfaces,
+        Func<DesktopSurfaceIdentity?>? currentForegroundResolver,
+        CancellationToken cancellationToken)
     {
         foreach (var character in text)
         {
+            cancellationToken.ThrowIfCancellationRequested();
+            ValidateFocusedSurface(
+                action,
+                permit,
+                protectedSurfaces,
+                currentForegroundResolver);
             var down = new Input
             {
                 Type = InputKeyboard,
@@ -96,7 +134,23 @@ internal static class DesktopControlExecutor
             };
             if (SendInput(2, [down, up], Marshal.SizeOf<Input>()) != 2)
                 throw new InvalidOperationException("Windows rejected text input.");
+            await Task.Yield();
         }
+    }
+
+    private static void ValidateFocusedSurface(
+        DesktopAction action,
+        ProtectedSurfacePolicy.DesktopActionPermit permit,
+        ProtectedSurfacePolicy protectedSurfaces,
+        Func<DesktopSurfaceIdentity?>? currentForegroundResolver)
+    {
+        var current = currentForegroundResolver?.Invoke();
+        if (!protectedSurfaces.TryValidateCurrentSurface(
+                permit,
+                action,
+                current,
+                out var error))
+            throw new DesktopActionAuthorizationException(error);
     }
 
     private static void SendVirtualKey(string key)

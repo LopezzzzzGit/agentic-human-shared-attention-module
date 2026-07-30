@@ -10,6 +10,8 @@ teach-recorder/bin/
 teach-recorder/obj/
 interactive-tests/bin/
 interactive-tests/obj/
+uia-worker/bin/
+uia-worker/obj/
 *.user
 *.suo
 .env

@@ -5,6 +5,9 @@ demonstrator. It separates the intended architecture from features that are
 already implemented, so an experimental button is never mistaken for the
 final interaction model.
 
+The tested implementation boundary and current live limitations are tracked in
+[docs/current-status.md](docs/current-status.md).
+
 ## Product principle: memory with human agency
 
 ASHA is not designed as a forgetful command assistant. A conversation,
@@ -56,34 +59,39 @@ events it needs; it does not create a second conflicting transcript.
 
 The person can:
 
-- start a new ephemeral session;
+- start a new retained session, which is the default for an ordinary new
+  conversation;
+- start a temporary session that is absent from retained history unless
+  explicitly kept;
 - continue a retained session;
 - start a new session directly inside a selected project; or
-- converse without choosing a project and decide where to keep the result
-  later.
+- move a retained result into a more specific project later.
 
 Starting a session also starts ASHA when she is not already running. Starting
-ordinary voice listening does not by itself imply permanent retention.
+ordinary voice listening with no active session creates a new retained
+session. Existing history is never silently loaded; continuing it is explicit.
 
 ### Ending
 
-An active, not-yet-retained session ends with a clear dialogue:
+An active temporary session ends with a clear dialogue:
 
 - **Keep session** — retain it locally; choose or confirm its title and project;
 - **Discard session** — delete its draft conversation, visual observations,
   and uncurated events;
 - **Cancel** — return to the active session.
 
-A previously retained session saves new work back into itself when continued,
-but destructive removal remains a separate explicit action.
+A retained session saves automatically turn by turn. Quitting makes it
+inactive but leaves it available under Sessions; continuing it remains an
+explicit action. Destructive removal remains a separate explicit action.
 
 ### Default retention policies
 
-The demonstrator defaults to **Ask every time**. Later, an advanced privacy
+The demonstrator defaults to **retain new ordinary sessions locally**.
+Temporary is an explicit per-session choice. Later, an advanced retention
 setting may offer:
 
-- Ask every time;
-- Always keep locally; or
+- Retain ordinary new sessions;
+- Ask every time; or
 - Always discard on close.
 
 Always-discard is intended for kiosks, shared office demonstrators, sensitive
@@ -91,9 +99,10 @@ temporary work, and people who deliberately want a stateless assistant. It
 must have a persistent visible indicator so nobody mistakes it for durable
 learning.
 
-Unexpected shutdown recovery should use a small local draft journal. Keeping
-that recovered draft still requires the normal retention decision. A strict
-always-discard profile may disable recovery journaling entirely.
+Unexpected-shutdown recovery for retained sessions uses their existing
+turn-by-turn local log. Temporary conversation remains process-local; orphaned
+temporary evidence is removed at startup. A future opt-in temporary recovery
+journal would require a clear retention disclosure.
 
 ## Memory architecture
 
@@ -131,6 +140,24 @@ are skipped, transient frames stay local, and provider-bound keyframes remain
 visible and permission-gated.
 
 ## Planned delivery order
+
+### P0 — grounded interaction reliability
+
+- Replay representative live sessions as application-agnostic regression
+  fixtures.
+- Resolve human descriptions through desktop, window, tab or document, panel,
+  control, and visual-object layers.
+- Separate target grounding, cue rendering, input delivery, and verified
+  outcome in telemetry and spoken claims.
+- Let visual guidance request a close-up or decline before drawing an
+  ungrounded cue.
+- Correct, move, replace, and group cues without accumulating rejected marks.
+- Enforce explicitly requested background, virtual, physical, or demonstration
+  execution.
+- Repair malformed provider tool output once through a minimal structured
+  action-or-refusal phase.
+- Cache unchanged evidence and prefer local semantics and small detail crops
+  over repeated broad images.
 
 ### P0 — reliable working and session memory
 

@@ -16,7 +16,7 @@ set "ASHA_EXE=interactive\bin\ASHA\asha-live.exe"
 set "ASHA_OVERLAY=overlay\bin\Release\net8.0-windows\asha-overlay.exe"
 
 if not exist "%ASHA_EXE%" goto build_asha
-for /f "usebackq delims=" %%B in (`powershell -NoProfile -Command "$exe=Get-Item -LiteralPath '%ASHA_EXE%'; $newer=Get-ChildItem -LiteralPath 'interactive' -Recurse -File | Where-Object { $_.FullName -notmatch '\\(?:bin|obj)\\' -and $_.Extension -in '.cs','.xaml','.csproj' -and $_.LastWriteTime -gt $exe.LastWriteTime }; if($newer){'yes'}else{'no'}"`) do set "ASHA_REBUILD=%%B"
+for /f "usebackq delims=" %%B in (`powershell -NoProfile -Command "$exe=Get-Item -LiteralPath '%ASHA_EXE%'; $newer=Get-ChildItem -LiteralPath 'interactive','uia-worker' -Recurse -File | Where-Object { $_.FullName -notmatch '\\(?:bin|obj)\\' -and $_.Extension -in '.cs','.xaml','.csproj' -and $_.LastWriteTime -gt $exe.LastWriteTime }; if($newer){'yes'}else{'no'}"`) do set "ASHA_REBUILD=%%B"
 if /I "%ASHA_REBUILD%"=="yes" goto build_asha
 if not exist "%ASHA_OVERLAY%" goto build_overlay
 goto start_asha

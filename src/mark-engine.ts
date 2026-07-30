@@ -20,6 +20,11 @@ export interface MarkRequest {
   label?: string;
   color?: string;
   id?: string;
+  /** Optional process lifetime for safety-critical presence overlays. */
+  ownerPid?: number;
+  ownerStartedAtUtcTicks?: number;
+  /** Bounding boxes normally use top-left; omitted preserves legacy centre anchoring. */
+  anchor?: "center" | "top_left";
 }
 
 export interface MarkUpdate {
@@ -141,6 +146,8 @@ class WindowsOverlayRenderer implements MarkRenderer {
     const request = JSON.stringify({
       id: mark.id, kind: mark.kind, x: mark.x, y: mark.y, w: mark.w, h: mark.h,
       label: mark.label, color, editable,
+      ownerPid: mark.ownerPid, ownerStartedAtUtcTicks: mark.ownerStartedAtUtcTicks,
+      anchor: mark.anchor,
       eventDirectory: join(defaultRuntimeDir(), "cue-edit-events"),
     });
     const process = spawn(this.executable, [request], { detached: true, stdio: "ignore", windowsHide: true });
@@ -381,6 +388,7 @@ function spriteSvg(kind: MarkKind, color: string, mark: MarkRequest): string {
 function validateMark(mark: MarkRequest): void {
   if (!["circle", "box", "dot", "label", "arrow", "frame"].includes(mark.kind)) throw new Error(`Unsupported mark kind '${mark.kind}'.`);
   if (!Number.isFinite(mark.x) || !Number.isFinite(mark.y)) throw new Error("Mark coordinates must be finite screen-pixel numbers.");
+  if (mark.anchor && !["center", "top_left"].includes(mark.anchor)) throw new Error(`Unsupported mark anchor '${mark.anchor}'.`);
   if (mark.kind === "box" && (!(Number.isFinite(mark.w)) || !(Number.isFinite(mark.h)) || mark.w! <= 0 || mark.h! <= 0)) throw new Error("A box mark requires positive finite w and h values.");
   if (mark.kind === "frame" && (!(Number.isFinite(mark.w)) || !(Number.isFinite(mark.h)) || mark.w! <= 0 || mark.h! <= 0)) throw new Error("A frame mark requires positive finite w and h values.");
   if (mark.kind === "arrow" && (!(Number.isFinite(mark.w)) || !(Number.isFinite(mark.h)) || (mark.w === 0 && mark.h === 0))) throw new Error("An arrow mark requires a non-zero finite w or h vector.");

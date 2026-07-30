@@ -111,3 +111,27 @@ test("an active mark can move without being recreated", async () => {
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+test("a safety presence mark retains its owning process lifetime", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "asha-test-"));
+  try {
+    const driver = new FakeDriver();
+    const engine = new MarkEngine({ driver, runtimeDir: directory });
+    await engine.mark({
+      id: "control-presence",
+      kind: "frame",
+      x: 0,
+      y: 0,
+      w: 1920,
+      h: 1080,
+      ownerPid: 12345,
+      ownerStartedAtUtcTicks: 638900000000000000,
+    });
+
+    const saved = JSON.parse(await readFile(join(directory, "marks.json"), "utf8"));
+    assert.equal(saved.marks["control-presence"].ownerPid, 12345);
+    assert.equal(saved.marks["control-presence"].ownerStartedAtUtcTicks, 638900000000000000);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});

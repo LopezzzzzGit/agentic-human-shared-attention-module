@@ -1,7 +1,3 @@
-using System.Runtime.InteropServices;
-using System.Windows;
-using System.Windows.Automation;
-
 namespace AshaLive;
 
 internal sealed record GroundedDesktopTarget(
@@ -17,6 +13,20 @@ internal sealed record GroundedDesktopTarget(
     public int CenterY => Y + (Height / 2);
 }
 
+internal sealed record GroundedDesktopResolution(
+    GroundedDesktopTarget? Target,
+    GroundedEntityResolutionKind Kind,
+    IReadOnlyList<string> Alternatives,
+    string Source = "none",
+    double Score = 0,
+    double RunnerUpScore = 0,
+    int CandidateCount = 0)
+{
+    public bool RequiresClarification =>
+        Target is null &&
+        Kind is GroundedEntityResolutionKind.Clarification or GroundedEntityResolutionKind.Ambiguous;
+}
+
 /// <summary>
 /// Resolves a model-proposed point to a target that Windows can independently
 /// establish. Accessibility metadata is preferred; local OCR is the fallback.
@@ -28,7 +38,7 @@ internal static class DesktopTargetGrounder
     {
         "a", "an", "the", "for", "in", "inside", "on", "at", "of",
         "button", "link", "menu", "item", "row", "tab", "account", "folder",
-        "control", "application", "app", "outlook",
+        "control", "application", "app",
         "der", "die", "das", "den", "dem", "ein", "eine", "einer", "einen",
         "im", "in", "auf", "von", "für", "fuer", "konto", "ordner",
         "schaltfläche", "schaltflaeche", "element", "zeile", "anwendung",
@@ -41,10 +51,30 @@ internal static class DesktopTargetGrounder
         string? containerName,
         int hintImageX,
         int hintImageY,
+        CancellationToken cancellationToken) =>
+        (await ResolveDetailedAsync(
+            vision,
+            targetName,
+            requestedRole,
+            containerName,
+            hintImageX,
+            hintImageY,
+            cancellationToken).ConfigureAwait(false)).Target;
+
+    public static async Task<GroundedDesktopResolution> ResolveDetailedAsync(
+        VisionAttachment vision,
+        string targetName,
+        string? requestedRole,
+        string? containerName,
+        int hintImageX,
+        int hintImageY,
         CancellationToken cancellationToken)
     {
         if (!vision.TryMapImagePoint(hintImageX, hintImageY, out var hintDesktopX, out var hintDesktopY))
-            return null;
+            return new GroundedDesktopResolution(
+                null,
+                GroundedEntityResolutionKind.None,
+                []);
 
         cancellationToken.ThrowIfCancellationRequested();
         var accessibility = FindAccessibilityTarget(
@@ -53,123 +83,89 @@ internal static class DesktopTargetGrounder
             requestedRole,
             containerName,
             hintDesktopX,
-            hintDesktopY);
-        if (accessibility is not null) return accessibility.Target;
+            hintDesktopY,
+            out var entityResolution);
+        if (accessibility is not null)
+            return new GroundedDesktopResolution(
+                accessibility.Target,
+                GroundedEntityResolutionKind.HighConfidence,
+                [],
+                accessibility.Target.Source,
+                entityResolution?.Score ?? 1,
+                entityResolution?.RunnerUpScore ?? 0,
+                vision.DesktopSnapshot?.Elements.Count ?? 0);
 
         var ocrHintX = hintImageX;
         var ocrHintY = hintImageY;
-        if (!string.IsNullOrWhiteSpace(containerName))
-        {
-            var container = await LocalOcrGrounder.FindNearestAsync(
-                vision.Bytes,
-                containerName,
+        if (!vision.TryMapImagePointToGrounding(
                 hintImageX,
                 hintImageY,
+                out ocrHintX,
+                out ocrHintY))
+        {
+            ocrHintX = hintImageX;
+            ocrHintY = hintImageY;
+        }
+        if (!string.IsNullOrWhiteSpace(containerName))
+        {
+            var containerResolution = await LocalOcrGrounder.ResolveNearestAsync(
+                vision.GroundingBytes,
+                containerName,
+                ocrHintX,
+                ocrHintY,
                 cancellationToken);
-            if (container is null) return null;
-            ocrHintX = container.Value.X + (container.Value.Width / 2);
-            ocrHintY = container.Value.Y + container.Value.Height + 36;
+            if (containerResolution.Match is not { } container)
+                return FromUncertainResolution(entityResolution);
+            ocrHintX = container.X + (container.Width / 2);
+            ocrHintY = container.Y + container.Height + 36;
         }
 
-        var ocr = await LocalOcrGrounder.FindNearestAsync(
-            vision.Bytes,
+        var ocrResolution = await LocalOcrGrounder.ResolveNearestAsync(
+            vision.GroundingBytes,
             targetName,
             ocrHintX,
             ocrHintY,
             cancellationToken);
-        if (ocr is not { } match ||
-            !vision.TryMapImagePoint(match.X, match.Y, out var left, out var top))
-            return null;
+        if (ocrResolution.Match is not { } match)
+        {
+            if (ocrResolution.RequiresClarification)
+            {
+                return new GroundedDesktopResolution(
+                    null,
+                    ocrResolution.Kind,
+                    ocrResolution.Alternatives,
+                    "local_windows_ocr",
+                    ocrResolution.Score,
+                    ocrResolution.RunnerUpScore,
+                    ocrResolution.CandidateCount);
+            }
+            return FromUncertainResolution(entityResolution);
+        }
+        if (!vision.TryMapGroundingPointToImage(match.X, match.Y, out var imageLeft, out var imageTop) ||
+            !vision.TryMapImagePoint(imageLeft, imageTop, out var left, out var top))
+            return FromUncertainResolution(entityResolution);
 
-        var width = Math.Max(2, vision.MapImageWidth(match.Width));
-        var height = Math.Max(2, vision.MapImageHeight(match.Height));
-        return new GroundedDesktopTarget(
+        var width = Math.Max(
+            2,
+            vision.MapImageWidth(vision.MapGroundingWidthToImage(match.Width)));
+        var height = Math.Max(
+            2,
+            vision.MapImageHeight(vision.MapGroundingHeightToImage(match.Height)));
+        return new GroundedDesktopResolution(
+            new GroundedDesktopTarget(
+                "local_windows_ocr",
+                ocrResolution.MatchedText ?? targetName,
+                requestedRole,
+                left,
+                top,
+                width,
+                height),
+            GroundedEntityResolutionKind.HighConfidence,
+            [],
             "local_windows_ocr",
-            targetName,
-            requestedRole,
-            left,
-            top,
-            width,
-            height);
-    }
-
-    public static bool TryExecuteAccessibleAction(
-        VisionAttachment vision,
-        string targetName,
-        string? requestedRole,
-        string? containerName,
-        int hintImageX,
-        int hintImageY,
-        string action,
-        out GroundedDesktopTarget? target,
-        out string? patternName)
-    {
-        target = null;
-        patternName = null;
-        if (!vision.TryMapImagePoint(hintImageX, hintImageY, out var hintDesktopX, out var hintDesktopY))
-            return false;
-
-        var match = FindAccessibilityTarget(
-            vision,
-            targetName,
-            requestedRole,
-            containerName,
-            hintDesktopX,
-            hintDesktopY);
-        if (match is null) return false;
-        target = match.Target;
-
-        try
-        {
-            if (string.Equals(action, "click", StringComparison.Ordinal) &&
-                string.Equals(Normalize(requestedRole ?? string.Empty), "account", StringComparison.Ordinal) &&
-                match.Element.TryGetCurrentPattern(ExpandCollapsePattern.Pattern, out var accountExpand))
-            {
-                var expansion = (ExpandCollapsePattern)accountExpand;
-                if (expansion.Current.ExpandCollapseState == ExpandCollapseState.Collapsed)
-                {
-                    expansion.Expand();
-                    patternName = "expand";
-                    return true;
-                }
-            }
-
-            if (string.Equals(action, "click", StringComparison.Ordinal) &&
-                match.Element.TryGetCurrentPattern(SelectionItemPattern.Pattern, out var selection))
-            {
-                ((SelectionItemPattern)selection).Select();
-                patternName = "select";
-                return true;
-            }
-
-            if (action is "click" or "double_click" &&
-                match.Element.TryGetCurrentPattern(InvokePattern.Pattern, out var invocation))
-            {
-                ((InvokePattern)invocation).Invoke();
-                patternName = "invoke";
-                return true;
-            }
-
-            if (string.Equals(action, "click", StringComparison.Ordinal) &&
-                match.Element.TryGetCurrentPattern(ExpandCollapsePattern.Pattern, out var expansionPattern))
-            {
-                var expansion = (ExpandCollapsePattern)expansionPattern;
-                if (expansion.Current.ExpandCollapseState == ExpandCollapseState.Collapsed)
-                    expansion.Expand();
-                else if (expansion.Current.ExpandCollapseState == ExpandCollapseState.Expanded)
-                    expansion.Collapse();
-                else
-                    return false;
-                patternName = "expand_collapse";
-                return true;
-            }
-        }
-        catch (Exception error) when (
-            error is ElementNotAvailableException or InvalidOperationException or COMException)
-        {
-            return false;
-        }
-        return false;
+            ocrResolution.Score,
+            ocrResolution.RunnerUpScore,
+            ocrResolution.CandidateCount);
     }
 
     internal static int BestNameMatchScoreForTesting(string requestedName, string candidateName) =>
@@ -184,131 +180,125 @@ internal static class DesktopTargetGrounder
         string? requestedRole,
         string? containerName,
         int hintX,
-        int hintY)
+        int hintY,
+        out GroundedEntityResolution? entityResolution)
     {
-        try
+        entityResolution = null;
+        var snapshot = vision.DesktopSnapshot;
+        if (snapshot is null) return null;
+        var candidates = new List<AccessibilityTargetCandidate>();
+        foreach (var element in snapshot.Elements)
         {
-            var hit = AutomationElement.FromPoint(new Point(hintX, hintY));
-            if (hit is null) return null;
+            var name = element.Name.Trim();
+            if (name.Length == 0) continue;
+            if (!string.IsNullOrWhiteSpace(containerName) &&
+                NameMatchScore(containerName, element.ParentName ?? string.Empty) == 0)
+                continue;
+            if (!IntersectsVision(vision, element.X, element.Y, element.Width, element.Height))
+                continue;
+            if (!string.IsNullOrWhiteSpace(requestedRole) &&
+                !RoleMatches(requestedRole, element.Role))
+                continue;
 
-            var processId = hit.Current.ProcessId;
-            var searchRoot = FindProcessRoot(hit, processId);
-            var elements = searchRoot.FindAll(TreeScope.Descendants, System.Windows.Automation.Condition.TrueCondition);
-            AccessibilityTargetMatch? best = null;
-            double bestRank = double.MinValue;
-
-            for (var index = 0; index < elements.Count; index++)
-            {
-                AutomationElement element;
-                AutomationElement.AutomationElementInformation current;
-                try
-                {
-                    element = elements[index];
-                    current = element.Current;
-                }
-                catch (ElementNotAvailableException)
-                {
-                    continue;
-                }
-
-                var name = current.Name?.Trim();
-                if (string.IsNullOrWhiteSpace(name) || current.IsOffscreen) continue;
-                var nameScore = NameMatchScore(targetName, name);
-                if (nameScore <= 0) continue;
-                if (!string.IsNullOrWhiteSpace(containerName) &&
-                    !HasMatchingAncestor(element, containerName, searchRoot))
-                    continue;
-
-                var rectangle = current.BoundingRectangle;
-                if (rectangle.IsEmpty || rectangle.Width < 2 || rectangle.Height < 2) continue;
-                var left = (int)Math.Round(rectangle.Left);
-                var top = (int)Math.Round(rectangle.Top);
-                var width = Math.Max(2, (int)Math.Round(rectangle.Width));
-                var height = Math.Max(2, (int)Math.Round(rectangle.Height));
-                if (!IntersectsVision(vision, left, top, width, height)) continue;
-
-                var role = ReadRole(current.ControlType);
-                if (!string.IsNullOrWhiteSpace(requestedRole) && !RoleMatches(requestedRole, role))
-                    continue;
-                var roleBonus = RoleMatches(requestedRole, role) ? 180 : 0;
-                var centerX = left + (width / 2d);
-                var centerY = top + (height / 2d);
-                var distance = Math.Sqrt(Math.Pow(centerX - hintX, 2) + Math.Pow(centerY - hintY, 2));
-                var rank = (nameScore * 1_000d) + roleBonus - Math.Min(900d, distance / 3d);
-                if (rank <= bestRank) continue;
-
-                bestRank = rank;
-                best = new AccessibilityTargetMatch(
-                    element,
+            var nameScore = NameMatchScore(targetName, name);
+            var roleBonus = RoleMatches(requestedRole, element.Role) ? 180 : 0;
+            var centerX = element.X + (element.Width / 2d);
+            var centerY = element.Y + (element.Height / 2d);
+            var distance = Math.Sqrt(Math.Pow(centerX - hintX, 2) + Math.Pow(centerY - hintY, 2));
+            var rank = (nameScore * 1_000d) + roleBonus - Math.Min(900d, distance / 3d);
+            candidates.Add(new AccessibilityTargetCandidate(
+                new AccessibilityTargetMatch(
                     new GroundedDesktopTarget(
-                        "windows_ui_automation",
+                        "isolated_windows_ui_automation",
                         name,
-                        role,
-                        left,
-                        top,
-                        width,
-                        height));
-            }
-
-            return best;
+                        element.Role,
+                        element.X,
+                        element.Y,
+                        element.Width,
+                        element.Height)),
+                nameScore,
+                rank,
+                element.ParentName));
         }
-        catch (Exception error) when (
-            error is ElementNotAvailableException or InvalidOperationException or COMException)
+
+        var directCandidates = candidates
+                .Where(candidate => candidate.NameScore > 0)
+                .OrderByDescending(candidate => candidate.NameScore)
+                .ThenByDescending(candidate => candidate.Rank)
+                .ToArray();
+        if (directCandidates.Length > 0)
         {
+            var bestScore = directCandidates[0].NameScore;
+            var equallyStrong = directCandidates
+                .Where(candidate => candidate.NameScore == bestScore)
+                .ToArray();
+            if (equallyStrong.Length == 1)
+                return equallyStrong[0].Match;
+
+            entityResolution = new GroundedEntityResolution(
+                GroundedEntityResolutionKind.Ambiguous,
+                targetName,
+                null,
+                bestScore / 100d,
+                bestScore / 100d,
+                equallyStrong
+                    .Take(3)
+                    .Select(candidate => new GroundedEntityCandidate(
+                        candidate.Match.Target.Name,
+                        candidate.Match.Target.Role,
+                        candidate.SemanticContainer))
+                    .ToArray());
             return null;
         }
+
+        entityResolution = GroundedEntityResolver.Resolve(
+            targetName,
+            candidates.Select(candidate => new GroundedEntityCandidate(
+                candidate.Match.Target.Name,
+                candidate.Match.Target.Role,
+                candidate.SemanticContainer)));
+        if (entityResolution.Kind != GroundedEntityResolutionKind.HighConfidence ||
+            entityResolution.Candidate is null)
+            return null;
+
+        var resolvedCandidate = entityResolution.Candidate;
+        return candidates
+            .Where(candidate =>
+                string.Equals(
+                    candidate.Match.Target.Name,
+                    resolvedCandidate.Value,
+                    StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(
+                    candidate.Match.Target.Role,
+                    resolvedCandidate.Role,
+                    StringComparison.OrdinalIgnoreCase))
+            .OrderByDescending(candidate => candidate.Rank)
+            .Select(candidate => candidate.Match)
+            .FirstOrDefault();
     }
 
-    private static AutomationElement FindProcessRoot(AutomationElement element, int processId)
+    private static GroundedDesktopResolution FromUncertainResolution(
+        GroundedEntityResolution? resolution)
     {
-        var walker = TreeWalker.ControlViewWalker;
-        var current = element;
-        for (var depth = 0; depth < 32; depth++)
-        {
-            AutomationElement? parent;
-            try { parent = walker.GetParent(current); }
-            catch (ElementNotAvailableException) { break; }
-            if (parent is null || parent == AutomationElement.RootElement) break;
-
-            try
-            {
-                if (parent.Current.ProcessId != processId) break;
-            }
-            catch (ElementNotAvailableException)
-            {
-                break;
-            }
-            current = parent;
-        }
-        return current;
-    }
-
-    private static bool HasMatchingAncestor(
-        AutomationElement element,
-        string containerName,
-        AutomationElement searchRoot)
-    {
-        var walker = TreeWalker.ControlViewWalker;
-        var current = element;
-        for (var depth = 0; depth < 24; depth++)
-        {
-            AutomationElement? parent;
-            try { parent = walker.GetParent(current); }
-            catch (ElementNotAvailableException) { return false; }
-            if (parent is null) return false;
-            try
-            {
-                if (NameMatchScore(containerName, parent.Current.Name ?? string.Empty) > 0)
-                    return true;
-            }
-            catch (ElementNotAvailableException)
-            {
-                return false;
-            }
-            if (parent == searchRoot) return false;
-            current = parent;
-        }
-        return false;
+        if (resolution is null)
+            return new GroundedDesktopResolution(
+                null,
+                GroundedEntityResolutionKind.None,
+                []);
+        return new GroundedDesktopResolution(
+            null,
+            resolution.Kind,
+            resolution.Alternatives
+                .Select(candidate => string.IsNullOrWhiteSpace(candidate.Container)
+                    ? candidate.Value
+                    : $"{candidate.Value} under {candidate.Container}")
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .Take(3)
+                .ToArray(),
+            "isolated_windows_ui_automation",
+            resolution.Score,
+            resolution.RunnerUpScore,
+            resolution.Alternatives.Count);
     }
 
     private static bool IntersectsVision(VisionAttachment vision, int x, int y, int width, int height)
@@ -338,8 +328,23 @@ internal static class DesktopTargetGrounder
         if (requestedJoined.Length >= 4 && candidateJoined.Contains(requestedJoined, StringComparison.Ordinal))
             return 75 + Math.Min(20, requestedJoined.Length / 2);
 
-        var overlap = requested.Intersect(candidate, StringComparer.Ordinal).Count();
-        return overlap == 0 ? 0 : 40 + (overlap * 10);
+        var requestedDistinct = requested.Distinct(StringComparer.Ordinal).ToArray();
+        var candidateDistinct = candidate.Distinct(StringComparer.Ordinal).ToArray();
+        var overlap = requestedDistinct.Intersect(candidateDistinct, StringComparer.Ordinal).Count();
+        if (overlap == 0) return 0;
+
+        // A shared person name, date, or ordinary sentence fragment must not
+        // let pointer proximity override the distinctive target identity.
+        // Substring matches above already handle short exact visible labels.
+        var requestedCoverage = overlap / (double)requestedDistinct.Length;
+        var candidateCoverage = overlap / (double)candidateDistinct.Length;
+        if (requestedDistinct.Length == 1 ||
+            requestedCoverage < 0.75 ||
+            candidateCoverage < 0.20)
+            return 0;
+        return 45 +
+               (int)Math.Round(requestedCoverage * 35) +
+               (int)Math.Round(candidateCoverage * 15);
     }
 
     private static string[] SearchTokens(string text)
@@ -354,16 +359,7 @@ internal static class DesktopTargetGrounder
     }
 
     private static string Normalize(string text) =>
-        new(text.Where(char.IsLetterOrDigit).Select(char.ToLowerInvariant).ToArray());
-
-    private static string? ReadRole(ControlType? controlType)
-    {
-        var programmaticName = controlType?.ProgrammaticName;
-        const string prefix = "ControlType.";
-        return !string.IsNullOrWhiteSpace(programmaticName) && programmaticName.StartsWith(prefix, StringComparison.Ordinal)
-            ? programmaticName[prefix.Length..].ToLowerInvariant()
-            : null;
-    }
+        SemanticUiVocabulary.CanonicalizeToken(text);
 
     private static bool RoleMatches(string? requestedRole, string? actualRole)
     {
@@ -379,7 +375,11 @@ internal static class DesktopTargetGrounder
                (requested == "menuitem" && actual == "menuitem");
     }
 
-    private sealed record AccessibilityTargetMatch(
-        AutomationElement Element,
-        GroundedDesktopTarget Target);
+    private sealed record AccessibilityTargetMatch(GroundedDesktopTarget Target);
+
+    private sealed record AccessibilityTargetCandidate(
+        AccessibilityTargetMatch Match,
+        int NameScore,
+        double Rank,
+        string? SemanticContainer);
 }

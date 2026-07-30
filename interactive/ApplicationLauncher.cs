@@ -1,10 +1,29 @@
 using System.Diagnostics;
 using System.IO;
-using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 
 namespace AshaLive;
+
+internal sealed class ApplicationResolutionException : InvalidOperationException
+{
+    public ApplicationResolutionException(
+        string requestedName,
+        IReadOnlyList<string> candidates,
+        bool noInstalledMatch)
+        : base(noInstalledMatch
+            ? $"No installed application matches {requestedName}."
+            : $"More than one installed application matches {requestedName}.")
+    {
+        RequestedName = requestedName;
+        Candidates = candidates;
+        NoInstalledMatch = noInstalledMatch;
+    }
+
+    public string RequestedName { get; }
+    public IReadOnlyList<string> Candidates { get; }
+    public bool NoInstalledMatch { get; }
+}
 
 /// <summary>
 /// Resolves human-facing names against Windows' own Start application catalog.
@@ -13,13 +32,7 @@ namespace AshaLive;
 /// </summary>
 internal static partial class ApplicationLauncher
 {
-    private const int SwRestore = 9;
-    private const uint SwpNoSize = 0x0001;
-    private const uint SwpNoMove = 0x0002;
-    private const uint SwpShowWindow = 0x0040;
-    private static readonly IntPtr HwndTop = IntPtr.Zero;
     private static readonly TimeSpan LaunchTimeout = TimeSpan.FromSeconds(18);
-    private static readonly TimeSpan ActivationTimeout = TimeSpan.FromSeconds(2);
     private static readonly object CatalogGate = new();
     private static Task<IReadOnlyList<StartApplication>>? _catalog;
 
@@ -31,12 +44,18 @@ internal static partial class ApplicationLauncher
         var name = ValidateName(requestedName);
         var applications = await ReadCatalogAsync(cancellationToken).ConfigureAwait(false);
         var match = Resolve(applications, name);
+        if (IsProtectedApplicationIdentity(match, Environment.ProcessPath))
+            throw new DesktopActionAuthorizationException(
+                "I can't launch or activate my own protected interface through general computer control.");
 
         var existing = FindWindow(match);
         if (existing is not null)
         {
-            await BringToFrontAndVerifyAsync(existing, match, cancellationToken).ConfigureAwait(false);
-            return ToResult(name, match.Name, existing, activatedExisting: true);
+            if (existing.Id == Environment.ProcessId)
+                throw new DesktopActionAuthorizationException(
+                    "I can't launch or activate my own protected interface through general computer control.");
+            var activation = await ActivateAsync(existing, match, cancellationToken).ConfigureAwait(false);
+            return ToResult(name, match.Name, existing, activatedExisting: true, activation);
         }
 
         using var started = LaunchAppId(match.AppId);
@@ -47,13 +66,13 @@ internal static partial class ApplicationLauncher
             var window = FindWindow(match, started);
             if (window is not null)
             {
-                await BringToFrontAndVerifyAsync(window, match, cancellationToken).ConfigureAwait(false);
-                return ToResult(name, match.Name, window, activatedExisting: false);
+                var activation = await ActivateAsync(window, match, cancellationToken).ConfigureAwait(false);
+                return ToResult(name, match.Name, window, activatedExisting: false, activation);
             }
             await Task.Delay(250, cancellationToken).ConfigureAwait(false);
         }
 
-        throw new InvalidOperationException($"Windows accepted the request to open '{match.Name}', but ASHA could not verify a visible application window.");
+        throw new InvalidOperationException($"Windows accepted the request to open '{match.Name}', but I couldn't verify a visible application window.");
     }
 
     internal static string ValidateName(string requestedName)
@@ -63,6 +82,27 @@ internal static partial class ApplicationLauncher
             throw new InvalidOperationException("Choose an installed application by its display name, without a path or command-line characters.");
         return name;
     }
+
+    internal static string ResolveDisplayNameForTesting(
+        string requestedName,
+        IReadOnlyList<string> installedDisplayNames) =>
+        Resolve(
+            installedDisplayNames
+                .Select((name, index) => new StartApplication(
+                    name,
+                    $"asha-test-{index}.exe",
+                    $@"C:\ASHA-Test\asha-test-{index}.exe"))
+                .ToArray(),
+            requestedName).Name;
+
+    internal static bool IsProtectedApplicationIdentityForTesting(
+        string name,
+        string appId,
+        string targetPath,
+        string currentProcessPath) =>
+        IsProtectedApplicationIdentity(
+            new StartApplication(name, appId, targetPath),
+            currentProcessPath);
 
     private static async Task<IReadOnlyList<StartApplication>> ReadCatalogAsync(CancellationToken cancellationToken)
     {
@@ -137,7 +177,10 @@ internal static partial class ApplicationLauncher
             .ThenBy(candidate => candidate.Item.Name.Length)
             .ToArray();
         if (scored.Length == 0)
-            throw new InvalidOperationException($"ASHA could not find an installed Start application named '{requestedName}'.");
+            throw new ApplicationResolutionException(
+                requestedName,
+                [],
+                noInstalledMatch: true);
 
         var best = scored[0];
         var ambiguous = scored.Skip(1)
@@ -148,8 +191,10 @@ internal static partial class ApplicationLauncher
             .ToArray();
         if (ambiguous.Length > 0 && best.Score > 0)
         {
-            var choices = string.Join(", ", new[] { best.Item.Name }.Concat(ambiguous));
-            throw new InvalidOperationException($"'{requestedName}' matches several installed applications: {choices}. Please use the displayed application name.");
+            throw new ApplicationResolutionException(
+                requestedName,
+                new[] { best.Item.Name }.Concat(ambiguous).ToArray(),
+                noInstalledMatch: false);
         }
         return best.Item;
     }
@@ -163,6 +208,39 @@ internal static partial class ApplicationLauncher
             identity,
             @"cmd\.exe|command prompt|eingabeaufforderung|powershell|pwsh|terminal|wsl|bash|regedit|registrierungs-editor|msconfig|run dialog|ausführen|\.msc(?:$|[.!\s])|RunDialog|ControlPanel",
             RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+    }
+
+    private static bool IsProtectedApplicationIdentity(
+        StartApplication application,
+        string? currentProcessPath)
+    {
+        if (string.IsNullOrWhiteSpace(currentProcessPath)) return false;
+        var currentFullPath = Path.GetFullPath(currentProcessPath);
+        if (!string.IsNullOrWhiteSpace(application.TargetPath))
+        {
+            try
+            {
+                if (string.Equals(
+                        Path.GetFullPath(application.TargetPath),
+                        currentFullPath,
+                        StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+            catch (Exception error) when (error is ArgumentException or NotSupportedException or PathTooLongException)
+            {
+                // A malformed catalog path is not trusted as an identity.
+            }
+        }
+
+        var currentProcessName = Normalize(Path.GetFileNameWithoutExtension(currentFullPath));
+        var expectedProcessName = ExpectedProcessName(
+            application.AppId,
+            application.TargetPath);
+        return currentProcessName.Length > 0 &&
+               string.Equals(
+                   expectedProcessName,
+                   currentProcessName,
+                   StringComparison.Ordinal);
     }
 
     private static int MatchScore(StartApplication application, string requested)
@@ -264,86 +342,42 @@ internal static partial class ApplicationLauncher
         return false;
     }
 
-    private static ApplicationLaunchResult ToResult(string requestedName, string resolvedName, Process window, bool activatedExisting)
+    private static ApplicationLaunchResult ToResult(
+        string requestedName,
+        string resolvedName,
+        Process window,
+        bool activatedExisting,
+        ForegroundActivationResult activation)
     {
         window.Refresh();
-        return new ApplicationLaunchResult(requestedName, resolvedName, window.ProcessName, window.MainWindowTitle, activatedExisting);
+        return new ApplicationLaunchResult(
+            requestedName,
+            resolvedName,
+            window.ProcessName,
+            window.MainWindowTitle,
+            activatedExisting,
+            activation);
     }
 
-    private static async Task BringToFrontAndVerifyAsync(Process process, StartApplication application, CancellationToken cancellationToken)
+    private static async Task<ForegroundActivationResult> ActivateAsync(
+        Process process,
+        StartApplication application,
+        CancellationToken cancellationToken)
     {
         process.Refresh();
         var window = process.MainWindowHandle;
         if (window == IntPtr.Zero)
             throw new InvalidOperationException($"ASHA found {application.Name}, but it does not currently have a visible window.");
-
-        var deadline = DateTime.UtcNow + ActivationTimeout;
-        while (DateTime.UtcNow < deadline)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            TryActivateWindow(window);
-            await Task.Delay(90, cancellationToken).ConfigureAwait(false);
-
-            var foreground = GetForegroundWindow();
-            if (foreground == window) return;
-            if (foreground != IntPtr.Zero)
-            {
-                _ = GetWindowThreadProcessId(foreground, out var foregroundProcessId);
-                if (foregroundProcessId == (uint)process.Id) return;
-            }
-        }
-
-        throw new InvalidOperationException($"Windows did not bring {application.Name} to the foreground, so ASHA has not claimed that it did.");
-    }
-
-    /// <summary>
-    /// SetForegroundWindow alone is routinely rejected when ASHA's voice turn
-    /// completes on a worker thread while another application owns the input
-    /// queue. Temporarily joining the relevant queues lets Windows treat this
-    /// as the same visible user-initiated activation; all joins are detached
-    /// immediately, even when an individual Win32 call fails.
-    /// </summary>
-    private static void TryActivateWindow(IntPtr window)
-    {
-        var currentThread = GetCurrentThreadId();
-        var foreground = GetForegroundWindow();
-        var foregroundThread = foreground == IntPtr.Zero ? 0 : GetWindowThreadProcessId(foreground, out _);
-        var targetThread = GetWindowThreadProcessId(window, out _);
-        var attachedForeground = foregroundThread != 0 && foregroundThread != currentThread &&
-                                 AttachThreadInput(currentThread, foregroundThread, true);
-        var attachedTarget = targetThread != 0 && targetThread != currentThread && targetThread != foregroundThread &&
-                             AttachThreadInput(currentThread, targetThread, true);
-        try
-        {
-            _ = ShowWindowAsync(window, SwRestore);
-            _ = BringWindowToTop(window);
-            _ = SetWindowPos(window, HwndTop, 0, 0, 0, 0, SwpNoMove | SwpNoSize | SwpShowWindow);
-            _ = SetForegroundWindow(window);
-            _ = SetActiveWindow(window);
-            _ = SetFocus(window);
-        }
-        finally
-        {
-            if (attachedTarget) _ = AttachThreadInput(currentThread, targetThread, false);
-            if (attachedForeground) _ = AttachThreadInput(currentThread, foregroundThread, false);
-        }
+        return await ForegroundWindowActivator.ActivateAsync(
+            window,
+            process.Id,
+            cancellationToken).ConfigureAwait(false);
     }
 
     private static string Normalize(string value) => Regex.Replace(value.ToLowerInvariant(), @"[^\p{L}\p{N}]+", " ").Trim();
 
     [GeneratedRegex(@"^[\p{L}\p{N}][\p{L}\p{N}\s.&()'_+\-]{0,79}$", RegexOptions.CultureInvariant)]
     private static partial Regex SafeApplicationName();
-
-    [DllImport("user32.dll")] private static extern bool SetForegroundWindow(IntPtr window);
-    [DllImport("user32.dll")] private static extern bool ShowWindowAsync(IntPtr window, int command);
-    [DllImport("user32.dll")] private static extern bool BringWindowToTop(IntPtr window);
-    [DllImport("user32.dll")] private static extern IntPtr SetActiveWindow(IntPtr window);
-    [DllImport("user32.dll")] private static extern IntPtr SetFocus(IntPtr window);
-    [DllImport("user32.dll")] private static extern bool SetWindowPos(IntPtr window, IntPtr insertAfter, int x, int y, int width, int height, uint flags);
-    [DllImport("user32.dll")] private static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool attach);
-    [DllImport("kernel32.dll")] private static extern uint GetCurrentThreadId();
-    [DllImport("user32.dll")] private static extern IntPtr GetForegroundWindow();
-    [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
 
     private sealed record StartApplication(string Name, string AppId, string TargetPath);
 
@@ -364,4 +398,5 @@ internal sealed record ApplicationLaunchResult(
     string ResolvedName,
     string ProcessName,
     string WindowTitle,
-    bool ActivatedExisting);
+    bool ActivatedExisting,
+    ForegroundActivationResult Activation);

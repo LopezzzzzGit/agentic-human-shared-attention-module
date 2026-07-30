@@ -18,6 +18,7 @@ public sealed class ScreenObserver : IDisposable
     private const int SourceCopy = 0x00CC0020;
     private readonly object _gate = new();
     private readonly Queue<ScreenSnapshot> _recent = [];
+    private readonly ProtectedCaptureMask _protectedCaptureMask;
     private Timer? _timer;
     private VisionPreference _mode = VisionPreference.Off;
     private int _captureInProgress;
@@ -25,6 +26,11 @@ public sealed class ScreenObserver : IDisposable
     private DateTime _lastChangeNotificationUtc;
 
     public event Action<LocalScreenChange>? MeaningfulChange;
+
+    public ScreenObserver(int? protectedProcessId = null)
+    {
+        _protectedCaptureMask = new ProtectedCaptureMask(protectedProcessId);
+    }
 
     public void Start(VisionPreference mode)
     {
@@ -90,6 +96,38 @@ public sealed class ScreenObserver : IDisposable
                 context.Height,
                 context.Image.Width,
                 context.Image.Height);
+        }, cancellationToken).ConfigureAwait(false);
+    }
+
+    public async Task<LocalGroundingCapture?> CaptureLocalGroundingAsync(
+        DesktopCaptureRegion requestedRegion,
+        CancellationToken cancellationToken = default)
+    {
+        if (_mode == VisionPreference.Off) return null;
+        return await Task.Run(() =>
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var bounds = NormalizeRegion(requestedRegion);
+            const double maximumWidth = 3_840;
+            const double maximumHeight = 2_160;
+            var scale = Math.Min(
+                1d,
+                Math.Min(maximumWidth / bounds.Width, maximumHeight / bounds.Height));
+            var targetWidth = Math.Max(1, (int)Math.Round(bounds.Width * scale));
+            var targetHeight = Math.Max(1, (int)Math.Round(bounds.Height * scale));
+            using var image = CaptureScaled(
+                bounds.Left,
+                bounds.Top,
+                bounds.Width,
+                bounds.Height,
+                targetWidth,
+                targetHeight);
+            using var stream = new MemoryStream();
+            image.Save(stream, ImageFormat.Png);
+            return new LocalGroundingCapture(
+                stream.ToArray(),
+                targetWidth,
+                targetHeight);
         }, cancellationToken).ConfigureAwait(false);
     }
 
@@ -201,14 +239,14 @@ public sealed class ScreenObserver : IDisposable
         }
     }
 
-    private static ScreenSnapshot CaptureSnapshot()
+    private ScreenSnapshot CaptureSnapshot()
     {
         var bounds = System.Windows.Forms.SystemInformation.VirtualScreen;
         var height = Math.Max(1, (int)Math.Round(SampleWidth * (bounds.Height / (double)Math.Max(1, bounds.Width))));
         return new ScreenSnapshot(DateTime.UtcNow, CaptureScaled(bounds.Left, bounds.Top, bounds.Width, bounds.Height, SampleWidth, height));
     }
 
-    private static ContextCapture CaptureContext(int anchorX, int anchorY, int? outputWidth = null, int? outputHeight = null)
+    private ContextCapture CaptureContext(int anchorX, int anchorY, int? outputWidth = null, int? outputHeight = null)
     {
         var bounds = System.Windows.Forms.SystemInformation.VirtualScreen;
         const int desiredWidth = 960;
@@ -222,15 +260,13 @@ public sealed class ScreenObserver : IDisposable
         return new ContextCapture(CaptureScaled(left, top, width, height, targetWidth, targetHeight), left, top, width, height);
     }
 
-    private static ContextCapture CaptureRegion(DesktopCaptureRegion requested)
+    private ContextCapture CaptureRegion(DesktopCaptureRegion requested)
     {
-        var bounds = System.Windows.Forms.SystemInformation.VirtualScreen;
-        var left = Math.Clamp(requested.X, bounds.Left, bounds.Right - 1);
-        var top = Math.Clamp(requested.Y, bounds.Top, bounds.Bottom - 1);
-        var right = Math.Clamp((long)requested.X + requested.Width, left + 1L, bounds.Right);
-        var bottom = Math.Clamp((long)requested.Y + requested.Height, top + 1L, bounds.Bottom);
-        var width = Math.Max(1, (int)(right - left));
-        var height = Math.Max(1, (int)(bottom - top));
+        var normalized = NormalizeRegion(requested);
+        var left = normalized.Left;
+        var top = normalized.Top;
+        var width = normalized.Width;
+        var height = normalized.Height;
         // A foreground-window request is commonly used to locate text-sized
         // controls. Preserve a little more detail there, while broad screen
         // scans keep the lower token and bandwidth budget.
@@ -245,22 +281,44 @@ public sealed class ScreenObserver : IDisposable
         return new ContextCapture(CaptureScaled(left, top, width, height, targetWidth, targetHeight), left, top, width, height);
     }
 
-    private static Bitmap CaptureScaled(int sourceX, int sourceY, int sourceWidth, int sourceHeight, int targetWidth, int targetHeight)
+    private static Rectangle NormalizeRegion(DesktopCaptureRegion requested)
     {
+        var bounds = System.Windows.Forms.SystemInformation.VirtualScreen;
+        var left = Math.Clamp(requested.X, bounds.Left, bounds.Right - 1);
+        var top = Math.Clamp(requested.Y, bounds.Top, bounds.Bottom - 1);
+        var right = Math.Clamp((long)requested.X + requested.Width, left + 1L, bounds.Right);
+        var bottom = Math.Clamp((long)requested.Y + requested.Height, top + 1L, bounds.Bottom);
+        return new Rectangle(
+            left,
+            top,
+            Math.Max(1, (int)(right - left)),
+            Math.Max(1, (int)(bottom - top)));
+    }
+
+    private Bitmap CaptureScaled(int sourceX, int sourceY, int sourceWidth, int sourceHeight, int targetWidth, int targetHeight)
+    {
+        var protectedBefore = _protectedCaptureMask.CaptureVisibleProtectedBounds();
         var bitmap = new Bitmap(Math.Max(1, targetWidth), Math.Max(1, targetHeight), PixelFormat.Format32bppPArgb);
-        using var graphics = Graphics.FromImage(bitmap);
-        var destination = graphics.GetHdc();
-        var source = GetDC(IntPtr.Zero);
-        try
+        using (var graphics = Graphics.FromImage(bitmap))
         {
-            if (source == IntPtr.Zero || !StretchBlt(destination, 0, 0, targetWidth, targetHeight, source, sourceX, sourceY, sourceWidth, sourceHeight, SourceCopy))
-                throw new InvalidOperationException("Windows could not capture the current desktop view.");
+            var destination = graphics.GetHdc();
+            var source = GetDC(IntPtr.Zero);
+            try
+            {
+                if (source == IntPtr.Zero || !StretchBlt(destination, 0, 0, targetWidth, targetHeight, source, sourceX, sourceY, sourceWidth, sourceHeight, SourceCopy))
+                    throw new InvalidOperationException("Windows could not capture the current desktop view.");
+            }
+            finally
+            {
+                if (source != IntPtr.Zero) ReleaseDC(IntPtr.Zero, source);
+                graphics.ReleaseHdc(destination);
+            }
         }
-        finally
-        {
-            if (source != IntPtr.Zero) ReleaseDC(IntPtr.Zero, source);
-            graphics.ReleaseHdc(destination);
-        }
+        var protectedAfter = _protectedCaptureMask.CaptureVisibleProtectedBounds();
+        ProtectedCaptureMask.Apply(
+            bitmap,
+            new Rectangle(sourceX, sourceY, sourceWidth, sourceHeight),
+            protectedBefore.Concat(protectedAfter));
         return bitmap;
     }
 
@@ -344,5 +402,7 @@ public sealed record VisualEvidenceBundle(
     int? ContextPixelHeight);
 
 public sealed record DesktopCaptureRegion(int X, int Y, int Width, int Height, bool PreferTextDetail = false);
+
+public sealed record LocalGroundingCapture(byte[] Bytes, int PixelWidth, int PixelHeight);
 
 public sealed record LocalScreenChange(DateTime TimestampUtc, double ChangedScore);

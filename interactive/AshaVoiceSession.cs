@@ -267,6 +267,14 @@ public sealed class AshaVoiceSession : IDisposable
         The pointer is a salience hint, never a camera constraint. Request a
         closer crop when text or a target is too small.
 
+        Visual guidance is an evidence transaction, not decoration. When a
+        closer-look tool is available, inspect the smallest useful region
+        before placing guidance. After inspection, either place one cue per
+        requested target or explicitly decline. For a correction to your most
+        recent guidance, replace the previous cue instead of accumulating a
+        misleading second cue. Never describe an estimated visual position as
+        independently verified.
+
         ASHA exposes capabilities progressively. When a capability-selection
         tool is available, use it only when the request genuinely needs a
         desktop capability. Answer ordinary conversation directly. At every
@@ -1340,7 +1348,15 @@ public sealed class AshaVoiceSession : IDisposable
         if (!TryReadImageInteger(call.Arguments, "x", 0, source.ImageWidth, out var imageX) ||
             !TryReadImageInteger(call.Arguments, "y", 0, source.ImageHeight, out var imageY) ||
             !TryReadImageInteger(call.Arguments, "w", 12, source.ImageWidth, out var imageWidth) ||
-            !TryReadImageInteger(call.Arguments, "h", 12, source.ImageHeight, out var imageHeight) ||
+            !TryReadImageInteger(call.Arguments, "h", 12, source.ImageHeight, out var imageHeight))
+        {
+            return DetailRegion(
+                source.ContextX!.Value,
+                source.ContextY!.Value,
+                source.ContextWidth!.Value,
+                source.ContextHeight!.Value);
+        }
+        if (
             imageX + imageWidth > source.ImageWidth ||
             imageY + imageHeight > source.ImageHeight ||
             !source.TryMapImagePoint(imageX, imageY, out var left, out var top) ||
@@ -1393,7 +1409,7 @@ public sealed class AshaVoiceSession : IDisposable
         ActivePerceptionPlan plan,
         bool allowDesktopAction) => plan.Goal switch
     {
-        ActivePerceptionGoal.Annotate => plan.AllowCloserLook ? VisualWithDetailToolDefinitions : VisualToolDefinitions,
+        ActivePerceptionGoal.Annotate => plan.AllowCloserLook ? VisualPlanningToolDefinitions : VisualDecisionToolDefinitions,
         ActivePerceptionGoal.Act when allowDesktopAction => plan.AllowCloserLook
             ? DesktopActionWithDetailToolDefinitions
             : DesktopActionToolDefinitions,
@@ -1421,9 +1437,16 @@ public sealed class AshaVoiceSession : IDisposable
             allowDesktopAction &&
             names.Contains("asha_act", StringComparer.Ordinal))
             return RequiredFunctionToolChoice("asha_act");
-        if (plan.Goal == ActivePerceptionGoal.Annotate &&
-            names.Contains("asha_mark", StringComparer.Ordinal))
-            return RequiredFunctionToolChoice("asha_mark");
+        if (plan.Goal == ActivePerceptionGoal.Annotate)
+        {
+            if (plan.AllowCloserLook &&
+                vision is { IsDetailView: false } &&
+                names.Contains("asha_request_detail", StringComparer.Ordinal))
+                return RequiredFunctionToolChoice("asha_request_detail");
+            if (names.Contains("asha_mark", StringComparer.Ordinal) &&
+                names.Contains("asha_decline_guidance", StringComparer.Ordinal))
+                return "required";
+        }
         if (plan.RequiresDetail &&
             names.Contains("asha_request_detail", StringComparer.Ordinal))
             return RequiredFunctionToolChoice("asha_request_detail");
@@ -1460,9 +1483,15 @@ public sealed class AshaVoiceSession : IDisposable
         if (capability == "desktop_interaction" &&
             names.Contains("asha_act", StringComparer.Ordinal))
             return RequiredFunctionToolChoice("asha_act");
-        if (capability == "visual_guidance" &&
-            names.Contains("asha_mark", StringComparer.Ordinal))
-            return RequiredFunctionToolChoice("asha_mark");
+        if (capability == "visual_guidance")
+        {
+            if (vision is { IsDetailView: false } &&
+                names.Contains("asha_request_detail", StringComparer.Ordinal))
+                return RequiredFunctionToolChoice("asha_request_detail");
+            if (names.Contains("asha_mark", StringComparer.Ordinal) &&
+                names.Contains("asha_decline_guidance", StringComparer.Ordinal))
+                return "required";
+        }
         if (plan?.RequiresDetail == true &&
             names.Contains("asha_request_detail", StringComparer.Ordinal))
             return RequiredFunctionToolChoice("asha_request_detail");
@@ -1535,6 +1564,23 @@ public sealed class AshaVoiceSession : IDisposable
         return DescribeToolChoice(ToolChoiceForPlan(plan, vision, allowComputerControl, tools));
     }
 
+    internal static string DetailGuidanceToolChoiceForTesting(string text)
+    {
+        var plan = ActivePerceptionPlanner.Infer(text) with { AllowCloserLook = false };
+        var vision = new VisionAttachment(
+            "detail.png",
+            [],
+            0,
+            0,
+            100,
+            100,
+            100,
+            100,
+            IsDetailView: true);
+        var tools = SelectGroundedToolsForPlan(plan, allowDesktopAction: false);
+        return DescribeToolChoice(ToolChoiceForPlan(plan, vision, false, tools));
+    }
+
     internal static bool StaticPromptContainsToolNameForTesting() =>
         Regex.IsMatch(SystemPrompt, @"\basha_[a-z_]+\b", RegexOptions.CultureInvariant) ||
         Regex.IsMatch(FreshEvidenceInstruction(ActivePerceptionGoal.Act), @"\basha_[a-z_]+\b", RegexOptions.CultureInvariant);
@@ -1605,7 +1651,7 @@ public sealed class AshaVoiceSession : IDisposable
         return capability switch
         {
             "desktop_observation" when hasGroundedVision => DetailAndViewToolDefinitions,
-            "visual_guidance" when hasGroundedVision => VisualWithDetailToolDefinitions,
+            "visual_guidance" when hasGroundedVision => VisualPlanningToolDefinitions,
             "application_control" when allowApplicationControl => ApplicationControlToolDefinitions,
             "window_management" when allowApplicationControl => WindowManagementToolDefinitions,
             "desktop_interaction" when hasGroundedVision && allowDesktopAction => DesktopActionWithDetailToolDefinitions,
@@ -1704,6 +1750,25 @@ public sealed class AshaVoiceSession : IDisposable
     {
         if (string.IsNullOrWhiteSpace(propertyName)) return false;
         var element = JsonSerializer.SerializeToElement(DesktopActionToolDefinition);
+        return element
+            .GetProperty("function")
+            .GetProperty("parameters")
+            .GetProperty("properties")
+            .TryGetProperty(propertyName, out _);
+    }
+
+    internal static bool VisualGuidanceSchemaContainsPropertyForTesting(string propertyName)
+    {
+        if (string.IsNullOrWhiteSpace(propertyName)) return false;
+        var mark = VisualDecisionToolDefinitions.First(tool =>
+        {
+            var element = JsonSerializer.SerializeToElement(tool);
+            return string.Equals(
+                element.GetProperty("function").GetProperty("name").GetString(),
+                "asha_mark",
+                StringComparison.Ordinal);
+        });
+        var element = JsonSerializer.SerializeToElement(mark);
         return element
             .GetProperty("function")
             .GetProperty("parameters")
@@ -2012,6 +2077,11 @@ public sealed class AshaVoiceSession : IDisposable
         // also keeps ASHA responsive when the provider is near its rate limit.
         if (toolCalls.Count == 1 && TryRenderToolResult(toolCalls[0], outputs[0], out var rendered))
             return rendered;
+
+        if (toolCalls.Count > 1 &&
+            toolCalls.All(call => string.Equals(call.Name, "asha_mark", StringComparison.Ordinal)) &&
+            outputs.All(ToolResultSucceeded))
+            return RenderMarkBatchConfirmation(outputs);
 
         using var final = await SendChatCompletionAsync(baseUrl, model, messages, tools, cancellationToken).ConfigureAwait(false);
         return ReadMessageContent(final.RootElement.GetProperty("choices")[0].GetProperty("message"));
@@ -2600,10 +2670,43 @@ public sealed class AshaVoiceSession : IDisposable
     private static string RenderMarkConfirmation(JsonElement result)
     {
         var label = ReadResultString(result, "label");
+        var grounded = result.TryGetProperty("target_grounded", out var targetGrounded) &&
+                       targetGrounded.ValueKind == JsonValueKind.True;
+        if (grounded)
+            return string.IsNullOrWhiteSpace(label)
+                ? "I've highlighted it for you."
+                : $"I've highlighted {label} for you.";
         return string.IsNullOrWhiteSpace(label)
-            ? "I've highlighted it for you."
-            : $"I've highlighted {label} for you.";
+            ? "I've placed a marker at my best visual estimate."
+            : $"I've placed a marker where I estimate {label} is.";
     }
+
+    private static string RenderMarkBatchConfirmation(IReadOnlyList<string> outputs)
+    {
+        var grounded = 0;
+        foreach (var output in outputs)
+        {
+            try
+            {
+                using var document = JsonDocument.Parse(output);
+                if (document.RootElement.TryGetProperty("target_grounded", out var value) &&
+                    value.ValueKind == JsonValueKind.True)
+                    grounded++;
+            }
+            catch (JsonException)
+            {
+                // ToolResultSucceeded already validated the useful contract.
+            }
+        }
+        return grounded == outputs.Count
+            ? $"I've highlighted {outputs.Count} targets for you."
+            : grounded == 0
+                ? $"I've placed {outputs.Count} markers at my best visual estimates."
+                : $"I've placed {outputs.Count} markers; {grounded} {(grounded == 1 ? "was" : "were")} independently grounded.";
+    }
+
+    internal static string RenderMarkBatchForTesting(params string[] outputs) =>
+        RenderMarkBatchConfirmation(outputs);
 
     private static string RenderApplicationConfirmation(JsonElement result)
     {
@@ -3528,15 +3631,15 @@ public sealed class AshaVoiceSession : IDisposable
             function = new
             {
                 name = "asha_mark",
-                description = "Place one click-through overlay on a verified top-layer target in the supplied image. Prefer its interactive text-bearing control, not a nearby icon or incidental duplicate text.",
+                description = "Place one click-through overlay on one visible top-layer target in the supplied image. Use one call per requested target. Text targets are independently checked with local OCR. Non-text targets require a detail view and are reported as visual estimates. On an immediate correction, set replace_previous only on the first replacement cue.",
                 parameters = new
                 {
                     type = "object",
                     additionalProperties = false,
-                    required = new[] { "kind", "x" },
+                    required = new[] { "kind", "x", "target_type" },
                     properties = new
                     {
-                        kind = new { type = "string", @enum = new[] { "dot", "circle", "box", "arrow", "label" } },
+                        kind = new { type = "string", @enum = new[] { "dot", "circle", "box", "arrow", "label" }, description = "Use box for a target that contains visible text so local OCR can verify its bounds." },
                         x = DesktopCoordinateParameter("Target x in supplied-image pixels; left edge for a box."),
                         y = DesktopCoordinateParameter("Target y in supplied-image pixels; top edge for a box."),
                         w = new { type = "number", description = "Box width or signed arrow x distance." },
@@ -3545,6 +3648,9 @@ public sealed class AshaVoiceSession : IDisposable
                         visible_text = new { type = "string", description = "Exact words printed inside a text target." },
                         expected_app = new { type = "string", description = "Visible host app/window for top-layer verification." },
                         target_type = new { type = "string", @enum = new[] { "text", "visual" }, description = "text requires local OCR; visual is genuinely non-textual." },
+                        replace_previous = new { type = "boolean", description = "True only when this cue corrects and replaces ASHA's immediately preceding guidance cue." },
+                        target_index = new { type = "integer", minimum = 1, description = "One-based index when the person requested multiple targets." },
+                        target_count = new { type = "integer", minimum = 1, description = "Total requested targets; issue one tool call for each target." },
                         color = new { type = "string", description = "Optional hex color." },
                     },
                 },
@@ -3554,8 +3660,18 @@ public sealed class AshaVoiceSession : IDisposable
         ClearGuidanceToolDefinition,
     ];
 
-    private static readonly IReadOnlyList<object> VisualWithDetailToolDefinitions =
-        VisualToolDefinitions.Concat([DetailViewToolDefinition]).Concat(ViewRequestToolDefinitions).ToArray();
+    private static readonly IReadOnlyList<object> VisualDecisionToolDefinitions =
+        VisualToolDefinitions
+            .Where(tool =>
+            {
+                var element = JsonSerializer.SerializeToElement(tool);
+                var name = element.GetProperty("function").GetProperty("name").GetString();
+                return name is "asha_mark" or "asha_decline_guidance";
+            })
+            .ToArray();
+
+    private static readonly IReadOnlyList<object> VisualPlanningToolDefinitions =
+        VisualDecisionToolDefinitions.Concat([DetailViewToolDefinition]).Concat(ViewRequestToolDefinitions).ToArray();
 
     private static readonly IReadOnlyList<object> DetailAndViewToolDefinitions =
         new[] { DetailViewToolDefinition }.Concat(ViewRequestToolDefinitions).ToArray();
@@ -3901,7 +4017,8 @@ public sealed record VisionAttachment(
     DesktopStateSnapshot? DesktopSnapshot = null,
     byte[]? LocalGroundingBytes = null,
     int? LocalGroundingPixelWidth = null,
-    int? LocalGroundingPixelHeight = null)
+    int? LocalGroundingPixelHeight = null,
+    bool IsDetailView = false)
 {
     public string DataUrl =>
         $"data:{(Name.EndsWith(".jpg", StringComparison.OrdinalIgnoreCase) || Name.EndsWith(".jpeg", StringComparison.OrdinalIgnoreCase) ? "image/jpeg" : "image/png")};base64,{Convert.ToBase64String(Bytes)}";
@@ -3912,7 +4029,7 @@ public sealed record VisionAttachment(
     public int GroundingImageWidth => LocalGroundingPixelWidth.GetValueOrDefault(ImageWidth);
     public int GroundingImageHeight => LocalGroundingPixelHeight.GetValueOrDefault(ImageHeight);
     public string CoordinateInstruction => HasDesktopMapping
-        ? $"The supplied image is {ImageWidth} by {ImageHeight} pixels. For any coordinate fields in a currently available tool, use only supplied-image pixels. Never copy desktop coordinates into an image-coordinate field; ASHA maps image coordinates internally. {DesktopContext}".Trim()
+        ? $"The supplied image is {ImageWidth} by {ImageHeight} pixels. {(IsDetailView ? "This is a fresh higher-detail region selected for the current target. " : string.Empty)}For any coordinate fields in a currently available tool, use only supplied-image pixels. Never copy desktop coordinates into an image-coordinate field; ASHA maps image coordinates internally. {DesktopContext}".Trim()
         : $"The image does not include a reliable desktop coordinate map, so do not use a visual marking tool. {DesktopContext}".Trim();
 
     public bool TryMapImagePoint(int imageX, int imageY, out int desktopX, out int desktopY)

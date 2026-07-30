@@ -3949,7 +3949,8 @@ public partial class MainWindow : Window
             desktopState?.Id,
             desktopState?.Signature,
             desktopState,
-            localGrounding);
+            localGrounding,
+            effectiveScope == VisionRequestScope.Region);
         if (attachment is null)
         {
             StatusText.Text = "ASHA could not read the selected view.";
@@ -4144,7 +4145,8 @@ public partial class MainWindow : Window
         string? desktopSnapshotId = null,
         string? desktopSnapshotSignature = null,
         DesktopStateSnapshot? desktopState = null,
-        LocalGroundingCapture? localGrounding = null)
+        LocalGroundingCapture? localGrounding = null,
+        bool isDetailView = false)
     {
         var relative = evidence.ContextFile ?? evidence.AfterFile;
         var runtimeRoot = Path.GetFullPath(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "asha"));
@@ -4175,7 +4177,8 @@ public partial class MainWindow : Window
             desktopState,
             localGrounding?.Bytes,
             localGrounding?.PixelWidth,
-            localGrounding?.PixelHeight);
+            localGrounding?.PixelHeight,
+            isDetailView);
     }
 
     private async Task<string> ExecuteVisualToolAsync(AshaVisualToolCall call, VisionAttachment? vision, CancellationToken cancellationToken)
@@ -4230,8 +4233,27 @@ public partial class MainWindow : Window
         var visibleText = TryReadToolString(call.Arguments, "visible_text", out var suppliedVisibleText) && suppliedVisibleText.Length <= 120
             ? suppliedVisibleText
             : label;
-        var requiresTextGrounding = TryReadToolString(call.Arguments, "target_type", out var targetType) &&
-                                    string.Equals(targetType, "text", StringComparison.Ordinal);
+        if (!TryReadToolString(call.Arguments, "target_type", out var targetType) ||
+            targetType is not ("text" or "visual"))
+            return JsonSerializer.Serialize(new
+            {
+                ok = false,
+                error = "Choose whether the visible guidance target is text or visual before showing a mark.",
+            });
+        var requiresTextGrounding = string.Equals(targetType, "text", StringComparison.Ordinal);
+        if (requiresTextGrounding && !string.Equals(kind, "box", StringComparison.Ordinal))
+            return JsonSerializer.Serialize(new
+            {
+                ok = false,
+                error = "Text guidance needs a box so I can verify the visible words and their bounds before showing it.",
+            });
+        if (!requiresTextGrounding && !vision.IsDetailView)
+            return JsonSerializer.Serialize(new
+            {
+                ok = false,
+                requires_detail = true,
+                error = "I need a closer current view before I can place guidance on a non-text target.",
+            });
         int? imageWidth = null;
         int? imageHeight = null;
         if (kind == "box")
@@ -4264,7 +4286,7 @@ public partial class MainWindow : Window
                 return JsonSerializer.Serialize(new { ok = false, error = "An arrow and its tip must fit inside the supplied image." });
         }
 
-        var grounding = "model_coordinates";
+        var grounding = vision.IsDetailView ? "model_detail_estimate" : "model_coordinates";
         if (kind == "box" && !string.IsNullOrWhiteSpace(visibleText))
         {
             OcrGroundingResolution? textResolution = null;
@@ -4401,6 +4423,19 @@ public partial class MainWindow : Window
             }
         }
         var id = $"asha-guidance-{Guid.NewGuid():N}";
+        var replacePrevious =
+            TryReadToolBoolean(call.Arguments, "replace_previous", out var suppliedReplacePrevious) &&
+            suppliedReplacePrevious;
+        var previousGuidanceId = replacePrevious
+            ? _marks.LastOrDefault(mark => mark.Id.StartsWith("asha-guidance-", StringComparison.Ordinal))?.Id ??
+              ReadPersistedGuidanceMarkIds().LastOrDefault()
+            : null;
+        var targetIndex = TryReadToolCoordinate(call.Arguments, "target_index", out var suppliedTargetIndex)
+            ? Math.Max(1, suppliedTargetIndex)
+            : 1;
+        var targetCount = TryReadToolCoordinate(call.Arguments, "target_count", out var suppliedTargetCount)
+            ? Math.Max(targetIndex, suppliedTargetCount)
+            : 1;
         var mark = new MarkRequest(
             id,
             kind,
@@ -4416,15 +4451,69 @@ public partial class MainWindow : Window
         var markId = document.RootElement.GetProperty("id").GetString() ?? id;
         var guidanceCue = new LiveMark(markId, kind, x, y, width, height, label, VisualGuidanceColor(kind));
         _marks.Add(guidanceCue);
+        var replacedPrevious = false;
+        if (!string.IsNullOrWhiteSpace(previousGuidanceId) &&
+            !string.Equals(previousGuidanceId, markId, StringComparison.Ordinal))
+        {
+            try
+            {
+                await RunAshaAsync("clear", previousGuidanceId);
+                foreach (var previous in _marks.Where(mark =>
+                             string.Equals(mark.Id, previousGuidanceId, StringComparison.Ordinal)).ToArray())
+                    _marks.Remove(previous);
+                replacedPrevious = true;
+            }
+            catch (Exception error)
+            {
+                try { await RunAshaAsync("clear", markId); } catch { }
+                _marks.Remove(guidanceCue);
+                Log($"ASHA could not replace her previous visual guidance safely: {error.Message}");
+                return JsonSerializer.Serialize(new
+                {
+                    ok = false,
+                    error = "I couldn't safely replace my previous marker, so I removed the new one.",
+                });
+            }
+        }
         await RecordActiveSessionEventAsync(
-            "guidance.visual_mark_shown",
-            $"ASHA showed a {kind} to guide the person to a visible target.",
+            replacedPrevious ? "guidance.visual_mark_replaced" : "guidance.visual_mark_shown",
+            replacedPrevious
+                ? $"ASHA replaced her previous guidance with a corrected {kind}."
+                : $"ASHA showed a {kind} to guide the person to a visible target.",
             "model",
             "teach_human",
-            new { app = "desktop", label, control = kind, x, y, w = width, h = height, grounding },
+            new
+            {
+                app = "desktop",
+                label,
+                control = kind,
+                x,
+                y,
+                w = width,
+                h = height,
+                grounding,
+                targetIndex,
+                targetCount,
+                replacedPrevious,
+            },
             cue: CuePayload(guidanceCue));
         Log($"ASHA visual guidance: {kind} at {x}, {y}; grounding: {grounding}.");
-        return JsonSerializer.Serialize(new { ok = true, id = markId, kind, x, y, label, grounding, action = "visual overlay shown; no mouse or keyboard input occurred" });
+        return JsonSerializer.Serialize(new
+        {
+            ok = true,
+            id = markId,
+            kind,
+            x,
+            y,
+            label,
+            grounding,
+            target_grounded = string.Equals(grounding, "local_windows_ocr", StringComparison.Ordinal),
+            evidence_level = vision.IsDetailView ? "detail" : "overview",
+            target_index = targetIndex,
+            target_count = targetCount,
+            replaced_previous = replacedPrevious,
+            action = "visual overlay shown; no mouse or keyboard input occurred",
+        });
     }
 
     private async Task<string> ExecuteClearGuidanceOnUiAsync(AshaVisualToolCall call)

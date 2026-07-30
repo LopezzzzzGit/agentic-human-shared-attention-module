@@ -937,10 +937,34 @@ Console.WriteLine($"{(directActionContractPassed ? "PASS" : "FAIL")} | tools  | 
 if (!directActionContractPassed) failed++;
 
 var explicitGuidanceContractPassed =
-    AshaVoiceSession.ToolChoiceForTesting("Highlight the visible Inbox folder.", hasGroundedVision: true, allowComputerControl: false) == "required:asha_mark" &&
+    AshaVoiceSession.ToolChoiceForTesting("Highlight the visible Inbox folder.", hasGroundedVision: true, allowComputerControl: false) == "required:asha_request_detail" &&
+    AshaVoiceSession.DetailGuidanceToolChoiceForTesting("Highlight the visible Inbox folder.") == "required" &&
     AshaVoiceSession.GroundedToolNamesForTesting("Highlight the visible Inbox folder.", allowComputerControl: false).Contains("asha_decline_guidance");
-Console.WriteLine($"{(explicitGuidanceContractPassed ? "PASS" : "FAIL")} | tools  | explicit guidance requires a verified mark or structured refusal");
+Console.WriteLine($"{(explicitGuidanceContractPassed ? "PASS" : "FAIL")} | tools  | explicit guidance obtains detail then requires either a mark or structured refusal");
 if (!explicitGuidanceContractPassed) failed++;
+
+var correctableGuidanceContractPassed =
+    AshaVoiceSession.VisualGuidanceSchemaContainsPropertyForTesting("replace_previous") &&
+    AshaVoiceSession.VisualGuidanceSchemaContainsPropertyForTesting("target_index") &&
+    AshaVoiceSession.VisualGuidanceSchemaContainsPropertyForTesting("target_count");
+Console.WriteLine($"{(correctableGuidanceContractPassed ? "PASS" : "FAIL")} | tools  | guidance supports correction-by-replacement and one cue per requested target");
+if (!correctableGuidanceContractPassed) failed++;
+
+var truthfulGuidanceSpeechPassed =
+    AshaVoiceSession.RenderToolResultForTesting(
+        "asha_mark",
+        "{\"ok\":true,\"label\":\"the control\",\"target_grounded\":true}") ==
+        "I've highlighted the control for you." &&
+    AshaVoiceSession.RenderToolResultForTesting(
+        "asha_mark",
+        "{\"ok\":true,\"label\":\"the visual symbol\",\"target_grounded\":false}") ==
+        "I've placed a marker where I estimate the visual symbol is." &&
+    AshaVoiceSession.RenderMarkBatchForTesting(
+        "{\"ok\":true,\"target_grounded\":true}",
+        "{\"ok\":true,\"target_grounded\":false}") ==
+        "I've placed 2 markers; 1 was independently grounded.";
+Console.WriteLine($"{(truthfulGuidanceSpeechPassed ? "PASS" : "FAIL")} | speech | guidance distinguishes independent grounding from visual estimates");
+if (!truthfulGuidanceSpeechPassed) failed++;
 
 var typedComposerPassed = MainWindow.NormalizeTypedInput("  pete.albrecht@gmx.net  ") == "pete.albrecht@gmx.net";
 Console.WriteLine($"{(typedComposerPassed ? "PASS" : "FAIL")} | chat   | typed technical identifiers bypass speech recognition unchanged");
@@ -1589,7 +1613,7 @@ if (failed > 0)
     return 1;
 }
 
-Console.WriteLine($"All {cases.Length + identityCases.Length + claimCases.Length + perceptionCases.Length + reliabilityCaseCount + 4 + interactionReliabilityCaseCount + foregroundActivationCaseCount + controlPolicyCaseCount + protectedSurfaceCaseCount + phaseTwoSecurityCaseCount + phaseThreeSecurityCaseCount + sessionLifecycleCaseCount + speechVocabularyCaseCount} ASHA reliability, audio, intent, perception, speech-vocabulary, policy, lease, protected-surface, observation-privacy, desktop-session, approval, emergency-stop, session-lifecycle, accessibility-containment, and application-control tests passed.");
+Console.WriteLine($"All {cases.Length + identityCases.Length + claimCases.Length + perceptionCases.Length + reliabilityCaseCount + 7 + interactionReliabilityCaseCount + foregroundActivationCaseCount + controlPolicyCaseCount + protectedSurfaceCaseCount + phaseTwoSecurityCaseCount + phaseThreeSecurityCaseCount + sessionLifecycleCaseCount + speechVocabularyCaseCount} ASHA reliability, audio, intent, perception, speech-vocabulary, policy, lease, protected-surface, observation-privacy, desktop-session, approval, emergency-stop, session-lifecycle, accessibility-containment, and application-control tests passed.");
 return 0;
 
 internal sealed record IntentCase(string Text, bool ShouldMatch, string Scope);

@@ -40,3 +40,6 @@ proposal, planned work, implemented design, or retained historical decision.
 | 004 | [Trusted observation and desktop-session boundaries](004-trusted-observation-and-desktop-session-boundaries.md) | Implemented; live acceptance pending |
 | 005 | [Approval transactions and emergency stop](005-approval-transactions-and-emergency-stop.md) | Implemented; live acceptance pending |
 | 006 | [Durable and temporary session lifecycle](006-durable-and-temporary-session-lifecycle.md) | Implemented; live acceptance pending |
+| 007 | [Portable grounded-interaction architecture](007-portable-grounded-interaction-architecture.md) | Planned |
+| 008 | [Privacy-controlled online knowledge](008-privacy-controlled-online-knowledge.md) | Planned |
+| 009 | [Searchable settings information architecture](009-settings-information-architecture.md) | Planned |

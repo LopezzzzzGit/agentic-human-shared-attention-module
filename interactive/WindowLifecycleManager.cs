@@ -20,6 +20,8 @@ internal sealed record WindowLifecycleResult(
     string ProcessName,
     string WindowTitle,
     bool Verified,
+    string Outcome = "state_verified",
+    ForegroundActivationResult? Activation = null,
     bool ConfirmationRequired = false,
     string? ConfirmationWindow = null);
 
@@ -215,15 +217,18 @@ internal static class WindowLifecycleManager
         string requestedName,
         CancellationToken cancellationToken)
     {
-        _ = ShowWindowAsync(target.Handle, SwRestore);
-        _ = SetForegroundWindow(target.Handle);
-        var verified = await WaitUntilAsync(
-            () => ForegroundBelongsTo(target),
-            TimeSpan.FromSeconds(2),
+        var activation = await ForegroundWindowActivator.ActivateAsync(
+            target.Handle,
+            target.ProcessId,
             cancellationToken).ConfigureAwait(false);
-        if (!verified)
-            throw new InvalidOperationException($"Windows did not bring {target.DisplayName} to the foreground.");
-        return Result("activate_window", requestedName, target);
+        return new WindowLifecycleResult(
+            "activate_window",
+            requestedName,
+            target.ProcessName,
+            target.WindowTitle,
+            activation.ForegroundVerified,
+            activation.Outcome,
+            activation);
     }
 
     private static async Task<WindowLifecycleResult> CloseAsync(
@@ -253,6 +258,7 @@ internal static class WindowLifecycleManager
                 target.ProcessName,
                 target.WindowTitle,
                 Verified: false,
+                Outcome: "confirmation_required",
                 ConfirmationRequired: true,
                 ConfirmationWindow: confirmationTitle);
         }
@@ -286,15 +292,6 @@ internal static class WindowLifecycleManager
             target.WindowTitle,
             Verified: true);
 
-    private static bool ForegroundBelongsTo(RunningWindowInfo target)
-    {
-        var foreground = GetForegroundWindow();
-        if (foreground == target.Handle) return true;
-        return foreground != IntPtr.Zero &&
-               GetWindowThreadProcessId(foreground, out var processId) != 0 &&
-               processId == (uint)target.ProcessId;
-    }
-
     private static async Task<bool> WaitUntilAsync(
         Func<bool> condition,
         TimeSpan timeout,
@@ -325,7 +322,6 @@ internal static class WindowLifecycleManager
     [DllImport("user32.dll")] private static extern bool IsIconic(IntPtr window);
     [DllImport("user32.dll")] private static extern bool IsZoomed(IntPtr window);
     [DllImport("user32.dll")] private static extern bool ShowWindowAsync(IntPtr window, int command);
-    [DllImport("user32.dll")] private static extern bool SetForegroundWindow(IntPtr window);
     [DllImport("user32.dll")] private static extern bool PostMessage(IntPtr window, uint message, IntPtr wParam, IntPtr lParam);
     [DllImport("user32.dll")] private static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);

@@ -5,6 +5,9 @@ demonstrator. It separates the intended architecture from features that are
 already implemented, so an experimental button is never mistaken for the
 final interaction model.
 
+The tested implementation boundary and current live limitations are tracked in
+[docs/current-status.md](docs/current-status.md).
+
 ## Product principle: memory with human agency
 
 ASHA is not designed as a forgetful command assistant. A conversation,
@@ -137,6 +140,24 @@ are skipped, transient frames stay local, and provider-bound keyframes remain
 visible and permission-gated.
 
 ## Planned delivery order
+
+### P0 — grounded interaction reliability
+
+- Replay representative live sessions as application-agnostic regression
+  fixtures.
+- Resolve human descriptions through desktop, window, tab or document, panel,
+  control, and visual-object layers.
+- Separate target grounding, cue rendering, input delivery, and verified
+  outcome in telemetry and spoken claims.
+- Let visual guidance request a close-up or decline before drawing an
+  ungrounded cue.
+- Correct, move, replace, and group cues without accumulating rejected marks.
+- Enforce explicitly requested background, virtual, physical, or demonstration
+  execution.
+- Repair malformed provider tool output once through a minimal structured
+  action-or-refusal phase.
+- Cache unchanged evidence and prefer local semantics and small detail crops
+  over repeated broad images.
 
 ### P0 — reliable working and session memory
 

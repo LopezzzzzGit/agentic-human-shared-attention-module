@@ -552,6 +552,205 @@ var postActionVerificationPassed =
 Console.WriteLine($"{(postActionVerificationPassed ? "PASS" : "FAIL")} | verify | post-action evidence distinguishes target verification from mere visual change");
 if (!postActionVerificationPassed) failed++;
 
+const int interactionReliabilityCaseCount = 11;
+var semanticStateVerificationPassed =
+    AshaVoiceSession.PostActionSnapshotOutcomeForTesting(
+        "Mail",
+        "p.albrecht@mindforge-labs.de",
+        "treeitem",
+        "Navigation",
+        false,
+        "expanded",
+        "p.albrecht@mindforge-labs.de") == "target_state_verified" &&
+    AshaVoiceSession.PostActionSnapshotOutcomeForTesting(
+        "Mail",
+        "Inbox 2 Unread",
+        "treeitem",
+        "p.albrecht@mindforge-labs.de",
+        true,
+        null,
+        "Inbox 2 Unread",
+        "p.albrecht@mindforge-labs.de") == "target_state_verified" &&
+    AshaVoiceSession.PostActionSnapshotOutcomeForTesting(
+        "Inbox – p.albrecht@mindforge-labs.de – Mail",
+        "Unrelated",
+        "pane",
+        null,
+        false,
+        null,
+        "Inbox 2 Unread",
+        "p.albrecht@mindforge-labs.de") == "target_state_verified";
+Console.WriteLine($"{(semanticStateVerificationPassed ? "PASS" : "FAIL")} | verify | selection, expansion, and corroborated window titles outrank tiny pixel-diff thresholds");
+if (!semanticStateVerificationPassed) failed++;
+
+var duplicateSignatureOne = MainWindow.DesktopTaskActionSignature(
+    "task-one",
+    "click",
+    "Inbox",
+    "Account",
+    new DesktopAction("click", 100, 200));
+var duplicateSignatureTwo = MainWindow.DesktopTaskActionSignature(
+    "task-one",
+    "click",
+    "Inbox",
+    "Account",
+    new DesktopAction("click", 100, 200));
+var differentActionSignature = MainWindow.DesktopTaskActionSignature(
+    "task-one",
+    "double_click",
+    "Inbox",
+    "Account",
+    new DesktopAction("double_click", 100, 200));
+var duplicateBarrierPassed =
+    duplicateSignatureOne == duplicateSignatureTwo &&
+    duplicateSignatureOne != differentActionSignature &&
+    MainWindow.DesktopTaskActionSignature(
+        null,
+        "click",
+        "Inbox",
+        "Account",
+        new DesktopAction("click", 100, 200)) is null;
+Console.WriteLine($"{(duplicateBarrierPassed ? "PASS" : "FAIL")} | input  | identical same-task actions have one stable signature while distinct strategies remain available");
+if (!duplicateBarrierPassed) failed++;
+
+var cursorSynchronizationPassed =
+    CuaDriverClient.VisibleCursorArrivalDelayMillisecondsForTesting >= 300;
+Console.WriteLine($"{(cursorSynchronizationPassed ? "PASS" : "FAIL")} | cursor | visible agent-cursor presentation has an arrival barrier before semantic input");
+if (!cursorSynchronizationPassed) failed++;
+
+var compactedContinuation = AshaVoiceSession.ContinuationCompactionForTesting();
+var continuationBudgetPassed =
+    compactedContinuation.ToolMessages == 0 &&
+    compactedContinuation.ImageMessages == 0 &&
+    compactedContinuation.TransientSystems == 0;
+Console.WriteLine($"{(continuationBudgetPassed ? "PASS" : "FAIL")} | budget | desktop continuations discard prior images, tool envelopes, and transient instructions");
+if (!continuationBudgetPassed) failed++;
+
+var closeUpRoutingPassed =
+    ActivePerceptionPlanner.IsExplicitDetailRequest("Take a real close-up of that message.") &&
+    !ActivePerceptionPlanner.IsWindowManagementRequest("Take a real close-up of that message.") &&
+    AshaVoiceSession.NormalizeSelectedCapabilityForTesting(
+        "window_management",
+        "Take a real close-up of that message.",
+        allowDesktopAction: true) == "desktop_observation" &&
+    ActivePerceptionPlanner.IsWindowManagementRequest("Close that window.");
+Console.WriteLine($"{(closeUpRoutingPassed ? "PASS" : "FAIL")} | vision | close-up inspection cannot collide with close-window intent");
+if (!closeUpRoutingPassed) failed++;
+
+var explicitDetailChoicePassed =
+    AshaVoiceSession.ToolChoiceForTesting(
+        "Read this more closely.",
+        hasGroundedVision: true,
+        allowComputerControl: true) == "required:asha_request_detail";
+Console.WriteLine($"{(explicitDetailChoicePassed ? "PASS" : "FAIL")} | vision | an explicit closer inspection requires the independent detail tool");
+if (!explicitDetailChoicePassed) failed++;
+
+var implicitReadingDetailChoicePassed =
+    ActivePerceptionPlanner.IsDetailedContentRequest("Tell me what this email says.") &&
+    AshaVoiceSession.ToolChoiceForTesting(
+        "Tell me what this email says.",
+        hasGroundedVision: true,
+        allowComputerControl: true) == "required:asha_request_detail";
+Console.WriteLine($"{(implicitReadingDetailChoicePassed ? "PASS" : "FAIL")} | vision | reading detailed content requires a targeted close-up without magic wording");
+if (!implicitReadingDetailChoicePassed) failed++;
+
+var semanticTransitionVerificationPassed =
+    AshaVoiceSession.PostActionTransitionOutcomeForTesting(
+        "select", "Example item", "listitem",
+        true, null, true, null,
+        "Example", "Example", snapshotChanged: false) == "already_satisfied" &&
+    AshaVoiceSession.PostActionTransitionOutcomeForTesting(
+        "open", "Example item", "listitem",
+        true, null, true, null,
+        "Inbox", "Inbox", snapshotChanged: false) == "no_visible_response" &&
+    AshaVoiceSession.PostActionTransitionOutcomeForTesting(
+        "expand", "Example account", "treeitem",
+        null, "collapsed", null, "expanded",
+        "Mail", "Mail", snapshotChanged: true) == "target_state_verified";
+Console.WriteLine($"{(semanticTransitionVerificationPassed ? "PASS" : "FAIL")} | verify | before-and-after state distinguishes selected, opened, and expanded outcomes");
+if (!semanticTransitionVerificationPassed) failed++;
+
+var semanticDeliveryPassed =
+    MainWindow.DeliveryActionForTesting("click", "open") == "double_click" &&
+    MainWindow.DeliveryActionForTesting("double_click", "select") == "click" &&
+    MainWindow.DeliveryActionForTesting("click", "expand") == "click";
+Console.WriteLine($"{(semanticDeliveryPassed ? "PASS" : "FAIL")} | input  | semantic operations choose safe delivery fallbacks without application recipes");
+if (!semanticDeliveryPassed) failed++;
+
+var semanticActionSchemaPassed =
+    AshaVoiceSession.DesktopActionSchemaContainsPropertyForTesting("operation") &&
+    AshaVoiceSession.DesktopActionSchemaContainsPropertyForTesting("completes_request");
+Console.WriteLine($"{(semanticActionSchemaPassed ? "PASS" : "FAIL")} | tools  | each action declares its semantic outcome and whether it completes the request");
+if (!semanticActionSchemaPassed) failed++;
+
+var completedActionStopsPassed =
+    AshaVoiceSession.ToolResultCompletesRequestForTesting(
+        "{\"ok\":true,\"completes_request\":true}") &&
+    !AshaVoiceSession.ToolResultCompletesRequestForTesting(
+        "{\"ok\":true,\"completes_request\":false}");
+Console.WriteLine($"{(completedActionStopsPassed ? "PASS" : "FAIL")} | task   | a verified whole-request action can finish without a redundant tool continuation");
+if (!completedActionStopsPassed) failed++;
+
+const int foregroundActivationCaseCount = 3;
+var foregroundIdentityPassed =
+    ForegroundWindowActivator.ForegroundMatchesForTesting(
+        targetHandle: 100,
+        targetProcessId: 42,
+        foregroundHandle: 100,
+        foregroundProcessId: 99) &&
+    ForegroundWindowActivator.ForegroundMatchesForTesting(
+        targetHandle: 100,
+        targetProcessId: 42,
+        foregroundHandle: 101,
+        foregroundProcessId: 42) &&
+    !ForegroundWindowActivator.ForegroundMatchesForTesting(
+        targetHandle: 100,
+        targetProcessId: 42,
+        foregroundHandle: 101,
+        foregroundProcessId: 99);
+Console.WriteLine($"{(foregroundIdentityPassed ? "PASS" : "FAIL")} | window | foreground verification accepts only the resolved handle or process");
+if (!foregroundIdentityPassed) failed++;
+
+var foregroundEvidencePassed =
+    AshaVoiceSession.ForegroundOutcomeForTesting(
+        "lm-studio",
+        "LM Studio",
+        0,
+        "lm-studio",
+        "LM Studio",
+        runtimeVerified: false) == "target_state_verified" &&
+    AshaVoiceSession.ForegroundOutcomeForTesting(
+        "explorer",
+        "Project Files",
+        0,
+        "lm-studio",
+        "LM Studio",
+        runtimeVerified: true) == "no_visible_response" &&
+    AshaVoiceSession.ForegroundOutcomeForTesting(
+        "explorer",
+        "Project Files",
+        0.02,
+        "lm-studio",
+        "LM Studio",
+        runtimeVerified: false) == "visible_change_only";
+Console.WriteLine($"{(foregroundEvidencePassed ? "PASS" : "FAIL")} | verify | fresh foreground identity outranks stale activation and textual name presence");
+if (!foregroundEvidencePassed) failed++;
+
+var backgroundLaunchOutput = JsonSerializer.Serialize(new
+{
+    ok = true,
+    action = "launch_application",
+    application = "Example Editor",
+    foreground_verified = false,
+});
+var backgroundLaunchSpeech = AshaVoiceSession.RenderToolResultForTesting(
+    "asha_act",
+    backgroundLaunchOutput);
+var backgroundLaunchSpeechPassed =
+    backgroundLaunchSpeech == "I opened Example Editor, but Windows kept it in the background.";
+Console.WriteLine($"{(backgroundLaunchSpeechPassed ? "PASS" : "FAIL")} | speech | a background launch is reported as a truthful partial outcome");
+if (!backgroundLaunchSpeechPassed) failed++;
+
 var strictRoleGroundingPassed =
     DesktopTargetGrounder.RoleMatchesForTesting("list_item", "treeitem") &&
     DesktopTargetGrounder.RoleMatchesForTesting("account", "treeitem") &&
@@ -730,7 +929,7 @@ Console.WriteLine($"{(bundledVisionCoordinatePassed ? "PASS" : "FAIL")} | tools 
 if (!bundledVisionCoordinatePassed) failed++;
 
 var directActionContractPassed =
-    AshaVoiceSession.ToolChoiceForTesting("Click the visible Inbox folder.", hasGroundedVision: true, allowComputerControl: true) == "required" &&
+    AshaVoiceSession.ToolChoiceForTesting("Click the visible Inbox folder.", hasGroundedVision: true, allowComputerControl: true) == "required:asha_act" &&
     AshaVoiceSession.ToolChoiceForTesting("Click the visible Inbox folder.", hasGroundedVision: false, allowComputerControl: true) == "auto" &&
     AshaVoiceSession.ToolChoiceForTesting("Click the visible Inbox folder.", hasGroundedVision: true, allowComputerControl: false) == "auto" &&
     AshaVoiceSession.GroundedToolNamesForTesting("Click the visible Inbox folder.", allowComputerControl: true).Contains("asha_decline_action");
@@ -738,7 +937,7 @@ Console.WriteLine($"{(directActionContractPassed ? "PASS" : "FAIL")} | tools  | 
 if (!directActionContractPassed) failed++;
 
 var explicitGuidanceContractPassed =
-    AshaVoiceSession.ToolChoiceForTesting("Highlight the visible Inbox folder.", hasGroundedVision: true, allowComputerControl: false) == "required" &&
+    AshaVoiceSession.ToolChoiceForTesting("Highlight the visible Inbox folder.", hasGroundedVision: true, allowComputerControl: false) == "required:asha_mark" &&
     AshaVoiceSession.GroundedToolNamesForTesting("Highlight the visible Inbox folder.", allowComputerControl: false).Contains("asha_decline_guidance");
 Console.WriteLine($"{(explicitGuidanceContractPassed ? "PASS" : "FAIL")} | tools  | explicit guidance requires a verified mark or structured refusal");
 if (!explicitGuidanceContractPassed) failed++;
@@ -1390,7 +1589,7 @@ if (failed > 0)
     return 1;
 }
 
-Console.WriteLine($"All {cases.Length + identityCases.Length + claimCases.Length + perceptionCases.Length + reliabilityCaseCount + 4 + controlPolicyCaseCount + protectedSurfaceCaseCount + phaseTwoSecurityCaseCount + phaseThreeSecurityCaseCount + sessionLifecycleCaseCount + speechVocabularyCaseCount} ASHA reliability, audio, intent, perception, speech-vocabulary, policy, lease, protected-surface, observation-privacy, desktop-session, approval, emergency-stop, session-lifecycle, accessibility-containment, and application-control tests passed.");
+Console.WriteLine($"All {cases.Length + identityCases.Length + claimCases.Length + perceptionCases.Length + reliabilityCaseCount + 4 + interactionReliabilityCaseCount + foregroundActivationCaseCount + controlPolicyCaseCount + protectedSurfaceCaseCount + phaseTwoSecurityCaseCount + phaseThreeSecurityCaseCount + sessionLifecycleCaseCount + speechVocabularyCaseCount} ASHA reliability, audio, intent, perception, speech-vocabulary, policy, lease, protected-surface, observation-privacy, desktop-session, approval, emergency-stop, session-lifecycle, accessibility-containment, and application-control tests passed.");
 return 0;
 
 internal sealed record IntentCase(string Text, bool ShouldMatch, string Scope);

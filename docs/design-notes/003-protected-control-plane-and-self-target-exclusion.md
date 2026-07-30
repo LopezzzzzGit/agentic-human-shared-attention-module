@@ -134,6 +134,23 @@ activity ledger records a bounded `control.action_denied` event with reason
 An unverified or changed target is also rejected. No physical fallback follows
 a protected, stale, or uncertain background result.
 
+## Foreground transition contract
+
+Application launch and running-window activation share one bounded Windows
+foreground activator. It accepts only a freshly resolved native window handle
+and process identity, never an application-specific recipe. ASHA restores and
+requests activation, then verifies the actual Windows foreground handle or
+process. If another application takes focus during the attempt, ASHA stops
+rather than fighting the person.
+
+Window actions use action-specific proof. The mere presence of a process,
+window title, OCR label, or screenshot text cannot establish that a window is
+foreground. Launching may therefore finish as `foreground_verified` or the
+truthful partial outcome `opened_but_background`; activation may finish as
+`foreground_verified`, `activation_rejected`, or
+`interrupted_by_foreground_change`. Each attempt records bounded before/after
+foreground identity and never substitutes model narration for runtime proof.
+
 ## Phase One implementation
 
 1. Add the protected-surface policy and runtime-owned action permit.

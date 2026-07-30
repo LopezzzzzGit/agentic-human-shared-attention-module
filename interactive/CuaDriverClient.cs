@@ -44,6 +44,7 @@ internal sealed class CuaDriverClient
 {
     private static readonly TimeSpan StatusTimeout = TimeSpan.FromSeconds(4);
     private static readonly TimeSpan ActionTimeout = TimeSpan.FromSeconds(10);
+    private static readonly TimeSpan VisibleCursorArrivalDelay = TimeSpan.FromMilliseconds(420);
     private readonly string? _executablePath;
     private readonly ProtectedSurfacePolicy _protectedSurfaces;
 
@@ -144,6 +145,39 @@ internal sealed class CuaDriverClient
             return;
     }
 
+    /// <summary>
+    /// Moves only the human-facing agent cursor, then allows its glide to
+    /// become legible before a separate semantic or background interaction.
+    /// The overlay is presentation and never counts as proof of input.
+    /// </summary>
+    public async Task<CuaExecutionResult> PresentCursorAsync(
+        int x,
+        int y,
+        string sessionId,
+        CancellationToken cancellationToken)
+    {
+        if (!Status.CuaConnected)
+            return new CuaExecutionResult(
+                false,
+                false,
+                false,
+                "cua_virtual_cursor",
+                Status.Diagnostic ?? "CUA Driver is not connected.");
+
+        var moved = await CallAsync(
+            "move_cursor",
+            new { x, y, session = sessionId, cursor_id = sessionId },
+            ActionTimeout,
+            cancellationToken).ConfigureAwait(false);
+        var result = Classify(moved, "cua_virtual_cursor");
+        if (result.Executed)
+            await Task.Delay(VisibleCursorArrivalDelay, cancellationToken).ConfigureAwait(false);
+        return result;
+    }
+
+    internal static int VisibleCursorArrivalDelayMillisecondsForTesting =>
+        (int)VisibleCursorArrivalDelay.TotalMilliseconds;
+
     public async Task<CuaExecutionResult> ExecuteAsync(
         DesktopAction action,
         ProtectedSurfacePolicy.DesktopActionPermit permit,
@@ -193,12 +227,11 @@ internal sealed class CuaDriverClient
 
         if (cursorVisible && action.X.HasValue && action.Y.HasValue)
         {
-            var cursor = await CallAsync(
-                "move_cursor",
-                new { x = action.X.Value, y = action.Y.Value, session = sessionId, cursor_id = sessionId },
-                ActionTimeout,
+            var cursorResult = await PresentCursorAsync(
+                action.X.Value,
+                action.Y.Value,
+                sessionId,
                 cancellationToken).ConfigureAwait(false);
-            var cursorResult = Classify(cursor, "cua_virtual_cursor");
             if (cursorResult.Uncertain)
                 return cursorResult;
             // The cursor is a human-facing indicator. A rendering failure does

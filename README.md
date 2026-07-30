@@ -26,9 +26,11 @@ Anyone developing ASHA should read these documents as one maintained set:
    product and interaction principles.
 3. [Product roadmap](ROADMAP.md) — lifecycle, memory architecture, delivery
    order, and near-term acceptance criteria.
-4. [Design-note register](docs/design-notes/README.md) — permanent, numbered
+4. [Current implementation status](docs/current-status.md) — the tested
+   capability boundary and known live gaps.
+5. [Design-note register](docs/design-notes/README.md) — permanent, numbered
    proposals and implementation decisions.
-5. [Harness contract](docs/harness-contract.md) — the model-neutral boundary
+6. [Harness contract](docs/harness-contract.md) — the model-neutral boundary
    between ASHA and external agent runtimes.
 
 Numbered design notes are actionable unless their status explicitly says
@@ -191,10 +193,17 @@ validate the currently exposed top-layer surface, remain visibly framed, and
 are written to the active session ledger. Stop the control session to remove
 the capability immediately.
 
-The virtual-cursor policy, visibility, and demonstration settings are present
-as a separate capability. Background interaction through the installed CUA
-driver is the next integration slice. Until it is connected, ASHA never
-silently substitutes the physical cursor for a permitted virtual action.
+Virtual-cursor policy, visibility, interaction, and demonstration remain
+separate capabilities. The installed CUA driver can deliver permitted virtual
+interaction, while accessible controls may use background UI Automation.
+Physical input remains separately gated and is never a silent fallback.
+
+Semantic UI operations distinguish selection, opening, invocation, activation,
+expansion, and collapse. ASHA captures fresh before-and-after evidence and
+reports success only when target state, foreground identity, or another
+action-specific postcondition verifies it. Explicit close-up and detailed
+reading requests use an independent detail region rather than assuming the
+person's pointer is the camera.
 
 Groq is the demonstrator's swappable research provider. Keys remain outside
 the repository and judges bring their own key. The provider boundary can be

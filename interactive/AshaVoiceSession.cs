@@ -921,7 +921,11 @@ public sealed class AshaVoiceSession : IDisposable
             return ReadMessageContent(unavailable.RootElement.GetProperty("choices")[0].GetProperty("message"));
         }
 
-        var toolChoice = ToolChoiceForCapabilityPhase(capability, vision, disclosedTools);
+        var toolChoice = ToolChoiceForCapabilityPhase(
+            capability,
+            vision,
+            disclosedTools,
+            perceptionPlan);
         ReportToolPhase("capability_disclosed", capability, disclosedTools, toolChoice);
         using var disclosed = await SendChatCompletionAsync(
             baseUrl,
@@ -1123,7 +1127,9 @@ public sealed class AshaVoiceSession : IDisposable
         string userText,
         bool allowApplicationControl,
         bool allowDesktopAction) =>
-        ActivePerceptionPlanner.IsWindowManagementRequest(userText) &&
+        perceptionPlan.RequiresDetail
+            ? "desktop_observation"
+            : ActivePerceptionPlanner.IsWindowManagementRequest(userText) &&
         allowApplicationControl
             ? "window_management"
             : string.Equals(requestedCapability, "application_control", StringComparison.Ordinal) &&
@@ -1260,12 +1266,23 @@ public sealed class AshaVoiceSession : IDisposable
         messages.Add(CreateUserMessage(
             $"Use this fresh model-selected view to complete the person's original request: {userText}",
             refreshedView));
+        // An explicitly requested detail crop satisfies the inspection
+        // sub-goal. Do not force the original action again after the crop; the
+        // next response must explain only what the refined evidence shows.
+        var refinedPlan = perceptionPlan.RequiresDetail
+            ? perceptionPlan with
+            {
+                Goal = ActivePerceptionGoal.Observe,
+                AllowCloserLook = false,
+                RequiresDetail = false,
+            }
+            : perceptionPlan with { AllowCloserLook = false };
         var detailTools = SelectGroundedToolsForPlan(
-            perceptionPlan with { AllowCloserLook = false },
-            allowDesktopAction) ?? SelectGroundedToolsAfterModelView(
-                perceptionPlan with { AllowCloserLook = false },
-                allowDesktopAction);
-        var detailChoice = ToolChoiceForPlan(perceptionPlan, refreshedView, allowDesktopAction, detailTools);
+            refinedPlan,
+            allowDesktopAction) ?? (refinedPlan.Goal == ActivePerceptionGoal.Observe
+                ? null
+                : SelectGroundedToolsAfterModelView(refinedPlan, allowDesktopAction));
+        var detailChoice = ToolChoiceForPlan(refinedPlan, refreshedView, allowDesktopAction, detailTools);
         ReportToolPhase("detail_view_grounded", null, detailTools, detailChoice);
         using var refined = await SendChatCompletionAsync(
             baseUrl, model, messages, detailTools, cancellationToken,
@@ -1279,8 +1296,48 @@ public sealed class AshaVoiceSession : IDisposable
 
     private static VisionRequest? ReadDetailVisionRequest(AshaVisualToolCall call, VisionAttachment source)
     {
-        if (!source.HasDesktopMapping ||
-            !TryReadImageInteger(call.Arguments, "x", 0, source.ImageWidth, out var imageX) ||
+        if (!source.HasDesktopMapping)
+            return null;
+
+        if (TryReadString(call.Arguments, "target_name", out var targetName) &&
+            source.DesktopSnapshot is { } snapshot)
+        {
+            var requestedRole = TryReadString(call.Arguments, "target_role", out var targetRole)
+                ? targetRole
+                : null;
+            var requestedContainer = TryReadString(call.Arguments, "container_name", out var containerName)
+                ? containerName
+                : null;
+            var candidates = snapshot.Elements
+                .Select(element => new
+                {
+                    Element = element,
+                    Score = DesktopTargetGrounder.BestNameMatchScoreForTesting(targetName, element.Name),
+                })
+                .Where(candidate =>
+                    candidate.Score > 0 &&
+                    (string.IsNullOrWhiteSpace(requestedRole) ||
+                     DesktopTargetGrounder.RoleMatchesForTesting(requestedRole, candidate.Element.Role)) &&
+                    (string.IsNullOrWhiteSpace(requestedContainer) ||
+                     DesktopTargetGrounder.BestNameMatchScoreForTesting(
+                         requestedContainer,
+                         candidate.Element.ParentName ?? string.Empty) > 0))
+                .OrderByDescending(candidate => candidate.Score)
+                .ThenBy(candidate => candidate.Element.Width * candidate.Element.Height)
+                .ToArray();
+            if (candidates.Length > 0 &&
+                (candidates.Length == 1 || candidates[0].Score > candidates[1].Score))
+            {
+                var element = candidates[0].Element;
+                return DetailRegion(
+                    element.X,
+                    element.Y,
+                    element.Width,
+                    element.Height);
+            }
+        }
+
+        if (!TryReadImageInteger(call.Arguments, "x", 0, source.ImageWidth, out var imageX) ||
             !TryReadImageInteger(call.Arguments, "y", 0, source.ImageHeight, out var imageY) ||
             !TryReadImageInteger(call.Arguments, "w", 12, source.ImageWidth, out var imageWidth) ||
             !TryReadImageInteger(call.Arguments, "h", 12, source.ImageHeight, out var imageHeight) ||
@@ -1290,8 +1347,13 @@ public sealed class AshaVoiceSession : IDisposable
             !source.TryMapImagePoint(imageX + imageWidth, imageY + imageHeight, out var right, out var bottom))
             return null;
 
-        var width = Math.Max(1, right - left);
-        var height = Math.Max(1, bottom - top);
+        return DetailRegion(left, top, right - left, bottom - top);
+    }
+
+    private static VisionRequest DetailRegion(int left, int top, int rawWidth, int rawHeight)
+    {
+        var width = Math.Max(1, rawWidth);
+        var height = Math.Max(1, rawHeight);
         var horizontalPadding = Math.Max(24, (int)Math.Round(width * 0.12));
         var verticalPadding = Math.Max(20, (int)Math.Round(height * 0.12));
         var region = new DesktopCaptureRegion(
@@ -1305,6 +1367,16 @@ public sealed class AshaVoiceSession : IDisposable
             VisionRequestScope.Region,
             Region: region,
             PreferTextDetail: true);
+    }
+
+    private static bool TryReadString(JsonElement arguments, string name, out string value)
+    {
+        value = string.Empty;
+        if (!arguments.TryGetProperty(name, out var raw) ||
+            raw.ValueKind != JsonValueKind.String)
+            return false;
+        value = raw.GetString()?.Trim() ?? string.Empty;
+        return value.Length > 0;
     }
 
     private static bool TryReadImageInteger(JsonElement arguments, string name, int minimum, int maximum, out int value)
@@ -1336,19 +1408,27 @@ public sealed class AshaVoiceSession : IDisposable
         SelectGroundedToolsForPlan(plan, allowDesktopAction) ??
         (allowDesktopAction ? DesktopActionWithDetailToolDefinitions : DetailAndViewToolDefinitions);
 
-    private static string ToolChoiceForPlan(
+    private static object ToolChoiceForPlan(
         ActivePerceptionPlan plan,
         VisionAttachment? vision,
         bool allowDesktopAction,
-        IReadOnlyList<object>? tools) =>
-        vision is { HasDesktopMapping: true } &&
-        ((plan.Goal == ActivePerceptionGoal.Act &&
-          allowDesktopAction &&
-          ToolNames(tools).Contains("asha_act", StringComparer.Ordinal)) ||
-         (plan.Goal == ActivePerceptionGoal.Annotate &&
-          ToolNames(tools).Contains("asha_mark", StringComparer.Ordinal)))
-            ? "required"
-            : "auto";
+        IReadOnlyList<object>? tools)
+    {
+        var names = ToolNames(tools);
+        if (vision is not { HasDesktopMapping: true })
+            return "auto";
+        if (plan.Goal == ActivePerceptionGoal.Act &&
+            allowDesktopAction &&
+            names.Contains("asha_act", StringComparer.Ordinal))
+            return RequiredFunctionToolChoice("asha_act");
+        if (plan.Goal == ActivePerceptionGoal.Annotate &&
+            names.Contains("asha_mark", StringComparer.Ordinal))
+            return RequiredFunctionToolChoice("asha_mark");
+        if (plan.RequiresDetail &&
+            names.Contains("asha_request_detail", StringComparer.Ordinal))
+            return RequiredFunctionToolChoice("asha_request_detail");
+        return "auto";
+    }
 
     private static object InitialToolChoice(
         ActivePerceptionPlan plan,
@@ -1367,17 +1447,26 @@ public sealed class AshaVoiceSession : IDisposable
     private static object ToolChoiceForCapabilityPhase(
         string capability,
         VisionAttachment? vision,
-        IReadOnlyList<object>? tools)
+        IReadOnlyList<object>? tools,
+        ActivePerceptionPlan? plan = null)
     {
         var names = ToolNames(tools);
         if (vision is null &&
             names.Count == 1 &&
             string.Equals(names[0], "asha_request_view", StringComparison.Ordinal))
             return RequiredFunctionToolChoice("asha_request_view");
-        return vision is { HasDesktopMapping: true } &&
-               capability is "desktop_interaction" or "visual_guidance"
-            ? "required"
-            : "auto";
+        if (vision is not { HasDesktopMapping: true })
+            return "auto";
+        if (capability == "desktop_interaction" &&
+            names.Contains("asha_act", StringComparer.Ordinal))
+            return RequiredFunctionToolChoice("asha_act");
+        if (capability == "visual_guidance" &&
+            names.Contains("asha_mark", StringComparer.Ordinal))
+            return RequiredFunctionToolChoice("asha_mark");
+        if (plan?.RequiresDetail == true &&
+            names.Contains("asha_request_detail", StringComparer.Ordinal))
+            return RequiredFunctionToolChoice("asha_request_detail");
+        return "auto";
     }
 
     private static object RequiredFunctionToolChoice(string name) => new
@@ -1443,7 +1532,7 @@ public sealed class AshaVoiceSession : IDisposable
             ? new VisionAttachment("test", [], 0, 0, 100, 100, 100, 100)
             : null;
         var tools = hasGroundedVision ? SelectGroundedToolsForPlan(plan, allowComputerControl) : null;
-        return ToolChoiceForPlan(plan, vision, allowComputerControl, tools);
+        return DescribeToolChoice(ToolChoiceForPlan(plan, vision, allowComputerControl, tools));
     }
 
     internal static bool StaticPromptContainsToolNameForTesting() =>
@@ -1814,10 +1903,17 @@ public sealed class AshaVoiceSession : IDisposable
             if (followUp is not null)
             {
                 var verificationOutcome = ReportDesktopActionVerification(toolCalls[0], outputs[0], followUp);
+                var continuationPlan = ActivePerceptionPlanner.Infer(userText);
                 if (ShouldRenderVerifiedRepeatLocally(
                         verificationOutcome,
                         toolCalls[0].Name,
                         userText))
+                    return RenderPostActionEvidenceResult(outputs[0], followUp);
+                if (verificationOutcome is "no_visible_response" or "visible_change_only")
+                    return RenderPostActionEvidenceResult(outputs[0], followUp);
+                if ((verificationOutcome is "target_state_verified" or "already_satisfied") &&
+                    ToolResultCompletesRequest(outputs[0]) &&
+                    !continuationPlan.RequiresDetail)
                     return RenderPostActionEvidenceResult(outputs[0], followUp);
 
                 if (remainingDesktopSteps <= 0)
@@ -1827,25 +1923,30 @@ public sealed class AshaVoiceSession : IDisposable
                             ? exhaustedResult
                             : "I reached the desktop-action limit before I could verify the complete request.";
 
+                CompactDesktopContinuationMessages(messages);
+                var previousAction = ToolResultActionSummary(outputs[0]);
                 messages.Add(new
                 {
                     role = "system",
-                    content = $"Continue the person's original desktop request as one bounded task. The runtime has completed one step and attached a fresh, versioned foreground state. Re-evaluate the remaining goal from this new state. A merely selected item does not satisfy an open or activate goal; if current evidence shows the intended item selected but not opened, use an appropriate non-duplicate activation such as double-click or the approved Enter key. If work remains, call exactly one appropriate tool. If the complete request is now established, answer only from current evidence. Do not narrate a click, open, selection, or other action unless a tool call in this task actually performed it. At most {remainingDesktopSteps} additional desktop step(s) remain.",
+                    content = $"Continue the person's original desktop request as one bounded task. The previous runtime step was {previousAction}; verification outcome: {verificationOutcome}. A fresh, versioned foreground state is attached. Do not repeat the same action on the same target after an unverified response; choose a different supported semantic action, request clarification, or stop. If the complete request is now established, answer only from current evidence. At most {remainingDesktopSteps} additional desktop step(s) remain.",
                 });
-                RemovePriorVisionMessages(messages);
                 messages.Add(CreateUserMessage(
                     $"Continue and, when possible, complete the original request: {userText}",
                     followUp));
 
-                var continuationPlan = ActivePerceptionPlanner.Infer(userText);
                 var continuationTools = SelectGroundedToolsAfterModelView(
                     continuationPlan with { AllowCloserLook = true },
                     allowDesktopAction);
-                var continuationChoice = ToolChoiceForPlan(
-                    continuationPlan,
-                    followUp,
-                    allowDesktopAction,
-                    continuationTools);
+                var continuationChoice =
+                    (verificationOutcome is "target_state_verified" or "already_satisfied") &&
+                    continuationPlan.RequiresDetail &&
+                    ToolNames(continuationTools).Contains("asha_request_detail", StringComparer.Ordinal)
+                        ? RequiredFunctionToolChoice("asha_request_detail")
+                        : ToolChoiceForPlan(
+                            continuationPlan,
+                            followUp,
+                            allowDesktopAction,
+                            continuationTools);
                 ReportToolPhase("bounded_task_continuation", null, continuationTools, continuationChoice);
                 using var continuation = await SendChatCompletionAsync(
                     baseUrl,
@@ -1982,26 +2083,37 @@ public sealed class AshaVoiceSession : IDisposable
             using var document = JsonDocument.Parse(output);
             var result = document.RootElement;
             var action = ReadResultString(result, "action") ?? call.Name;
-            var targetName =
+            var requestedTargetName =
                 ReadResultString(result, "target_name") ??
                 ReadResultString(result, "application") ??
                 ReadResultString(result, "folder");
             var containerName = ReadResultString(result, "container_name");
-            var outcome = ClassifyPostActionOutcome(evidence, targetName, containerName);
-            if (string.Equals(outcome, "target_state_verified", StringComparison.Ordinal))
+            var canonicalTargetName = requestedTargetName;
+            var canonicalTargetRole = ReadResultString(result, "target_role");
+            if (result.TryGetProperty("grounded_bounds", out var canonicalBounds) &&
+                canonicalBounds.ValueKind == JsonValueKind.Object)
             {
-                var groundedName = targetName;
-                var groundedRole = ReadResultString(result, "target_role");
-                if (result.TryGetProperty("grounded_bounds", out var bounds) &&
-                    bounds.ValueKind == JsonValueKind.Object)
-                {
-                    groundedName = ReadResultString(bounds, "name") ?? groundedName;
-                    groundedRole = ReadResultString(bounds, "role") ?? groundedRole;
-                }
-                if (!string.IsNullOrWhiteSpace(groundedName))
+                canonicalTargetName = ReadResultString(canonicalBounds, "name") ?? canonicalTargetName;
+                canonicalTargetRole = ReadResultString(canonicalBounds, "role") ?? canonicalTargetRole;
+            }
+            var operation = ReadResultString(result, "operation") ?? InferOperationFromAction(action);
+            var outcome = action is "launch_application" or "activate_window"
+                ? ClassifyForegroundActionOutcome(evidence, result, canonicalTargetName)
+                : ClassifyPostActionOutcome(
+                    evidence,
+                    canonicalTargetName,
+                    canonicalTargetRole,
+                    containerName,
+                    operation,
+                    ReadPreTargetState(result),
+                    ReadResultString(result, "pre_action_snapshot_signature"),
+                    ReadResultString(result, "pre_action_window_title"));
+            if (outcome is "target_state_verified" or "already_satisfied")
+            {
+                if (!string.IsNullOrWhiteSpace(canonicalTargetName))
                     _lastVerifiedDesktopTarget = new VerifiedDesktopTarget(
-                        groundedName,
-                        groundedRole,
+                        canonicalTargetName,
+                        canonicalTargetRole,
                         containerName,
                         DateTimeOffset.UtcNow);
             }
@@ -2011,7 +2123,7 @@ public sealed class AshaVoiceSession : IDisposable
                 ReadResultString(result, "task_id"),
                 result.TryGetProperty("task_step", out var rawStep) && rawStep.TryGetInt32(out var step) ? step : null,
                 action,
-                targetName,
+                canonicalTargetName,
                 outcome,
                 evidence.DesktopSnapshotId,
                 evidence.ChangedScore));
@@ -2028,13 +2140,164 @@ public sealed class AshaVoiceSession : IDisposable
     private static string ClassifyPostActionOutcome(
         VisionAttachment evidence,
         string? targetName,
-        string? containerName)
+        string? targetRole,
+        string? containerName,
+        string operation,
+        TargetStateEvidence? before,
+        string? beforeSnapshotSignature,
+        string? beforeWindowTitle)
     {
-        if (EvidenceConfirmsTargetState(evidence.DesktopContext, targetName, containerName))
+        var after = FindTargetState(evidence, targetName, targetRole, containerName);
+        var semanticChanged =
+            !string.IsNullOrWhiteSpace(beforeSnapshotSignature) &&
+            evidence.DesktopSnapshot is { } currentSnapshot &&
+            !string.Equals(beforeSnapshotSignature, currentSnapshot.Signature, StringComparison.Ordinal);
+        var titleChanged =
+            !string.IsNullOrWhiteSpace(beforeWindowTitle) &&
+            evidence.DesktopSnapshot is { } titledSnapshot &&
+            !string.Equals(beforeWindowTitle, titledSnapshot.WindowTitle, StringComparison.Ordinal);
+
+        // Backward-compatible evidence without a recorded pre-state may prove
+        // an absolute state, but production action transactions record the
+        // pre-state and therefore use the transition rules below.
+        if (before is null &&
+            string.IsNullOrWhiteSpace(beforeSnapshotSignature) &&
+            EvidenceConfirmsTargetState(evidence, targetName, containerName))
+            return "target_state_verified";
+
+        switch (operation)
+        {
+            case "select":
+                if (after?.IsSelected == true)
+                    return before?.IsSelected == true ? "already_satisfied" : "target_state_verified";
+                break;
+            case "expand":
+                if (string.Equals(after?.ExpandCollapseState, "expanded", StringComparison.OrdinalIgnoreCase))
+                    return string.Equals(before?.ExpandCollapseState, "expanded", StringComparison.OrdinalIgnoreCase)
+                        ? "already_satisfied"
+                        : "target_state_verified";
+                break;
+            case "collapse":
+                if (string.Equals(after?.ExpandCollapseState, "collapsed", StringComparison.OrdinalIgnoreCase))
+                    return string.Equals(before?.ExpandCollapseState, "collapsed", StringComparison.OrdinalIgnoreCase)
+                        ? "already_satisfied"
+                        : "target_state_verified";
+                break;
+            case "open":
+            case "invoke":
+            case "activate":
+                if (WindowTitleConfirmsTarget(evidence.DesktopSnapshot?.WindowTitle, targetName) &&
+                    !titleChanged &&
+                    WindowTitleConfirmsTarget(beforeWindowTitle, targetName))
+                    return "already_satisfied";
+                if ((titleChanged && WindowTitleConfirmsTarget(evidence.DesktopSnapshot?.WindowTitle, targetName)) ||
+                    (semanticChanged &&
+                     after is { IsSelected: true } &&
+                     before?.IsSelected != true) ||
+                    (semanticChanged &&
+                     after is { HasKeyboardFocus: true } &&
+                     before?.HasKeyboardFocus != true))
+                    return "target_state_verified";
+                break;
+            default:
+                if (after?.IsActive == true && before?.IsActive != true)
+                    return "target_state_verified";
+                break;
+        }
+
+        return evidence.ChangedScore is >= 0.0015
+            ? "visible_change_only"
+            : "no_visible_response";
+    }
+
+    private static string ClassifyForegroundActionOutcome(
+        VisionAttachment evidence,
+        JsonElement result,
+        string? targetName)
+    {
+        var expectedProcess = ReadResultString(result, "process");
+        var expectedWindow =
+            ReadResultString(result, "window") ??
+            ReadResultString(result, "target_name") ??
+            targetName;
+        if (ForegroundSnapshotConfirms(
+                evidence.DesktopSnapshot,
+                expectedProcess,
+                expectedWindow))
+            return "target_state_verified";
+
+        // A fresh foreground snapshot outranks an earlier Win32 success. This
+        // closes the race where the target briefly became active and another
+        // window reclaimed focus before ASHA finished checking.
+        if (evidence.DesktopSnapshot is not null)
+            return evidence.ChangedScore is >= 0.0015
+                ? "visible_change_only"
+                : "no_visible_response";
+
+        if (result.TryGetProperty("foreground_verified", out var foregroundVerified) &&
+            foregroundVerified.ValueKind == JsonValueKind.True)
             return "target_state_verified";
         return evidence.ChangedScore is >= 0.0015
             ? "visible_change_only"
             : "no_visible_response";
+    }
+
+    private static bool ForegroundSnapshotConfirms(
+        DesktopStateSnapshot? snapshot,
+        string? expectedProcess,
+        string? expectedWindow)
+    {
+        if (snapshot is null) return false;
+        if (!string.IsNullOrWhiteSpace(expectedProcess) &&
+            string.Equals(
+                snapshot.ProcessName,
+                expectedProcess,
+                StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        var expectedTitle = NormalizeEvidenceTerm(expectedWindow);
+        var actualTitle = NormalizeEvidenceTerm(snapshot.WindowTitle);
+        return expectedTitle.Length >= 3 &&
+               string.Equals(actualTitle, expectedTitle, StringComparison.Ordinal);
+    }
+
+    internal static string ForegroundOutcomeForTesting(
+        string foregroundProcess,
+        string foregroundWindow,
+        double? changedScore,
+        string? expectedProcess,
+        string? expectedWindow,
+        bool runtimeVerified)
+    {
+        using var result = JsonDocument.Parse(JsonSerializer.Serialize(new
+        {
+            process = expectedProcess,
+            window = expectedWindow,
+            foreground_verified = runtimeVerified,
+        }));
+        return ClassifyForegroundActionOutcome(
+            new VisionAttachment(
+                "test.png",
+                [],
+                0,
+                0,
+                100,
+                100,
+                100,
+                100,
+                ChangedScore: changedScore,
+                DesktopSnapshot: new DesktopStateSnapshot(
+                    "test-state",
+                    1,
+                    DateTime.UtcNow,
+                    foregroundProcess,
+                    foregroundWindow,
+                    1,
+                    [],
+                    0,
+                    true)),
+            result.RootElement,
+            expectedWindow);
     }
 
     private static AshaVisualToolCall WithDesktopTaskMetadata(
@@ -2072,6 +2335,120 @@ public sealed class AshaVoiceSession : IDisposable
                 return false;
             }
         });
+    }
+
+    /// <summary>
+    /// Provider calls are stateless, but a desktop continuation does not need
+    /// every prior screenshot, tool envelope, and full diagnostic result.
+    /// Current versioned state plus one compact runtime summary is sufficient
+    /// and prevents a bounded task from growing beyond the provider's TPM
+    /// ceiling after only a few clicks.
+    /// </summary>
+    private static void CompactDesktopContinuationMessages(List<object> messages)
+    {
+        messages.RemoveAll(message =>
+        {
+            try
+            {
+                var serialized = JsonSerializer.SerializeToElement(message);
+                if (!serialized.TryGetProperty("role", out var roleElement))
+                    return false;
+                var role = roleElement.GetString();
+                if (string.Equals(role, "tool", StringComparison.Ordinal))
+                    return true;
+                if (string.Equals(role, "assistant", StringComparison.Ordinal) &&
+                    serialized.TryGetProperty("tool_calls", out _))
+                    return true;
+                if (string.Equals(role, "user", StringComparison.Ordinal) &&
+                    serialized.TryGetProperty("content", out var userContent) &&
+                    userContent.ValueKind == JsonValueKind.Array &&
+                    userContent.EnumerateArray().Any(item =>
+                        item.TryGetProperty("type", out var type) &&
+                        string.Equals(type.GetString(), "image_url", StringComparison.Ordinal)))
+                    return true;
+                if (!string.Equals(role, "system", StringComparison.Ordinal) ||
+                    !serialized.TryGetProperty("content", out var systemContent) ||
+                    systemContent.ValueKind != JsonValueKind.String)
+                    return false;
+                var text = systemContent.GetString() ?? string.Empty;
+                return text.StartsWith(
+                           "Continue the person's original desktop request as one bounded task.",
+                           StringComparison.Ordinal) ||
+                       text.StartsWith(
+                           "The previous desktop action was intentionally not sent",
+                           StringComparison.Ordinal);
+            }
+            catch (Exception error) when (error is JsonException or NotSupportedException)
+            {
+                return false;
+            }
+        });
+    }
+
+    private static string ToolResultActionSummary(string output)
+    {
+        try
+        {
+            using var document = JsonDocument.Parse(output);
+            var root = document.RootElement;
+            var action = ReadResultString(root, "action") ?? "a desktop action";
+            var target = ReadResultString(root, "target_name");
+            return string.IsNullOrWhiteSpace(target)
+                ? action.Replace('_', ' ')
+                : $"{action.Replace('_', ' ')} on {target}";
+        }
+        catch (JsonException)
+        {
+            return "one desktop action";
+        }
+    }
+
+    internal static (int ToolMessages, int ImageMessages, int TransientSystems)
+        ContinuationCompactionForTesting()
+    {
+        var messages = new List<object>
+        {
+            new { role = "system", content = "Stable ASHA contract." },
+            new { role = "assistant", content = "", tool_calls = Array.Empty<object>() },
+            new { role = "tool", tool_call_id = "one", content = "{\"ok\":true}" },
+            new
+            {
+                role = "user",
+                content = new object[]
+                {
+                    new { type = "text", text = "current view" },
+                    new { type = "image_url", image_url = new { url = "data:image/jpeg;base64,AA==" } },
+                },
+            },
+            new
+            {
+                role = "system",
+                content = "Continue the person's original desktop request as one bounded task. Old transient state.",
+            },
+        };
+        CompactDesktopContinuationMessages(messages);
+        var toolMessages = 0;
+        var imageMessages = 0;
+        var transientSystems = 0;
+        foreach (var message in messages)
+        {
+            var serialized = JsonSerializer.SerializeToElement(message);
+            var role = serialized.GetProperty("role").GetString();
+            if (string.Equals(role, "tool", StringComparison.Ordinal)) toolMessages++;
+            if (string.Equals(role, "user", StringComparison.Ordinal) &&
+                serialized.TryGetProperty("content", out var content) &&
+                content.ValueKind == JsonValueKind.Array &&
+                content.EnumerateArray().Any(item =>
+                    item.TryGetProperty("type", out var type) &&
+                    string.Equals(type.GetString(), "image_url", StringComparison.Ordinal)))
+                imageMessages++;
+            if (string.Equals(role, "system", StringComparison.Ordinal) &&
+                serialized.GetProperty("content").GetString()?.StartsWith(
+                    "Continue the person's original desktop request",
+                    StringComparison.Ordinal) == true)
+                transientSystems++;
+        }
+        return (toolMessages, imageMessages, transientSystems);
     }
 
     private static bool ToolResultSucceeded(string output)
@@ -2114,6 +2491,23 @@ public sealed class AshaVoiceSession : IDisposable
             return false;
         }
     }
+
+    private static bool ToolResultCompletesRequest(string output)
+    {
+        try
+        {
+            using var document = JsonDocument.Parse(output);
+            return document.RootElement.TryGetProperty("completes_request", out var value) &&
+                   value.ValueKind == JsonValueKind.True;
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+    }
+
+    internal static bool ToolResultCompletesRequestForTesting(string output) =>
+        ToolResultCompletesRequest(output);
 
     private static bool TryRenderToolResult(AshaVisualToolCall call, string output, out string rendered)
     {
@@ -2214,6 +2608,13 @@ public sealed class AshaVoiceSession : IDisposable
     private static string RenderApplicationConfirmation(JsonElement result)
     {
         var application = ReadResultString(result, "application");
+        if (result.TryGetProperty("foreground_verified", out var foregroundVerified) &&
+            foregroundVerified.ValueKind == JsonValueKind.False)
+        {
+            return string.IsNullOrWhiteSpace(application)
+                ? "I opened the application, but Windows kept it in the background."
+                : $"I opened {application}, but Windows kept it in the background.";
+        }
         return string.IsNullOrWhiteSpace(application)
             ? "I've opened the application and brought it to the front."
             : $"I've opened {application} and brought it to the front.";
@@ -2262,32 +2663,53 @@ public sealed class AshaVoiceSession : IDisposable
             var result = document.RootElement;
             var action = ReadResultString(result, "action");
             var targetName = ReadResultString(result, "target_name");
+            var targetRole = ReadResultString(result, "target_role");
+            if (result.TryGetProperty("grounded_bounds", out var bounds) &&
+                bounds.ValueKind == JsonValueKind.Object)
+            {
+                targetName = ReadResultString(bounds, "name") ?? targetName;
+                targetRole = ReadResultString(bounds, "role") ?? targetRole;
+            }
             var containerName = ReadResultString(result, "container_name");
+            var operation = ReadResultString(result, "operation") ?? InferOperationFromAction(action ?? string.Empty);
             var targetDescription = string.IsNullOrWhiteSpace(targetName) ? "the grounded target" : targetName;
 
             if (string.Equals(action, "move", StringComparison.Ordinal))
                 return $"I've moved the pointer to {targetDescription}.";
 
-            var actionDescription = action switch
+            var actionDescription = operation switch
             {
-                "click" => "click",
-                "double_click" => "double-click",
-                "right_click" => "right-click",
+                "select" => "selection",
+                "open" or "invoke" or "activate" => "open action",
+                "expand" => "expand action",
+                "collapse" => "collapse action",
+                "context_menu" => "context-menu action",
                 "drag" => "drag",
                 "scroll" => "scroll",
-                "type_text" => "text input",
+                "type" => "text input",
                 "key" => "key input",
                 _ => "desktop input",
             };
             var delivery = $"I sent the {actionDescription} to {targetDescription}.";
-            if (EvidenceConfirmsTargetState(evidence.DesktopContext, targetName, containerName))
+            var outcome = ClassifyPostActionOutcome(
+                evidence,
+                targetName,
+                targetRole,
+                containerName,
+                operation,
+                ReadPreTargetState(result),
+                ReadResultString(result, "pre_action_snapshot_signature"),
+                ReadResultString(result, "pre_action_window_title"));
+            if (outcome == "already_satisfied")
+                return $"{targetDescription} was already in the requested state.";
+            if (outcome == "target_state_verified")
             {
                 var relationship = string.IsNullOrWhiteSpace(containerName)
                     ? string.Empty
                     : $" under {containerName}";
-                return $"{delivery} The fresh Windows state verifies that {targetDescription}{relationship} is now active.";
+                return $"Done. The fresh Windows state verifies {targetDescription}{relationship}.";
             }
-            if (evidence.ChangedScore is >= 0.0015)
+            if (outcome == "visible_change_only")
                 return $"{delivery} The visible interface changed afterward, but I haven't independently established the whole requested outcome.";
             return $"{delivery} I couldn't verify a visible response, so I won't claim the requested outcome is complete.";
         }
@@ -2298,20 +2720,49 @@ public sealed class AshaVoiceSession : IDisposable
     }
 
     private static bool EvidenceConfirmsTargetState(
-        string? desktopContext,
+        VisionAttachment evidence,
         string? targetName,
         string? containerName)
     {
-        if (string.IsNullOrWhiteSpace(desktopContext) || string.IsNullOrWhiteSpace(targetName))
+        if (string.IsNullOrWhiteSpace(targetName))
             return false;
         var target = NormalizeEvidenceTerm(targetName);
         var container = NormalizeEvidenceTerm(containerName);
         if (target.Length < 3) return false;
 
-        foreach (var line in desktopContext.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        if (evidence.DesktopSnapshot is { } snapshot)
+        {
+            foreach (var element in snapshot.Elements)
+            {
+                var name = NormalizeEvidenceTerm(element.Name);
+                if (!EvidenceNamesMatch(name, target)) continue;
+                if (container.Length > 0 &&
+                    !EvidenceNamesMatch(NormalizeEvidenceTerm(element.ParentName), container))
+                    continue;
+                if (element.IsSelected == true ||
+                    string.Equals(element.ExpandCollapseState, "expanded", StringComparison.OrdinalIgnoreCase) ||
+                    element.HasKeyboardFocus)
+                    return true;
+            }
+
+            // Opening a target commonly promotes it into the window title
+            // while status suffixes such as unread counts disappear. Require
+            // the requested container as corroboration when the target match
+            // is only a meaningful leading token.
+            var title = NormalizeEvidenceTerm(snapshot.WindowTitle);
+            if (EvidenceNamesMatch(title, target) ||
+                (container.Length > 0 &&
+                 title.Contains(container, StringComparison.Ordinal) &&
+                 FirstEvidenceTokenMatches(title, target)))
+                return true;
+        }
+
+        if (string.IsNullOrWhiteSpace(evidence.DesktopContext))
+            return false;
+        foreach (var line in evidence.DesktopContext.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
         {
             var normalized = NormalizeEvidenceTerm(line);
-            if (!normalized.Contains(target, StringComparison.Ordinal)) continue;
+            if (!EvidenceNamesMatch(normalized, target)) continue;
             var stateEstablished =
                 line.Contains(" selected", StringComparison.OrdinalIgnoreCase) ||
                 line.Contains("expand=expanded", StringComparison.OrdinalIgnoreCase) ||
@@ -2322,6 +2773,124 @@ public sealed class AshaVoiceSession : IDisposable
             return true;
         }
         return false;
+    }
+
+    private static TargetStateEvidence? FindTargetState(
+        VisionAttachment evidence,
+        string? targetName,
+        string? targetRole,
+        string? containerName)
+    {
+        if (evidence.DesktopSnapshot is not { } snapshot ||
+            string.IsNullOrWhiteSpace(targetName))
+            return null;
+        var target = NormalizeEvidenceTerm(targetName);
+        var role = NormalizeEvidenceTerm(targetRole);
+        var container = NormalizeEvidenceTerm(containerName);
+        return snapshot.Elements
+            .Where(element =>
+                EvidenceNamesMatch(NormalizeEvidenceTerm(element.Name), target) &&
+                (role.Length == 0 ||
+                 DesktopTargetGrounder.RoleMatchesForTesting(role, element.Role)) &&
+                (container.Length == 0 ||
+                 EvidenceNamesMatch(NormalizeEvidenceTerm(element.ParentName), container)))
+            .Select(element => new TargetStateEvidence(
+                element.Name,
+                element.Role,
+                element.ParentName,
+                element.IsSelected,
+                element.ExpandCollapseState,
+                element.HasKeyboardFocus))
+            .OrderByDescending(state => state.IsActive)
+            .FirstOrDefault();
+    }
+
+    private static TargetStateEvidence? ReadPreTargetState(JsonElement result)
+    {
+        if (!result.TryGetProperty("pre_target_state", out var raw) ||
+            raw.ValueKind != JsonValueKind.Object)
+            return null;
+        return new TargetStateEvidence(
+            ReadEitherCaseString(raw, "Name", "name"),
+            ReadEitherCaseString(raw, "Role", "role"),
+            ReadEitherCaseString(raw, "ParentName", "parent_name"),
+            ReadEitherCaseBoolean(raw, "IsSelected", "is_selected"),
+            ReadEitherCaseString(raw, "ExpandCollapseState", "expand_collapse_state"),
+            ReadEitherCaseBoolean(raw, "HasKeyboardFocus", "has_keyboard_focus") == true);
+    }
+
+    private static string? ReadEitherCaseString(JsonElement value, string first, string second)
+    {
+        if (value.TryGetProperty(first, out var raw) && raw.ValueKind == JsonValueKind.String)
+            return raw.GetString();
+        return value.TryGetProperty(second, out raw) && raw.ValueKind == JsonValueKind.String
+            ? raw.GetString()
+            : null;
+    }
+
+    private static bool? ReadEitherCaseBoolean(JsonElement value, string first, string second)
+    {
+        if (!value.TryGetProperty(first, out var raw) &&
+            !value.TryGetProperty(second, out raw))
+            return null;
+        return raw.ValueKind switch
+        {
+            JsonValueKind.True => true,
+            JsonValueKind.False => false,
+            _ => null,
+        };
+    }
+
+    private static string InferOperationFromAction(string action) => action switch
+    {
+        "double_click" => "open",
+        "right_click" => "context_menu",
+        "move" => "move",
+        "drag" => "drag",
+        "scroll" => "scroll",
+        "type_text" => "type",
+        "key" => "key",
+        _ => "select",
+    };
+
+    private static bool WindowTitleConfirmsTarget(string? title, string? targetName)
+    {
+        var normalizedTitle = NormalizeEvidenceTerm(title);
+        var normalizedTarget = NormalizeEvidenceTerm(targetName);
+        return normalizedTitle.Length >= 3 &&
+               normalizedTarget.Length >= 3 &&
+               (EvidenceNamesMatch(normalizedTitle, normalizedTarget) ||
+                FirstEvidenceTokenMatches(normalizedTitle, normalizedTarget));
+    }
+
+    private sealed record TargetStateEvidence(
+        string? Name,
+        string? Role,
+        string? ParentName,
+        bool? IsSelected,
+        string? ExpandCollapseState,
+        bool HasKeyboardFocus)
+    {
+        public bool IsActive =>
+            IsSelected == true ||
+            HasKeyboardFocus ||
+            string.Equals(ExpandCollapseState, "expanded", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool EvidenceNamesMatch(string actual, string expected) =>
+        actual.Length >= 3 &&
+        expected.Length >= 3 &&
+        (string.Equals(actual, expected, StringComparison.Ordinal) ||
+         actual.Contains(expected, StringComparison.Ordinal) ||
+         expected.Contains(actual, StringComparison.Ordinal));
+
+    private static bool FirstEvidenceTokenMatches(string actual, string expected)
+    {
+        var actualToken = actual.Split(' ', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault();
+        var expectedToken = expected.Split(' ', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault();
+        return !string.IsNullOrWhiteSpace(actualToken) &&
+               actualToken.Length >= 4 &&
+               string.Equals(actualToken, expectedToken, StringComparison.Ordinal);
     }
 
     private static string NormalizeEvidenceTerm(string? value) =>
@@ -2347,7 +2916,130 @@ public sealed class AshaVoiceSession : IDisposable
                 DesktopContext: desktopContext,
                 ChangedScore: changedScore),
             targetName,
-            containerName);
+            null,
+            containerName,
+            "select",
+            null,
+            null,
+            null);
+
+    internal static string PostActionSnapshotOutcomeForTesting(
+        string windowTitle,
+        string elementName,
+        string elementRole,
+        string? parentName,
+        bool? selected,
+        string? expandCollapseState,
+        string targetName,
+        string? containerName = null) =>
+        ClassifyPostActionOutcome(
+            new VisionAttachment(
+                "test.png",
+                [],
+                0,
+                0,
+                100,
+                100,
+                100,
+                100,
+                ChangedScore: 0,
+                DesktopSnapshot: new DesktopStateSnapshot(
+                    "test-state",
+                    1,
+                    DateTime.UtcNow,
+                    "test-app",
+                    windowTitle,
+                    1,
+                    [
+                        new DesktopStateElement(
+                            1,
+                            elementName,
+                            elementRole,
+                            parentName,
+                            0,
+                            0,
+                            100,
+                            20,
+                            true,
+                            false,
+                            selected,
+                            expandCollapseState,
+                            []),
+                    ],
+                    1,
+                    false)),
+            targetName,
+            elementRole,
+            containerName,
+            expandCollapseState is null ? "select" : "expand",
+            null,
+            null,
+            null);
+
+    internal static string PostActionTransitionOutcomeForTesting(
+        string operation,
+        string targetName,
+        string targetRole,
+        bool? beforeSelected,
+        string? beforeExpand,
+        bool? afterSelected,
+        string? afterExpand,
+        string beforeWindowTitle,
+        string afterWindowTitle,
+        bool snapshotChanged)
+    {
+        var before = new TargetStateEvidence(
+            targetName,
+            targetRole,
+            null,
+            beforeSelected,
+            beforeExpand,
+            false);
+        var afterSnapshot = new DesktopStateSnapshot(
+            "after",
+            1,
+            DateTime.UtcNow,
+            "test-app",
+            afterWindowTitle,
+            1,
+            [
+                new DesktopStateElement(
+                    1,
+                    targetName,
+                    targetRole,
+                    null,
+                    0,
+                    0,
+                    100,
+                    20,
+                    true,
+                    false,
+                    afterSelected,
+                    afterExpand,
+                    []),
+            ],
+            1,
+            false);
+        return ClassifyPostActionOutcome(
+            new VisionAttachment(
+                "test.png",
+                [],
+                0,
+                0,
+                100,
+                100,
+                100,
+                100,
+                ChangedScore: 0,
+                DesktopSnapshot: afterSnapshot),
+            targetName,
+            targetRole,
+            null,
+            operation,
+            before,
+            snapshotChanged ? "different-signature" : afterSnapshot.Signature,
+            beforeWindowTitle);
+    }
 
     private static string RenderActionRefusal(JsonElement result) => ReadResultString(result, "reason") switch
     {
@@ -2718,18 +3410,21 @@ public sealed class AshaVoiceSession : IDisposable
         function = new
         {
             name = "asha_request_detail",
-            description = "Request one higher-detail crop inside the supplied overview when a target is too small to verify.",
+            description = "Request one higher-detail crop independent of the person's mouse. Prefer an exact grounded target name, role, and container; otherwise provide a rectangle inside the supplied overview.",
             parameters = new
             {
                 type = "object",
                 additionalProperties = false,
-                required = new[] { "x", "y", "w", "h", "reason" },
+                required = new[] { "reason" },
                 properties = new
                 {
                     x = new { type = "number", description = "Left in supplied-image pixels." },
                     y = new { type = "number", description = "Top in supplied-image pixels." },
                     w = new { type = "number", description = "Width in supplied-image pixels." },
                     h = new { type = "number", description = "Height in supplied-image pixels." },
+                    target_name = new { type = "string", description = "Exact visible or accessible target name. Preferred over coordinates." },
+                    target_role = new { type = "string", description = "Optional semantic role used to disambiguate the target." },
+                    container_name = new { type = "string", description = "Optional exact parent, account, panel, or section name." },
                     reason = new { type = "string", description = "Short reason for detail." },
                 },
             },
@@ -2924,15 +3619,26 @@ public sealed class AshaVoiceSession : IDisposable
         function = new
         {
             name = "asha_act",
-            description = "Perform one permitted desktop input on a target grounded in the current image and UI snapshot. Match the action to the person's goal and the control role: a single click may only select a list item, while an open or activate goal commonly requires invoke, double_click, or an approved Enter key followed by verification. This stable action envelope is the only input function in this phase.",
+            description = "Perform one permitted desktop operation on a target grounded in the current image and UI snapshot. Operation is the semantic result, while action is only its delivery fallback. Choose the operation from the target's role and desired state, not from one verb in the person's sentence. This stable action envelope is the only input function in this phase.",
             parameters = new
             {
                 type = "object",
                 additionalProperties = false,
-                required = new[] { "action" },
+                required = new[] { "action", "operation", "completes_request" },
                 properties = new
                 {
                     action = new { type = "string", @enum = new[] { "move", "click", "double_click", "right_click", "drag", "scroll", "type_text", "key" } },
+                    operation = new
+                    {
+                        type = "string",
+                        @enum = new[] { "move", "select", "open", "invoke", "expand", "collapse", "activate", "context_menu", "drag", "scroll", "type", "key" },
+                        description = "Semantic outcome requested by the person. Use select for navigation containers such as tabs, folders, and inboxes; use open or invoke for content items or controls whose invocation is the requested result.",
+                    },
+                    completes_request = new
+                    {
+                        type = "boolean",
+                        description = "True only when this operation would complete the person's whole current request if verification succeeds.",
+                    },
                     x = DesktopCoordinateParameter("Target x in supplied-image pixels."),
                     y = DesktopCoordinateParameter("Target y in supplied-image pixels."),
                     end_x = DesktopCoordinateParameter("Drag destination x in supplied-image pixels."),

@@ -216,6 +216,41 @@ internal sealed class DesktopStateCaptureCore
         string action,
         string semanticRole)
     {
+        if (string.Equals(action, "select", StringComparison.Ordinal) &&
+            element.TryGetCurrentPattern(SelectionItemPattern.Pattern, out var semanticSelection))
+        {
+            var semanticSelectionPattern = (SelectionItemPattern)semanticSelection;
+            if (semanticSelectionPattern.Current.IsSelected)
+                return (true, "already_selected");
+            semanticSelectionPattern.Select();
+            return (true, "select");
+        }
+
+        if (action is "open" or "invoke" or "activate" &&
+            element.TryGetCurrentPattern(InvokePattern.Pattern, out var semanticInvocation))
+        {
+            ((InvokePattern)semanticInvocation).Invoke();
+            return (true, "invoke");
+        }
+
+        if (action is "expand" or "collapse" &&
+            element.TryGetCurrentPattern(ExpandCollapsePattern.Pattern, out var semanticExpansion))
+        {
+            var expansion = (ExpandCollapsePattern)semanticExpansion;
+            if (action == "expand")
+            {
+                if (expansion.Current.ExpandCollapseState == ExpandCollapseState.Expanded)
+                    return (true, "already_expanded");
+                expansion.Expand();
+                return (true, "expand");
+            }
+
+            if (expansion.Current.ExpandCollapseState == ExpandCollapseState.Collapsed)
+                return (true, "already_collapsed");
+            expansion.Collapse();
+            return (true, "collapse");
+        }
+
         if (string.Equals(action, "click", StringComparison.Ordinal) &&
             string.Equals(Normalize(semanticRole), "account", StringComparison.Ordinal) &&
             element.TryGetCurrentPattern(ExpandCollapsePattern.Pattern, out var accountExpand))
